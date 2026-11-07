@@ -24,6 +24,7 @@ struct AlertItem {
 // Provided by the alerts module (topbar/alerts), which is listed after this file.
 void AlertsDrawOverlay(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* brush, float L, float R, float B, float s);
 void AlertsPublishGeometry();
+bool AlertsHoldsHover();  // The alert on show is a slider: hovering it must not expand the island over it.
 
 IState g_isState = IState::Collapsed;
 Spring g_cover;         // 0 island shown, 1 faded out under the native volume popup (P5b).
@@ -270,6 +271,7 @@ void IslandDwellTick() {
     g_dwelling = false;
     POINT p;
     GetCursorPos(&p);
+    if (g_isState == IState::Alert && AlertsHoldsHover()) return;  // A slider came up during the dwell.
     if (!g_covered && !g_fullscreen && PtInRect(&g_isBody, p)) SetExpanded(true);
 }
 
@@ -410,7 +412,8 @@ LRESULT CALLBACK IslandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 TrackMouseEvent(&t);
             }
             // Event-driven while collapsed: the pixels of the notch start the dwell, nothing polls.
-            if (!g_expanded && !g_covered && !g_dwelling && !g_fullscreen) {
+            // Not over a slider card: expanding would replace it with a dashboard under the pointer.
+            if (!g_expanded && !g_covered && !g_dwelling && !g_fullscreen && !(g_isState == IState::Alert && AlertsHoldsHover())) {
                 g_dwelling = true;
                 SetTimer(g_hwnd, kDwellTimer, kDwellMs, nullptr);
             }
@@ -446,6 +449,7 @@ LRESULT CALLBACK IslandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_LBUTTONUP:
             if (g_isState == IState::Alert) {
+                IslandPointer(PointerEvent::Up, lp, true);  // Ends a slider drag; other cards ignore it.
                 if (IModule* m = TopAlert()) m->OnClickAlert();
             } else {
                 IslandPointer(PointerEvent::Up, lp, true);

@@ -87,11 +87,46 @@ struct AlLevels {
     }
 };
 
+// ---- Do Not Disturb off: the QuietHoursSettings COM class (undocumented) ----
+// The object Settings and Quick Settings drive: CLSID_QuietHoursSettings, hosted out of process by
+// WpnUserService, interface IQuietHoursSettings (layout from Rafael Rivera's quiethours.idl, also used
+// by WinDndToggle and others). Only the first two methods are declared. The class is registered in the
+// 64-bit view only, so a 32-bit host asks for the 64-bit server; the interface's proxy is registered in
+// both views. Setting the user profile to Unrestricted is what turning DND off in Quick Settings does.
+struct IAlQuietHoursSettings : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE get_UserSelectedProfile(LPWSTR* profile) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_UserSelectedProfile(LPCWSTR profile) = 0;
+};
+constexpr GUID kAlClsidQuietHours = {0xf53321fa, 0x34f8, 0x4b7f, {0xb9, 0xa3, 0x36, 0x18, 0x77, 0xcb, 0x94, 0xcf}};
+constexpr GUID kAlIidQuietHours = {0x6bff4732, 0x81ec, 0x4ffb, {0xae, 0x67, 0xb6, 0xc1, 0xbc, 0x29, 0x63, 0x1f}};
+constexpr wchar_t kAlProfileOff[] = L"Microsoft.QuietHoursProfile.Unrestricted";
+
+bool AlDndOff() {
+    IAlQuietHoursSettings* qh = nullptr;
+    HRESULT hr = CoCreateInstance(kAlClsidQuietHours, nullptr, CLSCTX_LOCAL_SERVER | CLSCTX_ACTIVATE_64_BIT_SERVER, kAlIidQuietHours,
+                                  reinterpret_cast<void**>(&qh));
+    if (FAILED(hr)) hr = CoCreateInstance(kAlClsidQuietHours, nullptr, CLSCTX_LOCAL_SERVER, kAlIidQuietHours, reinterpret_cast<void**>(&qh));
+    if (FAILED(hr) || !qh) {
+        Wh_Log(L"alerts: QuietHoursSettings unavailable, 0x%08lX", (unsigned long)hr);
+        return false;
+    }
+    hr = qh->put_UserSelectedProfile(kAlProfileOff);
+    bool ok = SUCCEEDED(hr);
+    if (ok) {  // Read it back: a changed vtable would succeed and do something else.
+        LPWSTR now = nullptr;
+        ok = SUCCEEDED(qh->get_UserSelectedProfile(&now)) && now && !wcscmp(now, kAlProfileOff);
+        if (now) CoTaskMemFree(now);
+    }
+    Wh_Log(L"alerts: DND off via QuietHoursSettings: hr 0x%08lX, %s", (unsigned long)hr, ok ? L"verified" : L"not verified");
+    qh->Release();
+    return ok;
+}
+
 DWORD WINAPI AlLevelThread(void*) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     {
         AlLevels lv;
-        HANDLE waits[] = {g_alStop, g_alLevelRead, g_alLevelSet};
+        HANDLE waits[] = {g_alStop, g_alLevelRead, g_alLevelSet, g_alDndOff};
         auto post = [&] {
             bool mute = false;
             const int vol = lv.Volume(&mute);
@@ -100,7 +135,7 @@ DWORD WINAPI AlLevelThread(void*) {
         };
         post();  // Baseline, so the first key press can be told apart.
         for (;;) {
-            const DWORD w = WaitForMultipleObjects(3, waits, FALSE, INFINITE);
+            const DWORD w = WaitForMultipleObjects(4, waits, FALSE, INFINITE);
             if (w == WAIT_OBJECT_0 + 1) {
                 post();
                 // The popup can show before the new brightness is readable: look once more.
@@ -116,6 +151,9 @@ DWORD WINAPI AlLevelThread(void*) {
                     }
                 }
                 if (b >= 0) lv.SetBrightness(b);
+            } else if (w == WAIT_OBJECT_0 + 3) {
+                if (!AlDndOff())  // Settings is the fallback; opened from the UI thread.
+                    if (HWND h = g_alHwnd.load()) PostMessageW(h, WM_AL_DNDFAIL, 0, 0);
             } else {
                 break;
             }
