@@ -1,4 +1,4 @@
-# Installs the bar and start-menu-pop without restarting the Windhawk service, because that
+﻿# Installs the bar and start-menu-pop without restarting the Windhawk service, because that
 # restart has crashed Explorer. Run elevated, then restart the bar process unelevated with:
 #   windhawk.exe -tool-mod "local@top-bar"
 $s = $PSScriptRoot
@@ -15,9 +15,6 @@ try {
     Set-ItemProperty "$base\$id" -Name SettingsChangeTime -Value $now -Type DWord
   }
   # windhawk.exe is 32-bit, so the bar needs both architectures.
-  Install 'local@top-bar' '3.0' '300030' @('32', '64')
-  Install 'local@start-menu-pop' '2.1' '200015' @('64')
-  # Windows restarts these by itself. Stopping both also sets up a true first open to test.
-  'StartMenuExperienceHost', 'ShellExperienceHost' | ForEach-Object { Stop-Process -Name $_ -Force -ErrorAction SilentlyContinue }
+  Install 'local@top-bar' '3.1' '300031' @('32', '64')
   "ok" | Out-File $out
 } catch { "ERROR: $($_.Exception.Message)" | Out-File $out }

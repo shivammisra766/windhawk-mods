@@ -98,42 +98,39 @@ void SetHover(int id) {
     Invalidate(HitRectById(id));
 }
 
-void SetPillTarget(bool expanded) {
-    if (expanded == g_pillTarget) {
-        return;
-    }
-    g_pillTarget = expanded;
-    if (expanded) {
-        g_pillSpring.Aim(1.0f, kSpringExpandK, kSpringExpandC);
-    } else {
-        g_pillSpring.Aim(0.0f, kSpringCollapseK, kSpringCollapseC);
-    }
-    g_clock.Wake();
+// The hit list moves with the buttons: resync hover against the new layout.
+void ResyncHover() {
+    if (!g_tracking) return;
+    POINT p;
+    GetCursorPos(&p);
+    ScreenToClient(g_hwnd, &p);
+    SetHover(HitIdAt(p));
 }
 
-// One display frame: the spring steps by the real time since the last one (QPC, at most 50 ms).
-void StepPill() {
+// One display frame: the springs step by the real time since the last one (QPC, at most 50 ms).
+void StepFrame() {
     g_clock.Acked();
     const double now = QpcSeconds();
     double dt = g_lastFrame ? now - g_lastFrame : 1.0 / 60.0;
     if (dt > 0.05) dt = 0.05;
     g_lastFrame = now;
-    g_pillSpring.Step(dt);
-    g_pillT = fminf(fmaxf(g_pillSpring.x, 0.0f), 1.0f);
-    if (g_pillSpring.Settled()) {
+    g_frameDt = dt;
+    g_isW.Step(dt);
+    g_isH.Step(dt);
+    g_wing.Step(dt);
+    g_mix.Step(dt);
+    const float wingT = fmaxf(g_wing.x, 0.0f);
+    const bool wingMoved = wingT != g_wingT;
+    g_wingT = wingT;
+    if (IslandSettled() && !ModulesAnimating()) {
         g_clock.Sleep();
         g_lastFrame = 0;
     }
-    InvalidateLayout();  // Paint adds the pill and whatever it pushed aside.
+    g_isDirty = true;
+    if (wingMoved) InvalidateLayout();  // Paint adds the old and new place of both buttons.
     Paint();
-    if (g_tracking) {
-        // The hit list moved with the pill: resync hover against the new layout.
-        POINT p;
-        GetCursorPos(&p);
-        ScreenToClient(g_hwnd, &p);
-        SetHover(HitIdAt(p));
-        SetPillTarget(PtInRect(&g_pillRect, p));
-    }
+    IslandPaint();
+    if (wingMoved) ResyncHover();
 }
 
 void RunAction(Action action) {
@@ -173,18 +170,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 TrackMouseEvent(&t);
             }
             POINT p{(short)LOWORD(lp), (short)HIWORD(lp)};
-            SetPillTarget(PtInRect(&g_pillRect, p));
             SetHover(HitIdAt(p));
             return 0;
         }
         case WM_MOUSELEAVE:
             g_tracking = false;
             SetHover(H_none);
-            SetPillTarget(false);
             return 0;
         case WM_APP_PAINT:
             Paint();
+            IslandPaint();
             return 0;
+        case WM_APP_POST: {
+            auto* fn = reinterpret_cast<std::function<void()>*>(lp);
+            if (fn) {
+                (*fn)();
+                delete fn;
+            }
+            return 0;
+        }
         case WM_MOUSEACTIVATE:
             return MA_NOACTIVATE;
         case WM_LBUTTONDOWN:
@@ -205,6 +209,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     ClickTrayIcon(g_hits[index].data, false);
                 } else {
                     RunAction(g_hits[index].action);
+                    if (g_hits[index].action == Action::Notifications || g_hits[index].action == Action::Calendar) {
+                        // Keep the buttons out while the panel opens, even if the pointer has left the island.
+                        g_wingHold = GetTickCount64() + kWingHoldMs;
+                        IslandRecompute();
+                    }
                 }
                 InvalidateAll();
             }
@@ -255,12 +264,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == kClockTimer) {
                 ArmClock();
                 InvalidateAll();
+                g_isDirty = true;
+                IslandRecompute();  // The text may be wider now.
             } else if (wp == kTitleTimer) {
                 KillTimer(hwnd, kTitleTimer);
                 g_titlePending = false;
                 ReadForeground();
                 InvalidateAll();
-                StepPill();
+                ResyncHover();
+            } else if (wp == kDwellTimer) {
+                IslandDwellTick();
+            } else if (wp == kZoneTimer) {
+                IslandZoneTick();
+            } else if (wp == kAlertTimer || wp == kWingTimer) {
+                KillTimer(hwnd, wp);
+                IslandRecompute();
+            } else if (wp >= kModuleTimerBase) {
+                RunModuleTimer(wp);
             } else if (wp == kPanelTimer) {
                 StepPanelFollow();
             } else if (wp == kFullscreenTimer) {
@@ -332,11 +352,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateAll();
             return 0;
         case WM_APP_FRAME:
-            StepPill();
+            StepFrame();
             return 0;
         case WM_APP_SETTINGS:
             g_settings = LoadSettings();
+            for (IModule* m : g_modules) m->OnSettings(g_settings);
             InvalidateAll();
+            IslandRecompute();
             return 0;
         case WM_REFRESH_TITLE:
             if (!g_titlePending) {
@@ -348,6 +370,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RehookTitle();
             ReadForeground();
             InvalidateAll();
+            IslandRecompute();  // A panel opening or closing moves the buttons.
             return 0;
         case WM_SETTINGCHANGE:
             ReadAccent();
@@ -357,6 +380,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_DISPLAYCHANGE:
         case WM_DPICHANGED:
             PlaceBar();
+            IslandRescale();
             InvalidateAll();
             return 0;
         case WM_CLOSE:
@@ -413,6 +437,7 @@ DWORD WINAPI BarThread(void*) {
     RehookTitle();
 
     RegisterBar();
+    IslandInit();
     ArmClock();
     InvalidateAll();
 
@@ -440,6 +465,7 @@ DWORD WINAPI BarThread(void*) {
         delete icon.pix;
     }
     g_tray.clear();
+    IslandShutdown();
     ReleaseGfx();
     CoUninitialize();
     return 0;

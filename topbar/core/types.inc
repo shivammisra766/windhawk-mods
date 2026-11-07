@@ -1,5 +1,6 @@
 
 constexpr wchar_t kClassName[] = L"WindhawkTopBar";
+constexpr wchar_t kIslandClass[] = L"WindhawkTopBarIsland";  // Must differ: other mods find the bar by kClassName.
 constexpr UINT WM_APPBAR_CB = WM_APP + 1;
 constexpr UINT WM_REFRESH_NET = WM_APP + 3;
 constexpr UINT WM_REFRESH_FOREGROUND = WM_APP + 4;
@@ -8,6 +9,7 @@ constexpr UINT WM_REFRESH_TITLE = WM_APP + 6;
 constexpr UINT WM_APP_FRAME = WM_APP + 10;     // From the frame clock thread: one per display frame while animating.
 constexpr UINT WM_APP_SETTINGS = WM_APP + 11;  // From the settings callback, which runs on another thread.
 constexpr UINT WM_APP_PAINT = WM_APP + 12;     // Coalesced repaint request.
+constexpr UINT WM_APP_POST = WM_APP + 13;      // Services::Post: lParam is a heap std::function<void()>.
 constexpr UINT_PTR kClockTimer = 1;
 constexpr UINT_PTR kTitleTimer = 2;  // Coalesces title changes.
 constexpr UINT_PTR kPanelTimer = 3;
@@ -16,6 +18,11 @@ constexpr UINT_PTR kReopenTimer = 5;
 constexpr UINT_PTR kQuickCloseTimer = 6;
 constexpr UINT_PTR kQuickPageTimer = 7;
 constexpr UINT_PTR kQuickReopenTimer = 8;
+constexpr UINT_PTR kDwellTimer = 9;    // Hover dwell before the island expands.
+constexpr UINT_PTR kZoneTimer = 10;    // Polls the pointer against the hover zone, only while expanded.
+constexpr UINT_PTR kAlertTimer = 11;   // Next alert deadline.
+constexpr UINT_PTR kWingTimer = 12;    // End of the hold that keeps bell and calendar out while a panel opens.
+constexpr UINT_PTR kModuleTimerBase = 100;  // Module timers: base + slot.
 
 // From the tray-bridge mod in Explorer, which declares the same layout.
 constexpr ULONG_PTR kTrayCopyData = 0x7472;
@@ -45,7 +52,18 @@ constexpr float kItemRadius = 4.8f;
 constexpr float kFontSize = 12.8f;
 constexpr float kPillH = 24.0f;  // Height of all three bubbles.
 constexpr float kPillPadX = 12.0f;
-constexpr float kPillButton = 20.0f;
+constexpr float kWingSize = 28.0f;     // Bell and calendar buttons.
+// Island (notch). DIP.
+constexpr float kNotchH = 30.0f;       // Collapsed height; the bar strip is 32.
+constexpr float kNotchShoulder = 6.0f; // Concave fillet where the notch meets the screen edge.
+constexpr float kNotchRadius = 10.0f;  // Bottom corners, collapsed.
+constexpr float kNotchRadiusOpen = 18.0f;
+constexpr float kIslandMaxW = 712.0f;  // Stage: the largest body any module may declare.
+constexpr float kIslandMaxH = 184.0f;
+constexpr UINT kDwellMs = 120;
+constexpr UINT kLeaveGraceMs = 250;
+constexpr UINT kZonePollMs = 50;
+constexpr int kWingHoldMs = 1500;
 constexpr float kBubbleMargin = 8.0f;  // Between a side bubble and the screen edge.
 constexpr float kBubblePad = 8.0f;     // Inside a side bubble, before the first item.
 constexpr float kBubbleClear = 12.0f;  // Least gap between the left bubble and the centre one.
@@ -112,17 +130,13 @@ int g_regionTop[3] = {};  // Clip top last seen for each mode, to place the pane
 int g_hoverId = H_none;
 std::vector<Hit> g_hits;
 
-// Pill animation: g_pillT runs from 0 (clock only) to 1 (buttons shown), driven by a spring.
-float g_pillT = 0.0f;
-bool g_pillTarget = false;
-RECT g_pillRect{};
+RECT g_monitor{};  // rcMonitor of the bar's monitor, set by PlaceBar. The notch hangs from its top edge.
 
 HWINEVENTHOOK g_foregroundHook = nullptr;
 HWINEVENTHOOK g_titleHook = nullptr;
 DWORD g_titlePid = 0;
 bool g_titlePending = false;
 FrameClock g_clock;
-Spring g_pillSpring;
 double g_lastFrame = 0;
 HANDLE g_netNotify = nullptr;
 HPOWERNOTIFY g_powerA = nullptr;

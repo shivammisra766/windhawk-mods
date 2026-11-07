@@ -1,5 +1,9 @@
 // ---- Bar placement and panels ----
 
+void IslandMoved();
+void IslandReset();
+void IslandRecompute();
+
 void PlaceBar() {
     if (!g_hwnd) {
         return;
@@ -7,6 +11,7 @@ void PlaceBar() {
     HMONITOR monitor = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFO mi{sizeof(mi)};
     GetMonitorInfoW(monitor, &mi);
+    g_monitor = mi.rcMonitor;
     const int height = (int)(kBarH * Scale() + 0.5f);
 
     APPBARDATA abd{sizeof(abd)};
@@ -19,6 +24,7 @@ void PlaceBar() {
     // Placement must never bring the bar back over a fullscreen app.
     SetWindowPos(g_hwnd, HWND_TOPMOST, abd.rc.left, abd.rc.top, abd.rc.right - abd.rc.left,
                  abd.rc.bottom - abd.rc.top, SWP_NOACTIVATE | (g_fullscreen ? 0 : SWP_SHOWWINDOW));
+    IslandMoved();
 }
 
 bool ForegroundCoversMonitor() {
@@ -42,16 +48,15 @@ void UpdateFullscreen() {
     g_fullscreen = fullscreen;
     if (fullscreen) {
         ShowWindow(g_hwnd, SW_HIDE);
-        // Forget the pointer and a half-open pill, so it does not come back expanded.
+        // Forget the pointer and a half-open island, so it does not come back expanded.
         g_tracking = false;
         g_hoverId = H_none;
-        g_pillTarget = false;
-        g_pillT = 0.0f;
-        g_pillSpring.Snap(0.0f);
+        IslandReset();
         g_clock.Sleep();
         g_lastFrame = 0;
     } else {
         PlaceBar();
+        IslandRecompute();
         InvalidateAll();
     }
 }

@@ -16,7 +16,13 @@ RECT g_dirty{};
 bool g_dirtyAny = false;
 bool g_dirtyWhole = false;
 bool g_paintPending = false;
-RECT g_bubbleRect[3]{};  // As last painted: left, centre, right.
+RECT g_bubbleRect[5]{};  // As last painted: left, (centre: the island's own window), right, bell, calendar.
+bool g_isDirty = false;  // The island needs drawing (see island.inc).
+float g_wingT = 0.0f;    // Bell and calendar travel: 0 parked under the notch, 1 at their place.
+float g_wingX[2]{};      // Their place (bar pixels, left edge), valid when g_wingOk.
+bool g_wingOk[2]{};      // False when the title or tray leave no room for the button.
+float g_wingSize = 0;
+float IslandMaxExpandedW();  // DIP, island.inc
 
 enum class CmdKind { Hover, Text, Icon, Avatar, Person, Pixmap, Tray };
 
@@ -33,8 +39,8 @@ struct Cmd {
 };
 
 std::vector<Cmd> g_cmds;
-D2D1_RECT_F g_bubbles[3]{};
-bool g_hasBubble[3]{};
+D2D1_RECT_F g_bubbles[5]{};  // 0 left, 1 unused, 2 right, 3 bell, 4 calendar
+bool g_hasBubble[5]{};
 float g_bubbleRadius = 0;
 
 bool EmptyRect(const RECT& r) { return r.right <= r.left || r.bottom <= r.top; }
@@ -84,11 +90,24 @@ bool EnsureGfx() {
     return true;
 }
 
+// Sets the font when the settings or the DPI changed it. Both windows draw with it.
+void PrepareText() {
+    const float s = Scale();
+    wchar_t key[160];
+    swprintf_s(key, L"%ls|%.3f", g_settings.fontFamily.c_str(), kFontSize * s * g_settings.fontScale / 100.0f);
+    if (g_fontKey != key) {
+        g_fontKey = key;
+        g_text.SetFont(g_settings.fontFamily, kFontSize * s * g_settings.fontScale / 100.0f);
+        g_dirtyWhole = g_dirtyAny = true;
+        g_isDirty = true;
+    }
+}
+
 void Layout(int W, int H) {
     const float s = Scale();
     g_cmds.clear();
     g_hits.clear();
-    g_hasBubble[0] = g_hasBubble[1] = g_hasBubble[2] = false;
+    for (bool& b : g_hasBubble) b = false;
 
     const float bubbleH = roundf(kPillH * s);
     const float by = floorf((H - bubbleH) / 2.0f);
@@ -186,35 +205,6 @@ void Layout(int W, int H) {
     g_bubbles[2] = D2D1::RectF(right + gap - bpad, by, W - margin, by + bubbleH);
     g_hasBubble[2] = true;
 
-    // Centre bubble: the pill, clock fixed in the middle, growing outward on hover.
-    wchar_t timeText[32] = {};
-    wchar_t dateText[32] = {};
-    GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, L"hh':'mm tt", timeText, 32);
-    GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, L"ddd d MMM", dateText, 32, nullptr);
-    const std::wstring clock = std::wstring(dateText) + L", " + timeText;
-    const float clockW = g_text.Measure(clock);
-    const float t = g_pillT;
-    const float button = kPillButton * s;
-    const float grow = (button + gap) * t;
-    const float pillW = clockW + 2 * kPillPadX * s + 2 * grow;
-    const float pillX = floorf((W - pillW) / 2.0f);
-    g_pillRect = {(LONG)pillX, 0, (LONG)(pillX + pillW + 1), H};
-    g_bubbles[1] = D2D1::RectF(pillX, by, pillX + pillW, by + bubbleH);
-    g_hasBubble[1] = true;
-    text(clock, (W - clockW) / 2.0f, by, clockW + 2, bubbleH);
-    if (t > 0.01f) {
-        const float buttonY = by + (bubbleH - button) / 2.0f;
-        const float inset = (bubbleH - button) / 2.0f;
-        auto pillButton = [&](float x, IconId id, Action action, int hitId, float iconH) {
-            if (t > 0.5f) {
-                addHit(x, buttonY, button, button, button / 2.0f, action, hitId);
-            }
-            iconCmd(id, x + button / 2.0f, by + bubbleH / 2.0f, iconH, t);
-        };
-        pillButton(pillX + inset, I_bell, Action::Notifications, H_bell, 15.0f * s);
-        pillButton(pillX + pillW - inset - button, I_calendar, Action::Calendar, H_calendar, 13.0f * s);
-    }
-
     // Left bubble: user, separator, app, separator, title. It gives way to the pill as it grows.
     float left = margin + bpad;
     const float slot = icon + 2 * pad;
@@ -231,7 +221,10 @@ void Layout(int W, int H) {
     float drawnRight = left + slot;
     left += slot + gap;
 
-    const float limit = pillX - kBubbleClear * s - bpad;
+    // The left bubble stops where the bell will stand when the island is fully open, so nothing reflows.
+    const float btn = roundf(kWingSize * s);
+    const float expHalf = IslandMaxExpandedW() * s / 2.0f + kNotchShoulder * s;
+    const float limit = (W / 2.0f - expHalf) - margin - gap - btn - gap - bpad;
     auto textItem = [&](const std::wstring& str) {
         const float w = g_text.Measure(str);
         if (left + pad + w < limit) {
@@ -264,6 +257,36 @@ void Layout(int W, int H) {
     }
     g_bubbles[0] = D2D1::RectF(margin, by, drawnRight + bpad, by + bubbleH);
     g_hasBubble[0] = true;
+
+    // Bell and calendar run out from under the notch to stand beside the side bubbles.
+    g_wingSize = btn;
+    const float parked = W / 2.0f - btn / 2.0f;
+    const float wy = floorf((H - btn) / 2.0f);
+    g_wingX[0] = roundf(g_bubbles[0].right + gap);
+    g_wingX[1] = roundf(g_bubbles[2].left - gap - btn);
+    g_wingOk[0] = g_wingX[0] + btn + gap <= W / 2.0f - expHalf;
+    g_wingOk[1] = g_wingX[1] >= W / 2.0f + expHalf + gap;
+    static bool logged[2];
+    for (int i = 0; i < 2; i++) {
+        if (g_wingOk[i] == logged[i]) {
+            logged[i] = !g_wingOk[i];
+            if (!g_wingOk[i]) Wh_Log(L"No room for the %ls button beside the island", i ? L"calendar" : L"bell");
+        }
+    }
+    if (g_wingT > 0.01f) {
+        const float t = g_wingT;
+        for (int i = 0; i < 2; i++) {
+            if (!g_wingOk[i]) continue;
+            const float x = parked + (g_wingX[i] - parked) * t;
+            const int slot = 3 + i;
+            g_bubbles[slot] = D2D1::RectF(x, wy, x + btn, wy + btn);
+            g_hasBubble[slot] = true;
+            if (t > 0.6f) {
+                addHit(x, wy, btn, btn, btn / 2.0f, i ? Action::Calendar : Action::Notifications, i ? H_calendar : H_bell);
+            }
+            iconCmd(i ? I_calendar : I_bell, x + btn / 2.0f, wy + btn / 2.0f, (i ? 14.0f : 16.0f) * s);
+        }
+    }
 }
 
 ID2D1Bitmap* BitmapOf(ID2D1RenderTarget* rt, Pixmap& p) {
@@ -283,10 +306,11 @@ void DrawFrame(ID2D1RenderTarget* rt) {
         brush->SetColor(c);
     };
 
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 5; i++) {
         if (!g_hasBubble[i]) continue;
-        color(i == 1 ? kCentreBg : kSideBg);
-        rt->FillRoundedRectangle(D2D1::RoundedRect(g_bubbles[i], g_bubbleRadius, g_bubbleRadius), brush);
+        const float radius = i < 3 ? g_bubbleRadius : g_wingSize / 2.0f;
+        color(kSideBg);
+        rt->FillRoundedRectangle(D2D1::RoundedRect(g_bubbles[i], radius, radius), brush);
     }
 
     for (const Cmd& c : g_cmds) {
@@ -359,16 +383,10 @@ void Paint() {
     if (!g_surface.Resize(g_factory.Get(), W, H)) {
         return;
     }
+    PrepareText();
     bool whole = g_dirtyWhole || g_surface.Generation() != before;
 
     const float s = Scale();
-    wchar_t key[160];
-    swprintf_s(key, L"%ls|%.3f", g_settings.fontFamily.c_str(), kFontSize * s * g_settings.fontScale / 100.0f);
-    if (g_fontKey != key) {
-        g_fontKey = key;
-        g_text.SetFont(g_settings.fontFamily, kFontSize * s * g_settings.fontScale / 100.0f);
-        whole = true;
-    }
     EnsureAvatar((int)roundf(kItem * s));
     Layout(W, H);
 
@@ -384,7 +402,7 @@ void Paint() {
 
     // Whatever moved or resized: old and new place both need drawing.
     RECT dirty = whole ? RECT{0, 0, W, H} : g_dirty;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 5; i++) {
         RECT now{};
         if (g_hasBubble[i]) {
             now = {(LONG)floorf(g_bubbles[i].left) - 1, (LONG)floorf(g_bubbles[i].top) - 1,

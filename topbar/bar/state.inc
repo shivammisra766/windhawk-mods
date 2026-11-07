@@ -185,7 +185,7 @@ bool IsShellWindow(HWND hwnd) {
     GetClassNameW(hwnd, cls, 64);
     return !wcscmp(cls, L"Shell_TrayWnd") || !wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW") ||
            !wcscmp(cls, L"Windows.UI.Core.CoreWindow") || !wcscmp(cls, L"ControlCenterWindow") ||
-           !wcscmp(cls, L"XamlExplorerHostIslandWindow") || !wcscmp(cls, kClassName);
+           !wcscmp(cls, L"XamlExplorerHostIslandWindow") || !wcscmp(cls, kClassName) || !wcscmp(cls, kIslandClass);
 }
 
 void ReadForeground() {

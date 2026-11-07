@@ -2,7 +2,7 @@
 // @id              top-bar
 // @name            Top bar
 // @description     Top bar with three bubbles in the Seelen toolbar style, drawn with Direct2D
-// @version         3.0
+// @version         3.1
 // @author          local
 // @include         windhawk.exe
 // @compilerOptions -lgdi32 -luser32 -lshell32 -ladvapi32 -lole32 -lversion -lwininet -liphlpapi -luuid -ld2d1 -ldwrite -lwindowscodecs -ldwmapi
@@ -40,6 +40,7 @@
 #include <atomic>
 #include <unordered_map>
 #include <algorithm>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -172,6 +173,7 @@ private:
 #line 1 "core/types.inc"
 
 constexpr wchar_t kClassName[] = L"WindhawkTopBar";
+constexpr wchar_t kIslandClass[] = L"WindhawkTopBarIsland";  // Must differ: other mods find the bar by kClassName.
 constexpr UINT WM_APPBAR_CB = WM_APP + 1;
 constexpr UINT WM_REFRESH_NET = WM_APP + 3;
 constexpr UINT WM_REFRESH_FOREGROUND = WM_APP + 4;
@@ -180,6 +182,7 @@ constexpr UINT WM_REFRESH_TITLE = WM_APP + 6;
 constexpr UINT WM_APP_FRAME = WM_APP + 10;     // From the frame clock thread: one per display frame while animating.
 constexpr UINT WM_APP_SETTINGS = WM_APP + 11;  // From the settings callback, which runs on another thread.
 constexpr UINT WM_APP_PAINT = WM_APP + 12;     // Coalesced repaint request.
+constexpr UINT WM_APP_POST = WM_APP + 13;      // Services::Post: lParam is a heap std::function<void()>.
 constexpr UINT_PTR kClockTimer = 1;
 constexpr UINT_PTR kTitleTimer = 2;  // Coalesces title changes.
 constexpr UINT_PTR kPanelTimer = 3;
@@ -188,6 +191,11 @@ constexpr UINT_PTR kReopenTimer = 5;
 constexpr UINT_PTR kQuickCloseTimer = 6;
 constexpr UINT_PTR kQuickPageTimer = 7;
 constexpr UINT_PTR kQuickReopenTimer = 8;
+constexpr UINT_PTR kDwellTimer = 9;    // Hover dwell before the island expands.
+constexpr UINT_PTR kZoneTimer = 10;    // Polls the pointer against the hover zone, only while expanded.
+constexpr UINT_PTR kAlertTimer = 11;   // Next alert deadline.
+constexpr UINT_PTR kWingTimer = 12;    // End of the hold that keeps bell and calendar out while a panel opens.
+constexpr UINT_PTR kModuleTimerBase = 100;  // Module timers: base + slot.
 
 // From the tray-bridge mod in Explorer, which declares the same layout.
 constexpr ULONG_PTR kTrayCopyData = 0x7472;
@@ -217,7 +225,18 @@ constexpr float kItemRadius = 4.8f;
 constexpr float kFontSize = 12.8f;
 constexpr float kPillH = 24.0f;  // Height of all three bubbles.
 constexpr float kPillPadX = 12.0f;
-constexpr float kPillButton = 20.0f;
+constexpr float kWingSize = 28.0f;     // Bell and calendar buttons.
+// Island (notch). DIP.
+constexpr float kNotchH = 30.0f;       // Collapsed height; the bar strip is 32.
+constexpr float kNotchShoulder = 6.0f; // Concave fillet where the notch meets the screen edge.
+constexpr float kNotchRadius = 10.0f;  // Bottom corners, collapsed.
+constexpr float kNotchRadiusOpen = 18.0f;
+constexpr float kIslandMaxW = 712.0f;  // Stage: the largest body any module may declare.
+constexpr float kIslandMaxH = 184.0f;
+constexpr UINT kDwellMs = 120;
+constexpr UINT kLeaveGraceMs = 250;
+constexpr UINT kZonePollMs = 50;
+constexpr int kWingHoldMs = 1500;
 constexpr float kBubbleMargin = 8.0f;  // Between a side bubble and the screen edge.
 constexpr float kBubblePad = 8.0f;     // Inside a side bubble, before the first item.
 constexpr float kBubbleClear = 12.0f;  // Least gap between the left bubble and the centre one.
@@ -284,17 +303,13 @@ int g_regionTop[3] = {};  // Clip top last seen for each mode, to place the pane
 int g_hoverId = H_none;
 std::vector<Hit> g_hits;
 
-// Pill animation: g_pillT runs from 0 (clock only) to 1 (buttons shown), driven by a spring.
-float g_pillT = 0.0f;
-bool g_pillTarget = false;
-RECT g_pillRect{};
+RECT g_monitor{};  // rcMonitor of the bar's monitor, set by PlaceBar. The notch hangs from its top edge.
 
 HWINEVENTHOOK g_foregroundHook = nullptr;
 HWINEVENTHOOK g_titleHook = nullptr;
 DWORD g_titlePid = 0;
 bool g_titlePending = false;
 FrameClock g_clock;
-Spring g_pillSpring;
 double g_lastFrame = 0;
 HANDLE g_netNotify = nullptr;
 HPOWERNOTIFY g_powerA = nullptr;
@@ -694,6 +709,25 @@ public:
         ReleaseDC(nullptr, screen);
     }
 
+    // Pushes only the crop (srcX, 0, size) of the DIB, and moves and resizes the window to match. Used by the
+    // island, whose window is just the current shape while the DIB is the largest stage.
+    void PresentCrop(HWND hwnd, POINT pos, POINT src, SIZE size) {
+        if (!mem_) return;
+        HDC screen = GetDC(nullptr);
+        BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        UPDATELAYEREDWINDOWINFO info{};
+        info.cbSize = sizeof(info);
+        info.hdcDst = screen;
+        info.pptDst = &pos;
+        info.psize = &size;
+        info.hdcSrc = mem_;
+        info.pptSrc = &src;
+        info.pblend = &blend;
+        info.dwFlags = ULW_ALPHA;
+        UpdateLayeredWindowIndirect(hwnd, &info);
+        ReleaseDC(nullptr, screen);
+    }
+
     ID2D1DCRenderTarget* Target() const { return rt_.Get(); }
     unsigned Generation() const { return generation_; }
     int Width() const { return w_; }
@@ -1071,7 +1105,7 @@ bool IsShellWindow(HWND hwnd) {
     GetClassNameW(hwnd, cls, 64);
     return !wcscmp(cls, L"Shell_TrayWnd") || !wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW") ||
            !wcscmp(cls, L"Windows.UI.Core.CoreWindow") || !wcscmp(cls, L"ControlCenterWindow") ||
-           !wcscmp(cls, L"XamlExplorerHostIslandWindow") || !wcscmp(cls, kClassName);
+           !wcscmp(cls, L"XamlExplorerHostIslandWindow") || !wcscmp(cls, kClassName) || !wcscmp(cls, kIslandClass);
 }
 
 void ReadForeground() {
@@ -1153,7 +1187,13 @@ RECT g_dirty{};
 bool g_dirtyAny = false;
 bool g_dirtyWhole = false;
 bool g_paintPending = false;
-RECT g_bubbleRect[3]{};  // As last painted: left, centre, right.
+RECT g_bubbleRect[5]{};  // As last painted: left, (centre: the island's own window), right, bell, calendar.
+bool g_isDirty = false;  // The island needs drawing (see island.inc).
+float g_wingT = 0.0f;    // Bell and calendar travel: 0 parked under the notch, 1 at their place.
+float g_wingX[2]{};      // Their place (bar pixels, left edge), valid when g_wingOk.
+bool g_wingOk[2]{};      // False when the title or tray leave no room for the button.
+float g_wingSize = 0;
+float IslandMaxExpandedW();  // DIP, island.inc
 
 enum class CmdKind { Hover, Text, Icon, Avatar, Person, Pixmap, Tray };
 
@@ -1170,8 +1210,8 @@ struct Cmd {
 };
 
 std::vector<Cmd> g_cmds;
-D2D1_RECT_F g_bubbles[3]{};
-bool g_hasBubble[3]{};
+D2D1_RECT_F g_bubbles[5]{};  // 0 left, 1 unused, 2 right, 3 bell, 4 calendar
+bool g_hasBubble[5]{};
 float g_bubbleRadius = 0;
 
 bool EmptyRect(const RECT& r) { return r.right <= r.left || r.bottom <= r.top; }
@@ -1221,11 +1261,24 @@ bool EnsureGfx() {
     return true;
 }
 
+// Sets the font when the settings or the DPI changed it. Both windows draw with it.
+void PrepareText() {
+    const float s = Scale();
+    wchar_t key[160];
+    swprintf_s(key, L"%ls|%.3f", g_settings.fontFamily.c_str(), kFontSize * s * g_settings.fontScale / 100.0f);
+    if (g_fontKey != key) {
+        g_fontKey = key;
+        g_text.SetFont(g_settings.fontFamily, kFontSize * s * g_settings.fontScale / 100.0f);
+        g_dirtyWhole = g_dirtyAny = true;
+        g_isDirty = true;
+    }
+}
+
 void Layout(int W, int H) {
     const float s = Scale();
     g_cmds.clear();
     g_hits.clear();
-    g_hasBubble[0] = g_hasBubble[1] = g_hasBubble[2] = false;
+    for (bool& b : g_hasBubble) b = false;
 
     const float bubbleH = roundf(kPillH * s);
     const float by = floorf((H - bubbleH) / 2.0f);
@@ -1323,35 +1376,6 @@ void Layout(int W, int H) {
     g_bubbles[2] = D2D1::RectF(right + gap - bpad, by, W - margin, by + bubbleH);
     g_hasBubble[2] = true;
 
-    // Centre bubble: the pill, clock fixed in the middle, growing outward on hover.
-    wchar_t timeText[32] = {};
-    wchar_t dateText[32] = {};
-    GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, L"hh':'mm tt", timeText, 32);
-    GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, L"ddd d MMM", dateText, 32, nullptr);
-    const std::wstring clock = std::wstring(dateText) + L", " + timeText;
-    const float clockW = g_text.Measure(clock);
-    const float t = g_pillT;
-    const float button = kPillButton * s;
-    const float grow = (button + gap) * t;
-    const float pillW = clockW + 2 * kPillPadX * s + 2 * grow;
-    const float pillX = floorf((W - pillW) / 2.0f);
-    g_pillRect = {(LONG)pillX, 0, (LONG)(pillX + pillW + 1), H};
-    g_bubbles[1] = D2D1::RectF(pillX, by, pillX + pillW, by + bubbleH);
-    g_hasBubble[1] = true;
-    text(clock, (W - clockW) / 2.0f, by, clockW + 2, bubbleH);
-    if (t > 0.01f) {
-        const float buttonY = by + (bubbleH - button) / 2.0f;
-        const float inset = (bubbleH - button) / 2.0f;
-        auto pillButton = [&](float x, IconId id, Action action, int hitId, float iconH) {
-            if (t > 0.5f) {
-                addHit(x, buttonY, button, button, button / 2.0f, action, hitId);
-            }
-            iconCmd(id, x + button / 2.0f, by + bubbleH / 2.0f, iconH, t);
-        };
-        pillButton(pillX + inset, I_bell, Action::Notifications, H_bell, 15.0f * s);
-        pillButton(pillX + pillW - inset - button, I_calendar, Action::Calendar, H_calendar, 13.0f * s);
-    }
-
     // Left bubble: user, separator, app, separator, title. It gives way to the pill as it grows.
     float left = margin + bpad;
     const float slot = icon + 2 * pad;
@@ -1368,7 +1392,10 @@ void Layout(int W, int H) {
     float drawnRight = left + slot;
     left += slot + gap;
 
-    const float limit = pillX - kBubbleClear * s - bpad;
+    // The left bubble stops where the bell will stand when the island is fully open, so nothing reflows.
+    const float btn = roundf(kWingSize * s);
+    const float expHalf = IslandMaxExpandedW() * s / 2.0f + kNotchShoulder * s;
+    const float limit = (W / 2.0f - expHalf) - margin - gap - btn - gap - bpad;
     auto textItem = [&](const std::wstring& str) {
         const float w = g_text.Measure(str);
         if (left + pad + w < limit) {
@@ -1401,6 +1428,36 @@ void Layout(int W, int H) {
     }
     g_bubbles[0] = D2D1::RectF(margin, by, drawnRight + bpad, by + bubbleH);
     g_hasBubble[0] = true;
+
+    // Bell and calendar run out from under the notch to stand beside the side bubbles.
+    g_wingSize = btn;
+    const float parked = W / 2.0f - btn / 2.0f;
+    const float wy = floorf((H - btn) / 2.0f);
+    g_wingX[0] = roundf(g_bubbles[0].right + gap);
+    g_wingX[1] = roundf(g_bubbles[2].left - gap - btn);
+    g_wingOk[0] = g_wingX[0] + btn + gap <= W / 2.0f - expHalf;
+    g_wingOk[1] = g_wingX[1] >= W / 2.0f + expHalf + gap;
+    static bool logged[2];
+    for (int i = 0; i < 2; i++) {
+        if (g_wingOk[i] == logged[i]) {
+            logged[i] = !g_wingOk[i];
+            if (!g_wingOk[i]) Wh_Log(L"No room for the %ls button beside the island", i ? L"calendar" : L"bell");
+        }
+    }
+    if (g_wingT > 0.01f) {
+        const float t = g_wingT;
+        for (int i = 0; i < 2; i++) {
+            if (!g_wingOk[i]) continue;
+            const float x = parked + (g_wingX[i] - parked) * t;
+            const int slot = 3 + i;
+            g_bubbles[slot] = D2D1::RectF(x, wy, x + btn, wy + btn);
+            g_hasBubble[slot] = true;
+            if (t > 0.6f) {
+                addHit(x, wy, btn, btn, btn / 2.0f, i ? Action::Calendar : Action::Notifications, i ? H_calendar : H_bell);
+            }
+            iconCmd(i ? I_calendar : I_bell, x + btn / 2.0f, wy + btn / 2.0f, (i ? 14.0f : 16.0f) * s);
+        }
+    }
 }
 
 ID2D1Bitmap* BitmapOf(ID2D1RenderTarget* rt, Pixmap& p) {
@@ -1420,10 +1477,11 @@ void DrawFrame(ID2D1RenderTarget* rt) {
         brush->SetColor(c);
     };
 
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 5; i++) {
         if (!g_hasBubble[i]) continue;
-        color(i == 1 ? kCentreBg : kSideBg);
-        rt->FillRoundedRectangle(D2D1::RoundedRect(g_bubbles[i], g_bubbleRadius, g_bubbleRadius), brush);
+        const float radius = i < 3 ? g_bubbleRadius : g_wingSize / 2.0f;
+        color(kSideBg);
+        rt->FillRoundedRectangle(D2D1::RoundedRect(g_bubbles[i], radius, radius), brush);
     }
 
     for (const Cmd& c : g_cmds) {
@@ -1496,16 +1554,10 @@ void Paint() {
     if (!g_surface.Resize(g_factory.Get(), W, H)) {
         return;
     }
+    PrepareText();
     bool whole = g_dirtyWhole || g_surface.Generation() != before;
 
     const float s = Scale();
-    wchar_t key[160];
-    swprintf_s(key, L"%ls|%.3f", g_settings.fontFamily.c_str(), kFontSize * s * g_settings.fontScale / 100.0f);
-    if (g_fontKey != key) {
-        g_fontKey = key;
-        g_text.SetFont(g_settings.fontFamily, kFontSize * s * g_settings.fontScale / 100.0f);
-        whole = true;
-    }
     EnsureAvatar((int)roundf(kItem * s));
     Layout(W, H);
 
@@ -1521,7 +1573,7 @@ void Paint() {
 
     // Whatever moved or resized: old and new place both need drawing.
     RECT dirty = whole ? RECT{0, 0, W, H} : g_dirty;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 5; i++) {
         RECT now{};
         if (g_hasBubble[i]) {
             now = {(LONG)floorf(g_bubbles[i].left) - 1, (LONG)floorf(g_bubbles[i].top) - 1,
@@ -1563,8 +1615,159 @@ void ReleaseGfx() {
     g_factory.Reset();
 }
 
+#line 1 "bar/module.inc"
+// ---- Module interface: FROZEN at the end of P4. See specs/module-api.md. ----
+// Feature modules (media, alerts, dashboards) implement IModule and are listed in g_modules.
+// Everything here runs on the UI thread. A module's own workers hand results over with Services::Post.
+
+struct Size2 { float w, h; };  // DIP
+
+enum class View { Pill, Alert, Dashboard };
+
+struct DrawCtx {
+    ID2D1RenderTarget* rt;
+    ID2D1SolidColorBrush* brush;  // Shared. Set its colour before each use; multiply alpha by `alpha`.
+    D2D1_RECT_F rect;             // Pixels. Exactly Measure(view) scaled by `scale`, in the island's stage.
+    float alpha;                  // Content fade, 0..1.
+    float scale;                  // DPI scale: DIP * scale = pixels.
+    double now, dt;               // QPC seconds.
+    View view;
+};
+
+struct PointerEvent {
+    enum Kind { Move, Down, Up, Leave } kind;
+    D2D1_POINT_2F pt;  // Pixels relative to rect.left, rect.top.
+    bool left;
+};
+
+enum class PanelKind { Notifications, Calendar };
+
+class Services;
+
+class IModule {
+public:
+    virtual ~IModule() = default;
+    virtual const wchar_t* Id() const = 0;
+    virtual void Start(Services&) {}
+    virtual void Stop() {}
+    virtual void OnSettings(const Settings&) {}
+
+    // Dashboards appear as pages in the expanded island, in DashboardOrder().
+    virtual bool HasDashboard() const { return false; }
+    virtual int DashboardOrder() const { return 100; }
+    // Collapsed: the module with the highest PillPriority() above 0 shows; otherwise the clock.
+    virtual int PillPriority() const { return 0; }
+
+    virtual Size2 Measure(View) = 0;  // Called when state changes, not per frame.
+    virtual void Draw(const DrawCtx&) = 0;
+    virtual bool OnPointer(const PointerEvent&, View) { return false; }  // true: handled
+    virtual void OnClickAlert() {}                                        // The alert was tapped.
+
+    virtual bool Animating(View) const { return false; }  // True keeps the frame clock running.
+    virtual void OnVisibility(View, bool shown) {}        // Start or stop costly sampling.
+};
+
+class Services {
+public:
+    // Alerts queue by priority (higher first), then arrival. ms == 0: stays until ClearAlert.
+    // An alert that arrives while the island is expanded waits; it does not close the island.
+    void ShowAlert(IModule*, int priority, int ms);
+    void ClearAlert(IModule*);
+
+    void Invalidate();       // Redraw the island once.
+    void WakeAnimation();    // Re-check Animating() and run the frame clock.
+    void Post(std::function<void()>);  // From any thread to the UI thread.
+    void SetTimer(IModule*, UINT ms, std::function<void()>);  // One timer per module; repeats until KillTimer.
+    void KillTimer(IModule*);
+    void OpenPanel(PanelKind, int anchorX);  // The native notification or calendar panel.
+    const Settings& GetSettings() const;
+    const wchar_t* Loc(const wchar_t* key) const;
+    TextService& Text();
+    // Reserved, added by the module that first needs them: Images() for decoded art, PersistInt.
+};
+
+// ---- Stub modules: what P4 ships so the shell can be seen. Later agents replace or add to these. ----
+
+float ToDip(float px) { return px / Scale(); }
+
+std::wstring ClockText() {
+    wchar_t timeText[32] = {};
+    wchar_t dateText[32] = {};
+    GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, L"hh':'mm tt", timeText, 32);
+    GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, L"ddd d MMM", dateText, 32, nullptr);
+    return std::wstring(dateText) + L", " + timeText;
+}
+
+void DrawCentredText(const DrawCtx& c, const std::wstring& text, D2D1_RECT_F r, float size = 0) {
+    D2D1_COLOR_F col = kFg;
+    col.a *= c.alpha;
+    c.brush->SetColor(col);
+    TextOpts o;
+    o.maxW = r.right - r.left;
+    o.maxH = r.bottom - r.top;
+    o.center = true;
+    o.size = size;
+    g_text.Draw(c.rt, text, r.left, r.top, c.brush, o);
+}
+
+// The collapsed content: date and time.
+class ClockModule : public IModule {
+public:
+    const wchar_t* Id() const override { return L"clock"; }
+    Size2 Measure(View) override { return {ToDip(g_text.Measure(ClockText())) + 2 * kPillPadX, kNotchH}; }
+    void Draw(const DrawCtx& c) override { DrawCentredText(c, ClockText(), c.rect); }
+};
+
+// Stub alert, raised by right-clicking the island so the alert queue can be seen. Replaced by P6b.
+class DemoAlertModule : public IModule {
+public:
+    const wchar_t* Id() const override { return L"demo-alert"; }
+    void Start(Services& s) override { services_ = &s; }
+    Size2 Measure(View) override { return {240.0f, kNotchH}; }
+    void Draw(const DrawCtx& c) override {
+        D2D1_COLOR_F col = kFg;
+        col.a *= c.alpha;
+        c.brush->SetColor(col);
+        const float cy = (c.rect.top + c.rect.bottom) / 2.0f;
+        g_icons.Draw(c.rt, c.brush, I_bell, c.rect.left + 22.0f * c.scale, cy, 16.0f * c.scale);
+        DrawCentredText(c, L"Demo alert", D2D1::RectF(c.rect.left + 40.0f * c.scale, c.rect.top, c.rect.right, c.rect.bottom));
+    }
+    void OnClickAlert() override { if (services_) services_->ClearAlert(this); }
+    void Raise() { if (services_) services_->ShowAlert(this, 1, 3000); }
+private:
+    Services* services_ = nullptr;
+};
+
+// Stub dashboard page. Replaced by the real dashboards (P6c).
+class PlaceholderPage : public IModule {
+public:
+    PlaceholderPage(int index, int count) : index_(index), count_(count) {}
+    const wchar_t* Id() const override { return index_ == 1 ? L"page-1" : L"page-2"; }
+    bool HasDashboard() const override { return true; }
+    int DashboardOrder() const override { return index_ * 10; }
+    Size2 Measure(View) override { return {475.0f, 140.0f}; }
+    void Draw(const DrawCtx& c) override {
+        wchar_t line[64];
+        swprintf_s(line, L"Placeholder page %d of %d", index_, count_);
+        const float h = c.rect.bottom - c.rect.top;
+        DrawCentredText(c, line, D2D1::RectF(c.rect.left, c.rect.top + h * 0.22f, c.rect.right, c.rect.top + h * 0.5f), g_text.DefaultSize() * 1.4f);
+        DrawCentredText(c, L"Scroll to switch pages", D2D1::RectF(c.rect.left, c.rect.top + h * 0.5f, c.rect.right, c.rect.top + h * 0.7f));
+    }
+private:
+    int index_, count_;
+};
+
+ClockModule g_clockModule;
+DemoAlertModule g_demoAlert;
+PlaceholderPage g_page1(1, 2), g_page2(2, 2);
+IModule* const g_modules[] = {&g_clockModule, &g_demoAlert, &g_page1, &g_page2};
+
 #line 1 "bar/placement.inc"
 // ---- Bar placement and panels ----
+
+void IslandMoved();
+void IslandReset();
+void IslandRecompute();
 
 void PlaceBar() {
     if (!g_hwnd) {
@@ -1573,6 +1776,7 @@ void PlaceBar() {
     HMONITOR monitor = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFO mi{sizeof(mi)};
     GetMonitorInfoW(monitor, &mi);
+    g_monitor = mi.rcMonitor;
     const int height = (int)(kBarH * Scale() + 0.5f);
 
     APPBARDATA abd{sizeof(abd)};
@@ -1585,6 +1789,7 @@ void PlaceBar() {
     // Placement must never bring the bar back over a fullscreen app.
     SetWindowPos(g_hwnd, HWND_TOPMOST, abd.rc.left, abd.rc.top, abd.rc.right - abd.rc.left,
                  abd.rc.bottom - abd.rc.top, SWP_NOACTIVATE | (g_fullscreen ? 0 : SWP_SHOWWINDOW));
+    IslandMoved();
 }
 
 bool ForegroundCoversMonitor() {
@@ -1608,16 +1813,15 @@ void UpdateFullscreen() {
     g_fullscreen = fullscreen;
     if (fullscreen) {
         ShowWindow(g_hwnd, SW_HIDE);
-        // Forget the pointer and a half-open pill, so it does not come back expanded.
+        // Forget the pointer and a half-open island, so it does not come back expanded.
         g_tracking = false;
         g_hoverId = H_none;
-        g_pillTarget = false;
-        g_pillT = 0.0f;
-        g_pillSpring.Snap(0.0f);
+        IslandReset();
         g_clock.Sleep();
         g_lastFrame = 0;
     } else {
         PlaceBar();
+        IslandRecompute();
         InvalidateAll();
     }
 }
@@ -2070,6 +2274,530 @@ void ToggleProfile() {
 
 
 
+#line 1 "bar/island.inc"
+// ---- Island: the centre bubble, a layered window owned by the bar, on the bar's thread ----
+// The window is only as big as the notch at that moment. Drawing goes to a retained stage-sized DIB;
+// each frame presents the crop that holds the shape, so a settled notch is a small window and an
+// idle one costs nothing. Hover, alerts and tabs are decided here; modules draw the content.
+
+HWND g_isHwnd = nullptr;
+LayeredSurface g_isSurface;
+Com<ID2D1SolidColorBrush> g_isBrush;
+unsigned g_isBrushGen = 0;
+
+enum class IState { Collapsed, Alert, Expanded };
+struct ViewSel {
+    IModule* m = nullptr;
+    View v = View::Pill;
+    bool operator==(const ViewSel& o) const { return m == o.m && v == o.v; }
+    bool operator!=(const ViewSel& o) const { return !(*this == o); }
+};
+struct AlertItem {
+    IModule* m;
+    int priority;
+    ULONGLONG expires;  // 0: until cleared
+    ULONGLONG seq;
+};
+
+IState g_isState = IState::Collapsed;
+Spring g_isW, g_isH;    // Body size, pixels.
+Spring g_wing;          // 0 bell and calendar parked, 1 out.
+Spring g_mix;           // Cross-fade between g_viewPrev and g_viewCur.
+ViewSel g_viewCur, g_viewPrev;
+Size2 g_curSize{}, g_prevSize{};  // Measure() of each, taken when state changes.
+double g_frameDt = 0;
+bool g_isInit = false;
+bool g_expanded = false;   // Hover (after the dwell) or pinned.
+bool g_pinned = false;     // Reserved for the menu (P5c).
+bool g_covered = false;    // Reserved for the native volume popup (P5b): blocks hover expansion.
+bool g_isTracking = false;
+bool g_dwelling = false;
+int g_tab = 0;
+int g_wheelAcc = 0;
+ULONGLONG g_leaveSince = 0;
+ULONGLONG g_wingHold = 0;
+ULONGLONG g_alertSeq = 0;
+std::vector<AlertItem> g_alerts;
+RECT g_isBody{};        // Screen rect of the body as drawn.
+RECT g_isTarget{};      // Screen rect of the body when the springs have settled (no shoulders).
+D2D1_RECT_F g_isView{}; // Stage rect of the view last drawn, for pointer events.
+int g_isCropX = 0;
+
+struct ModuleTimer { IModule* m; std::function<void()> fn; };
+std::vector<ModuleTimer> g_moduleTimers;
+
+float Clamp01(float v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+
+std::vector<IModule*> Dashboards() {
+    std::vector<IModule*> out;
+    for (IModule* m : g_modules) if (m->HasDashboard()) out.push_back(m);
+    std::stable_sort(out.begin(), out.end(), [](IModule* a, IModule* b) { return a->DashboardOrder() < b->DashboardOrder(); });
+    return out;
+}
+
+IModule* PillModule() {
+    IModule* best = &g_clockModule;
+    int priority = 0;
+    for (IModule* m : g_modules) {
+        if (m->PillPriority() > priority) { priority = m->PillPriority(); best = m; }
+    }
+    return best;
+}
+
+IModule* TopAlert() {
+    const AlertItem* best = nullptr;
+    for (const AlertItem& a : g_alerts) {
+        if (!best || a.priority > best->priority || (a.priority == best->priority && a.seq < best->seq)) best = &a;
+    }
+    return best ? best->m : nullptr;
+}
+
+// Widest dashboard any module declares: the bar caps its left bubble by it, so nothing reflows.
+float IslandMaxExpandedW() {
+    float w = 0;
+    for (IModule* m : g_modules) if (m->HasDashboard()) w = std::max(w, m->Measure(View::Dashboard).w);
+    return w > 0 ? std::min(w, kIslandMaxW) : 475.0f;
+}
+
+bool PanelWingsWanted() {
+    HWND fg = GetForegroundWindow();
+    return fg && IsShellExperienceWindow(fg) && (g_panelMode == kPanelNotifications || g_panelMode == kPanelCalendar);
+}
+
+void AimIfChanged(Spring& sp, float target, float k, float c) {
+    if (fabsf(sp.target - target) > 0.01f) sp.Aim(target, k, c);
+}
+
+bool IslandSettled() {
+    return g_isW.Settled() && g_isH.Settled() && g_wing.Settled() && g_mix.Settled();
+}
+
+// Derives everything from the inputs: alerts, hover, tab, panel. Called when an input changes, never per frame.
+void IslandRecompute() {
+    if (!g_isHwnd || g_fullscreen || !EnsureGfx()) return;
+    PrepareText();
+    const ULONGLONG now = GetTickCount64();
+    g_alerts.erase(std::remove_if(g_alerts.begin(), g_alerts.end(), [&](const AlertItem& a) { return a.expires && a.expires <= now; }),
+                   g_alerts.end());
+    const std::vector<IModule*> dashes = Dashboards();
+    if (g_tab >= (int)dashes.size()) g_tab = std::max(0, (int)dashes.size() - 1);
+
+    IState state = IState::Collapsed;
+    if (g_expanded && !dashes.empty()) state = IState::Expanded;
+    else if (!g_alerts.empty()) state = IState::Alert;
+    ViewSel want{PillModule(), View::Pill};
+    if (state == IState::Expanded) want = {dashes[g_tab], View::Dashboard};
+    else if (state == IState::Alert) want = {TopAlert(), View::Alert};
+
+    const float s = Scale();
+    const Size2 size = want.m->Measure(want.v);
+    const float tw = std::min(std::max(size.w, 40.0f), kIslandMaxW) * s;
+    const float th = std::min(std::max(size.h, 20.0f), kIslandMaxH) * s;
+
+    const bool wings = state == IState::Expanded || PanelWingsWanted() || now < g_wingHold;
+    if (!g_isInit) {
+        g_isInit = true;
+        g_isW.eps = g_isH.eps = 0.25f;  // Pixels.
+        g_isW.epsV = g_isH.epsV = 5.0f;
+        g_isW.Snap(tw);
+        g_isH.Snap(th);
+        g_wing.Snap(wings ? 1.0f : 0.0f);
+        g_wingT = g_wing.x;
+        g_mix.Snap(1.0f);
+        g_viewCur = want;
+        g_curSize = size;
+        g_viewPrev = ViewSel{};
+    } else {
+        AimIfChanged(g_isW, tw, tw > g_isW.x ? kSpringExpandK : kSpringCollapseK, tw > g_isW.x ? kSpringExpandC : kSpringCollapseC);
+        AimIfChanged(g_isH, th, th > g_isH.x ? kSpringExpandK : kSpringCollapseK, th > g_isH.x ? kSpringExpandC : kSpringCollapseC);
+        AimIfChanged(g_wing, wings ? 1.0f : 0.0f, 320.0f, 34.0f);
+        if (want != g_viewCur) {
+            if (g_viewCur.m) g_viewCur.m->OnVisibility(g_viewCur.v, false);
+            g_viewPrev = g_viewCur;
+            g_prevSize = g_curSize;
+            g_viewCur = want;
+            g_mix.x = 0;
+            g_mix.v = 0;
+            g_mix.Aim(1.0f, 250.0f, 31.0f);
+            if (want.m) want.m->OnVisibility(want.v, true);
+        }
+    }
+    g_curSize = size;
+    g_isState = state;
+
+    // Where the body will stand once settled, for the pointer tests.
+    const float cx = (g_monitor.left + g_monitor.right) / 2.0f;
+    g_isTarget = {(LONG)roundf(cx - tw / 2.0f), g_monitor.top, (LONG)roundf(cx + tw / 2.0f), g_monitor.top + (LONG)roundf(th)};
+
+    if (state == IState::Expanded) SetTimer(g_hwnd, kZoneTimer, kZonePollMs, nullptr);
+    else KillTimer(g_hwnd, kZoneTimer);
+
+    ULONGLONG next = 0;
+    for (const AlertItem& a : g_alerts) if (a.expires && (!next || a.expires < next)) next = a.expires;
+    if (next) SetTimer(g_hwnd, kAlertTimer, (UINT)std::max<ULONGLONG>(next - now, 10) + 5, nullptr);
+    else KillTimer(g_hwnd, kAlertTimer);
+    if (now < g_wingHold) SetTimer(g_hwnd, kWingTimer, (UINT)(g_wingHold - now) + 30, nullptr);
+    else KillTimer(g_hwnd, kWingTimer);
+
+    g_isDirty = true;
+    if (!IslandSettled()) {
+        g_lastFrame = 0;
+        g_clock.Wake();
+    }
+    RequestPaint();
+}
+
+void IslandRescale() {  // DPI changed: sizes are pixels, so start over from the new scale.
+    g_isInit = false;
+    IslandRecompute();
+}
+
+void IslandMoved() {  // The bar moved (monitor, work area): the notch follows rcMonitor.
+    g_isDirty = true;
+    RequestPaint();
+}
+
+void SetExpanded(bool expanded) {
+    if (g_expanded == expanded) return;
+    g_expanded = expanded;
+    g_leaveSince = 0;
+    IslandRecompute();
+}
+
+// Fullscreen: forget the pointer and any open state, and hide. IslandRecompute brings it back.
+void IslandReset() {
+    g_expanded = false;
+    g_dwelling = false;
+    g_isTracking = false;
+    g_leaveSince = 0;
+    g_wingHold = 0;
+    if (g_hwnd) {
+        KillTimer(g_hwnd, kDwellTimer);
+        KillTimer(g_hwnd, kZoneTimer);
+        KillTimer(g_hwnd, kWingTimer);
+    }
+    g_isInit = false;
+    g_wing.Snap(0.0f);
+    g_wingT = 0.0f;
+    if (g_isHwnd) ShowWindow(g_isHwnd, SW_HIDE);
+}
+
+// Every 50 ms while expanded: is the pointer in the island, or in the strip band the buttons run along?
+void IslandZoneTick() {
+    if (g_isState != IState::Expanded) return;
+    POINT p;
+    GetCursorPos(&p);
+    const float s = Scale();
+    RECT zone = g_isTarget;
+    InflateRect(&zone, (int)ceilf(kNotchShoulder * s), 0);
+    bool in = PtInRect(&zone, p) != FALSE;
+    // The strip band from the left edge of the bell to the right edge of the calendar keeps hover alive across the gaps.
+    int lo = zone.left, hi = zone.right;
+    if (g_wingOk[0]) lo = std::min<int>(lo, g_monitor.left + (int)g_wingX[0]);
+    if (g_wingOk[1]) hi = std::max<int>(hi, g_monitor.left + (int)(g_wingX[1] + g_wingSize));
+    const RECT band{lo, g_monitor.top, hi, g_monitor.top + (LONG)(kBarH * s + 0.5f)};
+    if (PtInRect(&band, p)) in = true;
+    // Over the settled body, a window that covers it (a panel, a popup) counts as leaving.
+    if (in && IslandSettled() && PtInRect(&g_isTarget, p)) {
+        HWND at = WindowFromPoint(p);
+        if (at != g_isHwnd && at != g_hwnd) in = false;
+    }
+    if (in || g_pinned) {
+        g_leaveSince = 0;
+        return;
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (!g_leaveSince) g_leaveSince = now;
+    else if (now - g_leaveSince >= kLeaveGraceMs) SetExpanded(false);
+}
+
+void IslandDwellTick() {
+    KillTimer(g_hwnd, kDwellTimer);
+    g_dwelling = false;
+    POINT p;
+    GetCursorPos(&p);
+    if (!g_covered && !g_fullscreen && PtInRect(&g_isBody, p)) SetExpanded(true);
+}
+
+// Notch outline from the shell spec: flat top at the screen edge, concave shoulders, convex bottom corners.
+Com<ID2D1PathGeometry> NotchGeometry(float L, float R, float B, float r, float rs, bool edgeOnly) {
+    Com<ID2D1PathGeometry> geo;
+    if (FAILED(g_factory->CreatePathGeometry(geo.Put()))) return {};
+    Com<ID2D1GeometrySink> sink;
+    if (FAILED(geo->Open(sink.Put()))) return {};
+    const auto cw = D2D1_SWEEP_DIRECTION_CLOCKWISE;
+    const auto ccw = D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE;
+    if (edgeOnly) {  // Open path for the faint outline: no top edge, no shoulders.
+        sink->BeginFigure(D2D1::Point2F(L, rs), D2D1_FIGURE_BEGIN_HOLLOW);
+        sink->AddLine(D2D1::Point2F(L, B - r));
+        sink->AddArc(D2D1::ArcSegment(D2D1::Point2F(L + r, B), D2D1::SizeF(r, r), 0, ccw, D2D1_ARC_SIZE_SMALL));
+        sink->AddLine(D2D1::Point2F(R - r, B));
+        sink->AddArc(D2D1::ArcSegment(D2D1::Point2F(R, B - r), D2D1::SizeF(r, r), 0, ccw, D2D1_ARC_SIZE_SMALL));
+        sink->AddLine(D2D1::Point2F(R, rs));
+        sink->EndFigure(D2D1_FIGURE_END_OPEN);
+    } else {
+        sink->BeginFigure(D2D1::Point2F(L - rs, 0), D2D1_FIGURE_BEGIN_FILLED);
+        sink->AddArc(D2D1::ArcSegment(D2D1::Point2F(L, rs), D2D1::SizeF(rs, rs), 0, cw, D2D1_ARC_SIZE_SMALL));
+        sink->AddLine(D2D1::Point2F(L, B - r));
+        sink->AddArc(D2D1::ArcSegment(D2D1::Point2F(L + r, B), D2D1::SizeF(r, r), 0, ccw, D2D1_ARC_SIZE_SMALL));
+        sink->AddLine(D2D1::Point2F(R - r, B));
+        sink->AddArc(D2D1::ArcSegment(D2D1::Point2F(R, B - r), D2D1::SizeF(r, r), 0, ccw, D2D1_ARC_SIZE_SMALL));
+        sink->AddLine(D2D1::Point2F(R, rs));
+        sink->AddArc(D2D1::ArcSegment(D2D1::Point2F(R + rs, 0), D2D1::SizeF(rs, rs), 0, cw, D2D1_ARC_SIZE_SMALL));
+        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+    }
+    sink->Close();
+    return geo;
+}
+
+void IslandPaint() {
+    if (!g_isDirty || !g_isHwnd) return;
+    g_isDirty = false;
+    if (g_fullscreen || !g_isInit || !EnsureGfx()) return;
+    PrepareText();
+    g_isDirty = false;
+
+    const float s = Scale();
+    const float rs = kNotchShoulder * s;
+    int stageW = (int)ceilf((kIslandMaxW + 2 * kNotchShoulder) * s) + 8;
+    stageW += stageW & 1;  // Even, so the centre is a whole pixel.
+    const int stageH = (int)ceilf(kIslandMaxH * s) + 4;
+    if (!g_isSurface.Resize(g_factory.Get(), stageW, stageH)) return;
+    ID2D1DCRenderTarget* rt = g_isSurface.Target();
+    if (!rt) return;
+    if (!g_isBrush || g_isBrushGen != g_isSurface.Generation()) {
+        g_isBrush.Reset();
+        rt->CreateSolidColorBrush(kFg, g_isBrush.Put());
+        g_isBrushGen = g_isSurface.Generation();
+    }
+    ID2D1SolidColorBrush* brush = g_isBrush.Get();
+    if (!brush) return;
+
+    const float w = roundf(fmaxf(g_isW.x, 2.0f)), h = roundf(fmaxf(g_isH.x, 2.0f));
+    const float cx = stageW / 2.0f;
+    const float L = cx - floorf(w / 2.0f), R = L + w, B = h;
+    const float grow = Clamp01((h - kNotchH * s) / (40.0f * s));
+    const float r = std::min((kNotchRadius + (kNotchRadiusOpen - kNotchRadius) * grow) * s, std::min(w, h) / 2.0f);
+    const int cl = std::max(0, (int)floorf(L - rs) - 1);
+    const int cr = std::min(stageW, (int)ceilf(R + rs) + 1);
+    const int cb = std::min(stageH, (int)ceilf(B) + 2);
+    const RECT crop{cl, 0, cr, cb};
+
+    if (!g_isSurface.Begin(crop)) return;
+    brush->SetColor(kCentreBg);
+    if (Com<ID2D1PathGeometry> body = NotchGeometry(L, R, B, r, rs, false)) rt->FillGeometry(body.Get(), brush);
+    if (grow > 0.02f) {  // Faint edge once open, so a dark overlay stays apart from dark apps. Never along the top.
+        if (Com<ID2D1PathGeometry> edge = NotchGeometry(L + 0.5f, R - 0.5f, B - 0.5f, r, rs, true)) {
+            D2D1_COLOR_F c = Rgb(255, 255, 255, 0x30);
+            c.a *= grow;
+            brush->SetColor(c);
+            rt->DrawGeometry(edge.Get(), brush, 1.0f);
+        }
+    }
+
+    // Content, laid out at its own size and clipped to the body, inset so the corners never touch it.
+    const double now = QpcSeconds();
+    rt->PushAxisAlignedClip(D2D1::RectF(L + r * 0.5f, 0, R - r * 0.5f, B - r * 0.25f), D2D1_ANTIALIAS_MODE_ALIASED);
+    auto drawView = [&](const ViewSel& v, const Size2& sz, float alpha) {
+        if (!v.m || alpha <= 0.01f) return;
+        const float vw = sz.w * s, vh = sz.h * s;
+        DrawCtx c{rt, brush, D2D1::RectF(cx - vw / 2.0f, 0, cx + vw / 2.0f, vh), alpha, s, now, g_frameDt, v.v};
+        v.m->Draw(c);
+        if (v == g_viewCur) g_isView = c.rect;
+    };
+    const float mix = Clamp01(g_mix.x);
+    if (mix < 1.0f) drawView(g_viewPrev, g_prevSize, 1.0f - mix);
+    drawView(g_viewCur, g_curSize, mix);
+    if (g_viewCur.v == View::Dashboard) {
+        const int n = (int)Dashboards().size();
+        if (n > 1) {
+            const float step = 10.0f * s, y = B - 10.0f * s;
+            for (int i = 0; i < n; i++) {
+                D2D1_COLOR_F c = kFg;
+                c.a *= mix * (i == g_tab ? 1.0f : 0.35f);
+                brush->SetColor(c);
+                rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx + (i - (n - 1) / 2.0f) * step, y), 2.5f * s, 2.5f * s), brush);
+            }
+        }
+    }
+    rt->PopAxisAlignedClip();
+
+    if (!g_isSurface.End()) {
+        g_isBrush.Reset();
+        g_isDirty = true;
+        RequestPaint();
+        return;
+    }
+    const int x0 = (g_monitor.left + g_monitor.right) / 2 - stageW / 2;
+    g_isCropX = cl;
+    g_isBody = {x0 + (LONG)L, g_monitor.top, x0 + (LONG)R, g_monitor.top + (LONG)B};
+    g_isSurface.PresentCrop(g_isHwnd, POINT{x0 + cl, g_monitor.top}, POINT{cl, 0}, SIZE{cr - cl, cb});
+    if (!IsWindowVisible(g_isHwnd)) ShowWindow(g_isHwnd, SW_SHOWNOACTIVATE);
+}
+
+void IslandPointer(PointerEvent::Kind kind, LPARAM lp, bool left) {
+    if (!g_viewCur.m) return;
+    PointerEvent e{kind, D2D1::Point2F((float)(short)LOWORD(lp) + g_isCropX - g_isView.left, (float)(short)HIWORD(lp) - g_isView.top), left};
+    g_viewCur.m->OnPointer(e, g_viewCur.v);
+}
+
+LRESULT CALLBACK IslandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE;
+        case WM_MOUSEMOVE:
+            if (!g_isTracking) {
+                g_isTracking = true;
+                TRACKMOUSEEVENT t{sizeof(t), TME_LEAVE, hwnd, 0};
+                TrackMouseEvent(&t);
+            }
+            // Event-driven while collapsed: the pixels of the notch start the dwell, nothing polls.
+            if (!g_expanded && !g_covered && !g_dwelling && !g_fullscreen) {
+                g_dwelling = true;
+                SetTimer(g_hwnd, kDwellTimer, kDwellMs, nullptr);
+            }
+            IslandPointer(PointerEvent::Move, lp, false);
+            return 0;
+        case WM_MOUSELEAVE:
+            g_isTracking = false;
+            if (g_dwelling) {  // Brushed past: no expansion.
+                g_dwelling = false;
+                KillTimer(g_hwnd, kDwellTimer);
+            }
+            IslandPointer(PointerEvent::Leave, 0, false);
+            return 0;
+        case WM_MOUSEWHEEL:
+            if (g_expanded) {
+                g_wheelAcc += GET_WHEEL_DELTA_WPARAM(wp);
+                const int steps = g_wheelAcc / WHEEL_DELTA;
+                if (steps) {
+                    g_wheelAcc -= steps * WHEEL_DELTA;
+                    const int count = (int)Dashboards().size();
+                    const int tab = std::min(std::max(g_tab - steps, 0), std::max(count - 1, 0));
+                    if (tab != g_tab) {
+                        g_tab = tab;
+                        IslandRecompute();
+                    }
+                }
+            }
+            return 0;
+        case WM_LBUTTONDOWN:
+            IslandPointer(PointerEvent::Down, lp, true);
+            return 0;
+        case WM_LBUTTONUP:
+            if (g_isState == IState::Alert) {
+                if (IModule* m = TopAlert()) m->OnClickAlert();
+            } else {
+                IslandPointer(PointerEvent::Up, lp, true);
+            }
+            return 0;
+        case WM_RBUTTONUP:
+            g_demoAlert.Raise();  // Stub: shows the alert queue until the real alert modules exist.
+            return 0;
+        case WM_DESTROY:
+            g_isHwnd = nullptr;
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// ---- Services: what modules call ----
+
+Services g_services;
+
+void Services::ShowAlert(IModule* m, int priority, int ms) {
+    g_alerts.erase(std::remove_if(g_alerts.begin(), g_alerts.end(), [&](const AlertItem& a) { return a.m == m; }), g_alerts.end());
+    g_alerts.push_back({m, priority, ms > 0 ? GetTickCount64() + ms : 0, ++g_alertSeq});
+    IslandRecompute();
+}
+
+void Services::ClearAlert(IModule* m) {
+    g_alerts.erase(std::remove_if(g_alerts.begin(), g_alerts.end(), [&](const AlertItem& a) { return a.m == m; }), g_alerts.end());
+    IslandRecompute();
+}
+
+void Services::Invalidate() {
+    g_isDirty = true;
+    RequestPaint();
+}
+
+void Services::WakeAnimation() {
+    g_lastFrame = 0;
+    g_clock.Wake();
+}
+
+void Services::Post(std::function<void()> fn) {
+    auto* heap = new std::function<void()>(std::move(fn));
+    if (!g_hwnd || !PostMessageW(g_hwnd, WM_APP_POST, 0, reinterpret_cast<LPARAM>(heap))) delete heap;
+}
+
+void Services::SetTimer(IModule* m, UINT ms, std::function<void()> fn) {
+    size_t slot = 0;
+    while (slot < g_moduleTimers.size() && g_moduleTimers[slot].m != m) slot++;
+    if (slot == g_moduleTimers.size()) g_moduleTimers.push_back({m, nullptr});
+    g_moduleTimers[slot].fn = std::move(fn);
+    ::SetTimer(g_hwnd, kModuleTimerBase + slot, ms, nullptr);
+}
+
+void Services::KillTimer(IModule* m) {
+    for (size_t i = 0; i < g_moduleTimers.size(); i++) {
+        if (g_moduleTimers[i].m == m) {
+            ::KillTimer(g_hwnd, kModuleTimerBase + i);
+            g_moduleTimers[i].fn = nullptr;
+        }
+    }
+}
+
+void Services::OpenPanel(PanelKind kind, int anchorX) {
+    g_anchorX = anchorX;
+    g_anchorTick = GetTickCount64();
+    SetPropW(g_hwnd, L"TopBarAnchorX", reinterpret_cast<HANDLE>((INT_PTR)anchorX));
+    SetPropW(g_hwnd, L"TopBarAnchorTick", reinterpret_cast<HANDLE>((UINT_PTR)GetTickCount()));
+    TogglePanel(kind == PanelKind::Notifications ? kPanelNotifications : kPanelCalendar);
+}
+
+const Settings& Services::GetSettings() const { return g_settings; }
+const wchar_t* Services::Loc(const wchar_t* key) const { return ::Loc(key); }
+TextService& Services::Text() { return g_text; }
+
+void RunModuleTimer(UINT_PTR id) {
+    const size_t slot = id - kModuleTimerBase;
+    if (slot < g_moduleTimers.size() && g_moduleTimers[slot].fn) {
+        auto fn = g_moduleTimers[slot].fn;
+        fn();
+    }
+}
+
+bool ModulesAnimating() {
+    return g_viewCur.m && g_viewCur.m->Animating(g_viewCur.v);
+}
+
+bool IslandInit() {
+    HINSTANCE inst = GetModuleHandleW(nullptr);
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = IslandProc;
+    wc.hInstance = inst;
+    wc.lpszClassName = kIslandClass;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    RegisterClassW(&wc);
+    // Owned by the bar: always above it, no z-order upkeep, and it is hidden with it.
+    g_isHwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST, kIslandClass,
+                               L"Top bar island", WS_POPUP, 0, 0, 10, 10, g_hwnd, nullptr, inst, nullptr);
+    if (!g_isHwnd) return false;
+    for (IModule* m : g_modules) m->Start(g_services);
+    IslandRecompute();
+    return true;
+}
+
+void IslandShutdown() {
+    for (IModule* m : g_modules) m->Stop();
+    g_moduleTimers.clear();
+    g_isBrush.Reset();
+    g_isSurface.Destroy();
+    if (g_isHwnd) DestroyWindow(g_isHwnd);
+    UnregisterClassW(kIslandClass, GetModuleHandleW(nullptr));
+}
+
 #line 1 "bar/window.inc"
 void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG object, LONG, DWORD, DWORD) {
     if (object != OBJID_WINDOW || !hwnd) {
@@ -2171,42 +2899,39 @@ void SetHover(int id) {
     Invalidate(HitRectById(id));
 }
 
-void SetPillTarget(bool expanded) {
-    if (expanded == g_pillTarget) {
-        return;
-    }
-    g_pillTarget = expanded;
-    if (expanded) {
-        g_pillSpring.Aim(1.0f, kSpringExpandK, kSpringExpandC);
-    } else {
-        g_pillSpring.Aim(0.0f, kSpringCollapseK, kSpringCollapseC);
-    }
-    g_clock.Wake();
+// The hit list moves with the buttons: resync hover against the new layout.
+void ResyncHover() {
+    if (!g_tracking) return;
+    POINT p;
+    GetCursorPos(&p);
+    ScreenToClient(g_hwnd, &p);
+    SetHover(HitIdAt(p));
 }
 
-// One display frame: the spring steps by the real time since the last one (QPC, at most 50 ms).
-void StepPill() {
+// One display frame: the springs step by the real time since the last one (QPC, at most 50 ms).
+void StepFrame() {
     g_clock.Acked();
     const double now = QpcSeconds();
     double dt = g_lastFrame ? now - g_lastFrame : 1.0 / 60.0;
     if (dt > 0.05) dt = 0.05;
     g_lastFrame = now;
-    g_pillSpring.Step(dt);
-    g_pillT = fminf(fmaxf(g_pillSpring.x, 0.0f), 1.0f);
-    if (g_pillSpring.Settled()) {
+    g_frameDt = dt;
+    g_isW.Step(dt);
+    g_isH.Step(dt);
+    g_wing.Step(dt);
+    g_mix.Step(dt);
+    const float wingT = fmaxf(g_wing.x, 0.0f);
+    const bool wingMoved = wingT != g_wingT;
+    g_wingT = wingT;
+    if (IslandSettled() && !ModulesAnimating()) {
         g_clock.Sleep();
         g_lastFrame = 0;
     }
-    InvalidateLayout();  // Paint adds the pill and whatever it pushed aside.
+    g_isDirty = true;
+    if (wingMoved) InvalidateLayout();  // Paint adds the old and new place of both buttons.
     Paint();
-    if (g_tracking) {
-        // The hit list moved with the pill: resync hover against the new layout.
-        POINT p;
-        GetCursorPos(&p);
-        ScreenToClient(g_hwnd, &p);
-        SetHover(HitIdAt(p));
-        SetPillTarget(PtInRect(&g_pillRect, p));
-    }
+    IslandPaint();
+    if (wingMoved) ResyncHover();
 }
 
 void RunAction(Action action) {
@@ -2246,18 +2971,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 TrackMouseEvent(&t);
             }
             POINT p{(short)LOWORD(lp), (short)HIWORD(lp)};
-            SetPillTarget(PtInRect(&g_pillRect, p));
             SetHover(HitIdAt(p));
             return 0;
         }
         case WM_MOUSELEAVE:
             g_tracking = false;
             SetHover(H_none);
-            SetPillTarget(false);
             return 0;
         case WM_APP_PAINT:
             Paint();
+            IslandPaint();
             return 0;
+        case WM_APP_POST: {
+            auto* fn = reinterpret_cast<std::function<void()>*>(lp);
+            if (fn) {
+                (*fn)();
+                delete fn;
+            }
+            return 0;
+        }
         case WM_MOUSEACTIVATE:
             return MA_NOACTIVATE;
         case WM_LBUTTONDOWN:
@@ -2278,6 +3010,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     ClickTrayIcon(g_hits[index].data, false);
                 } else {
                     RunAction(g_hits[index].action);
+                    if (g_hits[index].action == Action::Notifications || g_hits[index].action == Action::Calendar) {
+                        // Keep the buttons out while the panel opens, even if the pointer has left the island.
+                        g_wingHold = GetTickCount64() + kWingHoldMs;
+                        IslandRecompute();
+                    }
                 }
                 InvalidateAll();
             }
@@ -2328,12 +3065,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == kClockTimer) {
                 ArmClock();
                 InvalidateAll();
+                g_isDirty = true;
+                IslandRecompute();  // The text may be wider now.
             } else if (wp == kTitleTimer) {
                 KillTimer(hwnd, kTitleTimer);
                 g_titlePending = false;
                 ReadForeground();
                 InvalidateAll();
-                StepPill();
+                ResyncHover();
+            } else if (wp == kDwellTimer) {
+                IslandDwellTick();
+            } else if (wp == kZoneTimer) {
+                IslandZoneTick();
+            } else if (wp == kAlertTimer || wp == kWingTimer) {
+                KillTimer(hwnd, wp);
+                IslandRecompute();
+            } else if (wp >= kModuleTimerBase) {
+                RunModuleTimer(wp);
             } else if (wp == kPanelTimer) {
                 StepPanelFollow();
             } else if (wp == kFullscreenTimer) {
@@ -2405,11 +3153,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateAll();
             return 0;
         case WM_APP_FRAME:
-            StepPill();
+            StepFrame();
             return 0;
         case WM_APP_SETTINGS:
             g_settings = LoadSettings();
+            for (IModule* m : g_modules) m->OnSettings(g_settings);
             InvalidateAll();
+            IslandRecompute();
             return 0;
         case WM_REFRESH_TITLE:
             if (!g_titlePending) {
@@ -2421,6 +3171,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RehookTitle();
             ReadForeground();
             InvalidateAll();
+            IslandRecompute();  // A panel opening or closing moves the buttons.
             return 0;
         case WM_SETTINGCHANGE:
             ReadAccent();
@@ -2430,6 +3181,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_DISPLAYCHANGE:
         case WM_DPICHANGED:
             PlaceBar();
+            IslandRescale();
             InvalidateAll();
             return 0;
         case WM_CLOSE:
@@ -2486,6 +3238,7 @@ DWORD WINAPI BarThread(void*) {
     RehookTitle();
 
     RegisterBar();
+    IslandInit();
     ArmClock();
     InvalidateAll();
 
@@ -2513,6 +3266,7 @@ DWORD WINAPI BarThread(void*) {
         delete icon.pix;
     }
     g_tray.clear();
+    IslandShutdown();
     ReleaseGfx();
     CoUninitialize();
     return 0;

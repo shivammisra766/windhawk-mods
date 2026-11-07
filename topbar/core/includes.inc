@@ -17,6 +17,7 @@
 #include <atomic>
 #include <unordered_map>
 #include <algorithm>
+#include <functional>
 #include <string>
 #include <vector>
 

@@ -88,6 +88,25 @@ public:
         ReleaseDC(nullptr, screen);
     }
 
+    // Pushes only the crop (srcX, 0, size) of the DIB, and moves and resizes the window to match. Used by the
+    // island, whose window is just the current shape while the DIB is the largest stage.
+    void PresentCrop(HWND hwnd, POINT pos, POINT src, SIZE size) {
+        if (!mem_) return;
+        HDC screen = GetDC(nullptr);
+        BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        UPDATELAYEREDWINDOWINFO info{};
+        info.cbSize = sizeof(info);
+        info.hdcDst = screen;
+        info.pptDst = &pos;
+        info.psize = &size;
+        info.hdcSrc = mem_;
+        info.pptSrc = &src;
+        info.pblend = &blend;
+        info.dwFlags = ULW_ALPHA;
+        UpdateLayeredWindowIndirect(hwnd, &info);
+        ReleaseDC(nullptr, screen);
+    }
+
     ID2D1DCRenderTarget* Target() const { return rt_.Get(); }
     unsigned Generation() const { return generation_; }
     int Width() const { return w_; }
