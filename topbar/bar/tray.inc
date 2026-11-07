@@ -18,7 +18,7 @@ void RemoveDeadTrayIcons() {
     }
 }
 
-// Runs while the app that sent the update is still waiting, so its icon handle is valid.
+// The icon handle is the bridge's own copy, alive in Explorer until the icon next changes.
 void OnTrayMessage(const BarTrayMessage& m) {
     // Windows' own speaker, network and battery icons, the same ones Seelen leaves out.
     if ((m.flags & NIF_GUID) && m.guid.Data1 >= 0x7820AE73 && m.guid.Data1 <= 0x7820AE75) {

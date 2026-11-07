@@ -21,12 +21,14 @@
 
 // Apps register tray icons by sending the taskbar a WM_COPYDATA message. This only looks at
 // those messages on their way past and copies them to the top bar: the taskbar itself carries
-// on as usual and nothing is replaced. The sender waits for this, so the bar can copy an icon
-// before the app is able to destroy it.
+// on as usual and nothing is replaced. The bridge copies each icon while the app still waits, and
+// keeps a table of the current icons, so a bar that starts later is sent the full set.
 
 #include <windows.h>
 #include <windhawk_utils.h>
 #include <cwchar>
+#include <cstddef>
+#include <vector>
 
 namespace {
 
@@ -80,12 +82,41 @@ HANDLE g_setupThread = nullptr;
 HHOOK g_hook = nullptr;
 HWND g_tray = nullptr;
 
+// The bar sets this when it starts, asking for every icon the taskbar already has.
+constexpr wchar_t kReplayEventName[] = L"Local\\WindhawkTopBarTrayReplay";
+HANDLE g_replayEvent = nullptr;
+// Marks the bridge's own TaskbarCreated broadcast so the bar does not treat it as a new taskbar.
+constexpr WPARAM kBridgeBroadcast = 0x7472;
+
+// An update on its way to the bar. The icon is the bridge's own copy, made while the app was still
+// waiting, so it stays valid however late it is sent; the table below takes it over.
+struct QueuedUpdate {
+    BarTrayMessage msg;
+    HICON copy;
+};
+
 constexpr int kQueueSize = 256;
 CRITICAL_SECTION g_queueLock;
 HANDLE g_queueEvent = nullptr;
 HANDLE g_senderThread = nullptr;
 int g_queueHead = 0, g_queueCount = 0;
-BarTrayMessage g_queue[kQueueSize];
+QueuedUpdate g_queue[kQueueSize];
+
+// Every icon the taskbar currently shows, kept so a bar that starts later gets them all.
+// Only the sender thread touches it (and Wh_ModUninit after that thread has ended).
+struct KnownIcon {
+    DWORD hwnd;
+    DWORD id;
+    DWORD callback;
+    DWORD version;
+    bool hasGuid;
+    bool hidden;
+    GUID guid;
+    HICON icon;  // Owned.
+    WCHAR tip[128];
+};
+std::vector<KnownIcon> g_known;
+HWND g_lastBar = nullptr;
 
 void Forward(const COPYDATASTRUCT* cds) {
     // Older apps send a shorter structure, so only trust what has arrived.
@@ -97,63 +128,185 @@ void Forward(const COPYDATASTRUCT* cds) {
     if (data->signature != kTraySignature) {
         return;
     }
-    HWND bar = FindWindowW(L"WindhawkTopBar", nullptr);
-    if (!bar) {
-        return;
-    }
+    // Recorded even with no bar running, so a bar that starts later gets the full set.
     const DWORD size = cds->cbData - offsetof(TrayData, nid);
-    BarTrayMessage out{};
-    out.message = data->message;
-    out.hwnd = data->nid.hWnd;
-    out.id = data->nid.uID;
-    out.flags = data->nid.uFlags;
-    out.callback = data->nid.uCallbackMessage;
-    out.icon = data->nid.hIcon;
+    QueuedUpdate out{};
+    out.msg.message = data->message;
+    out.msg.hwnd = data->nid.hWnd;
+    out.msg.id = data->nid.uID;
+    out.msg.flags = data->nid.uFlags;
+    out.msg.callback = data->nid.uCallbackMessage;
+    out.msg.icon = data->nid.hIcon;
     if (size >= offsetof(NotifyIconData32, dwState)) {
-        wcsncpy_s(out.tip, data->nid.szTip, _TRUNCATE);
+        wcsncpy_s(out.msg.tip, data->nid.szTip, _TRUNCATE);
     }
     if (size >= offsetof(NotifyIconData32, szInfo)) {
-        out.state = data->nid.dwState;
-        out.stateMask = data->nid.dwStateMask;
+        out.msg.state = data->nid.dwState;
+        out.msg.stateMask = data->nid.dwStateMask;
     }
     if (size >= offsetof(NotifyIconData32, szInfoTitle)) {
-        out.version = data->nid.uVersion;
+        out.msg.version = data->nid.uVersion;
     }
     if (size >= offsetof(NotifyIconData32, hBalloonIcon)) {
-        out.guid = data->nid.guidItem;
+        out.msg.guid = data->nid.guidItem;
+    }
+    // The app's handle is only sure to be valid while it waits for this message, so copy it now.
+    // CopyIcon sends no window messages.
+    if ((out.msg.flags & NIF_ICON) && out.msg.icon && (out.msg.message == NIM_ADD || out.msg.message == NIM_MODIFY)) {
+        out.copy = CopyIcon(reinterpret_cast<HICON>((UINT_PTR)out.msg.icon));
+        if (out.copy) {
+            out.msg.icon = (DWORD)(UINT_PTR)out.copy;
+        }
     }
     // Never send from the taskbar's thread: while it waits, sent messages are dispatched into it, and during
     // startup (every app re-adding its icon while the taskbar's XAML loads) that reentrancy crashed Explorer
     // (0xc000027b in CoreMessaging). Queue it; the sender thread forwards. A full queue drops the update.
+    bool queued = false;
     EnterCriticalSection(&g_queueLock);
     if (g_queueCount < kQueueSize) {
         g_queue[(g_queueHead + g_queueCount) % kQueueSize] = out;
         g_queueCount++;
+        queued = true;
         SetEvent(g_queueEvent);
     }
     LeaveCriticalSection(&g_queueLock);
+    if (!queued && out.copy) {
+        DestroyIcon(out.copy);
+    }
+}
+
+// Same identity rule as the bar: the GUID if there is one, otherwise window and id.
+KnownIcon* FindKnown(const BarTrayMessage& m) {
+    const bool hasGuid = (m.flags & NIF_GUID) != 0;
+    for (auto& k : g_known) {
+        if (hasGuid ? (k.hasGuid && IsEqualGUID(k.guid, m.guid)) : (k.hwnd == m.hwnd && k.id == m.id)) {
+            return &k;
+        }
+    }
+    return nullptr;
+}
+
+void DropKnown(size_t index) {
+    if (g_known[index].icon) DestroyIcon(g_known[index].icon);
+    g_known.erase(g_known.begin() + index);
+}
+
+// Records the update in the table, which takes over the copied icon.
+void ApplyToTable(QueuedUpdate& u) {
+    const BarTrayMessage& m = u.msg;
+    KnownIcon* k = FindKnown(m);
+    if (m.message == NIM_DELETE) {
+        if (k) DropKnown(k - g_known.data());
+        return;
+    }
+    if (m.message != NIM_ADD && m.message != NIM_MODIFY && m.message != NIM_SETVERSION) {
+        return;
+    }
+    if (!k) {
+        if (m.message == NIM_SETVERSION) return;
+        g_known.push_back(KnownIcon{});
+        k = &g_known.back();
+    }
+    if (m.hwnd) k->hwnd = m.hwnd;
+    k->id = m.id;
+    if (m.flags & NIF_GUID) {
+        k->guid = m.guid;
+        k->hasGuid = true;
+    }
+    if (m.message == NIM_SETVERSION) {
+        k->version = m.version;
+        return;
+    }
+    if (m.flags & NIF_MESSAGE) k->callback = m.callback;
+    if (m.flags & NIF_TIP) wcsncpy_s(k->tip, m.tip, _TRUNCATE);
+    if ((m.flags & NIF_STATE) && (m.stateMask & NIS_HIDDEN)) k->hidden = (m.state & NIS_HIDDEN) != 0;
+    if (u.copy) {
+        if (k->icon) DestroyIcon(k->icon);  // The bar turned it into its own bitmap when it was sent.
+        k->icon = u.copy;
+        u.copy = nullptr;
+    }
+}
+
+bool SendToBar(HWND bar, const BarTrayMessage& msg, UINT timeout) {
+    BarTrayMessage copy = msg;
+    COPYDATASTRUCT forward{kBarCopyData, sizeof(copy), &copy};
+    DWORD_PTR result = 0;
+    return SendMessageTimeoutW(bar, WM_COPYDATA, reinterpret_cast<WPARAM>(g_tray), reinterpret_cast<LPARAM>(&forward),
+                               SMTO_ABORTIFHUNG, timeout, &result) != 0;
+}
+
+// Sends the whole table as fresh adds; the bar matches them to icons it already has.
+void Replay(HWND bar) {
+    for (size_t i = g_known.size(); i-- > 0;) {
+        if (!IsWindow(reinterpret_cast<HWND>((UINT_PTR)g_known[i].hwnd))) DropKnown(i);
+    }
+    Wh_Log(L"Replaying %d tray icons to the bar", (int)g_known.size());
+    for (const KnownIcon& k : g_known) {
+        if (WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0) return;
+        BarTrayMessage msg{};
+        msg.message = NIM_ADD;
+        msg.hwnd = k.hwnd;
+        msg.id = k.id;
+        msg.flags = NIF_MESSAGE | NIF_TIP | NIF_STATE | (k.icon ? NIF_ICON : 0) | (k.hasGuid ? NIF_GUID : 0);
+        msg.callback = k.callback;
+        msg.icon = (DWORD)(UINT_PTR)k.icon;
+        msg.state = k.hidden ? NIS_HIDDEN : 0;
+        msg.stateMask = NIS_HIDDEN;
+        msg.guid = k.guid;
+        wcsncpy_s(msg.tip, k.tip, _TRUNCATE);
+        // The bar may only just have entered its message loop, so it gets longer than a live update.
+        if (!SendToBar(bar, msg, 1000)) return;
+        if (k.version) {
+            msg.message = NIM_SETVERSION;
+            msg.version = k.version;
+            SendToBar(bar, msg, 1000);
+        }
+    }
 }
 
 DWORD WINAPI SenderThread(void*) {
-    HANDLE waits[] = {g_stopEvent, g_queueEvent};
-    while (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
+    HANDLE waits[] = {g_stopEvent, g_queueEvent, g_replayEvent};
+    const DWORD count = g_replayEvent ? 3 : 2;
+    for (;;) {
+        const DWORD wait = WaitForMultipleObjects(count, waits, FALSE, INFINITE);
+        if (wait == WAIT_OBJECT_0 + 2) {
+            g_lastBar = FindWindowW(L"WindhawkTopBar", nullptr);
+            if (g_lastBar) Replay(g_lastBar);
+            continue;
+        }
+        if (wait != WAIT_OBJECT_0 + 1) {
+            break;
+        }
         for (;;) {
-            BarTrayMessage msg;
+            QueuedUpdate u;
             EnterCriticalSection(&g_queueLock);
             if (!g_queueCount) {
                 LeaveCriticalSection(&g_queueLock);
                 break;
             }
-            msg = g_queue[g_queueHead];
+            u = g_queue[g_queueHead];
             g_queueHead = (g_queueHead + 1) % kQueueSize;
             g_queueCount--;
             LeaveCriticalSection(&g_queueLock);
+            ApplyToTable(u);
+            if (u.copy) {  // An update the table ignores; the bar still gets it this once.
+                HWND bar = FindWindowW(L"WindhawkTopBar", nullptr);
+                if (bar) SendToBar(bar, u.msg, 200);
+                DestroyIcon(u.copy);
+                continue;
+            }
             HWND bar = FindWindowW(L"WindhawkTopBar", nullptr);
-            if (!bar) continue;
-            COPYDATASTRUCT forward{kBarCopyData, sizeof(msg), &msg};
-            DWORD_PTR result = 0;
-            SendMessageTimeoutW(bar, WM_COPYDATA, reinterpret_cast<WPARAM>(g_tray), reinterpret_cast<LPARAM>(&forward),
-                                SMTO_ABORTIFHUNG, 200, &result);
+            if (!bar) {
+                g_lastBar = nullptr;
+                continue;
+            }
+            if (bar != g_lastBar) {
+                // A bar not talked to yet (it started without asking): give it everything, this update included.
+                g_lastBar = bar;
+                Replay(bar);
+                continue;
+            }
+            SendToBar(bar, u.msg, 200);
         }
     }
     return 0;
@@ -172,15 +325,34 @@ LRESULT CALLBACK CallWndProc(int code, WPARAM wParam, LPARAM lParam) {
     return CallNextHookEx(nullptr, code, wParam, lParam);
 }
 
+// Seconds since this Explorer started.
+ULONGLONG ExplorerAgeSeconds() {
+    FILETIME created, exited, kernel, user, now;
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 0;
+    GetSystemTimeAsFileTime(&now);
+    const ULONGLONG c = ((ULONGLONG)created.dwHighDateTime << 32) | created.dwLowDateTime;
+    const ULONGLONG n = ((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime;
+    return n > c ? (n - c) / 10000000ULL : 0;
+}
+
 DWORD WINAPI SetupThread(void*) {
-    // The taskbar may still be starting: wait for it, then this thread ends.
-    for (int i = 0; i < 240; i++) {
+    // The taskbar may still be starting: wait for it (checked often, so few early icons slip past).
+    for (int i = 0; i < 1200; i++) {
         HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
         DWORD pid = 0;
         const DWORD thread = tray ? GetWindowThreadProcessId(tray, &pid) : 0;
         if (thread && pid == GetCurrentProcessId()) {
             g_tray = tray;
             g_hook = SetWindowsHookExW(WH_CALLWNDPROC, CallWndProc, nullptr, thread);
+            // Loaded into an Explorer that has been up a while (the mod was enabled or updated): its icons were
+            // added before the hook, so the table is empty. Ask apps once to add them again; this is the only
+            // case with no better source. Posted from this thread, so nothing waits on it. At logon Explorer
+            // broadcasts this itself, after the hook is in place.
+            if (g_hook && ExplorerAgeSeconds() > 30) {
+                const UINT taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+                if (taskbarCreated) PostMessageW(HWND_BROADCAST, taskbarCreated, kBridgeBroadcast, 0);
+                Wh_Log(L"Loaded late: asked apps to add their tray icons again");
+            }
             // A hook dies with the thread that set it, so this one stays, asleep, until unload.
             WaitForSingleObject(g_stopEvent, INFINITE);
             if (g_hook) {
@@ -189,7 +361,7 @@ DWORD WINAPI SetupThread(void*) {
             }
             return 0;
         }
-        if (WaitForSingleObject(g_stopEvent, 500) == WAIT_OBJECT_0) {
+        if (WaitForSingleObject(g_stopEvent, 100) == WAIT_OBJECT_0) {
             return 0;
         }
     }
@@ -280,6 +452,7 @@ BOOL Wh_ModInit() {
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     InitializeCriticalSection(&g_queueLock);
     g_queueEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_replayEvent = CreateEventW(nullptr, FALSE, FALSE, kReplayEventName);
     g_senderThread = CreateThread(nullptr, 0, SenderThread, nullptr, 0, nullptr);
     g_setupThread = CreateThread(nullptr, 0, SetupThread, nullptr, 0, nullptr);
     g_osdMessage = RegisterWindowMessageW(L"Windhawk_TopBar_Osd");
@@ -311,6 +484,20 @@ void Wh_ModUninit() {
         CloseHandle(g_queueEvent);
         g_queueEvent = nullptr;
     }
+    if (g_replayEvent) {
+        CloseHandle(g_replayEvent);
+        g_replayEvent = nullptr;
+    }
+    // The bridge's own icon copies: whatever is still queued, and the table.
+    for (int i = 0; i < g_queueCount; i++) {
+        HICON copy = g_queue[(g_queueHead + i) % kQueueSize].copy;
+        if (copy) DestroyIcon(copy);
+    }
+    g_queueCount = 0;
+    for (auto& k : g_known) {
+        if (k.icon) DestroyIcon(k.icon);
+    }
+    g_known.clear();
     DeleteCriticalSection(&g_queueLock);
     if (g_stopEvent) {
         CloseHandle(g_stopEvent);

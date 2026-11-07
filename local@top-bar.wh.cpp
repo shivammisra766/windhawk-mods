@@ -291,6 +291,10 @@ constexpr UINT_PTR kModuleTimerBase = 100;  // Module timers: base + slot.
 
 // From the tray-bridge mod in Explorer, which declares the same layout.
 constexpr ULONG_PTR kTrayCopyData = 0x7472;
+// Set by the bar at start; the bridge then sends its whole table of current icons.
+constexpr wchar_t kTrayReplayEventName[] = L"Local\\WindhawkTopBarTrayReplay";
+// wParam of the bridge's own TaskbarCreated broadcast (only when it loads into a running Explorer).
+constexpr WPARAM kTrayBridgeBroadcast = 0x7472;
 struct BarTrayMessage {
     DWORD message;
     DWORD hwnd;
@@ -5605,7 +5609,7 @@ void RemoveDeadTrayIcons() {
     }
 }
 
-// Runs while the app that sent the update is still waiting, so its icon handle is valid.
+// The icon handle is the bridge's own copy, alive in Explorer until the icon next changes.
 void OnTrayMessage(const BarTrayMessage& m) {
     // Windows' own speaker, network and battery icons, the same ones Seelen leaves out.
     if ((m.flags & NIF_GUID) && m.guid.Data1 >= 0x7820AE73 && m.guid.Data1 <= 0x7820AE75) {
@@ -7941,8 +7945,8 @@ void RunAction(Action action) {
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == g_taskbarCreated && g_taskbarCreated) {
-        if (GetTickCount64() - g_trayBroadcastTick < 3000) {
-            return 0;  // The bar's own request for tray icons, not a new taskbar.
+        if (wp == kTrayBridgeBroadcast || GetTickCount64() - g_trayBroadcastTick < 3000) {
+            return 0;  // The tray bridge asking apps for their icons, not a new taskbar.
         }
         g_registered = false;
         if (!g_hidden) RegisterBar();
@@ -8249,9 +8253,14 @@ DWORD WINAPI BarThread(void*) {
     ArmClock();
     InvalidateAll();
 
-    // Apps add their tray icons again when told the taskbar is new, and the bridge sees that.
-    g_trayBroadcastTick = GetTickCount64();
-    PostMessageW(HWND_BROADCAST, g_taskbarCreated, 0, 0);
+    // Ask the tray bridge in Explorer for every icon the taskbar already has. Not a TaskbarCreated
+    // broadcast: some apps ignore it, so icons added before the bar started went missing. Set just before
+    // the message loop so the bridge's replay is answered at once. If the bridge is not loaded yet, it
+    // replays on its own the first time it sees this window.
+    if (HANDLE replay = CreateEventW(nullptr, FALSE, FALSE, kTrayReplayEventName)) {
+        SetEvent(replay);
+        CloseHandle(replay);
+    }
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
