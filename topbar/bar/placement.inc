@@ -46,6 +46,7 @@ void UpdateFullscreen() {
         return;
     }
     g_fullscreen = fullscreen;
+    AlertsFullscreenChanged();
     if (fullscreen) {
         ShowWindow(g_hwnd, SW_HIDE);
         // Forget the pointer and a half-open island, so it does not come back expanded.

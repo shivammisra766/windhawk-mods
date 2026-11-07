@@ -119,6 +119,7 @@ void StepFrame() {
     g_isH.Step(dt);
     g_wing.Step(dt);
     g_mix.Step(dt);
+    g_cover.Step(dt);
     const float wingT = fmaxf(g_wing.x, 0.0f);
     const bool wingMoved = wingT != g_wingT;
     g_wingT = wingT;

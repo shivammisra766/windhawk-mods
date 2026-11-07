@@ -1,0 +1,33 @@
+Alerts (P6b), popup cover (P5b), panels (P7): what the integrator sets by hand.
+Nothing here was installed, restarted or written to the registry by the build.
+
+Versions: top-bar 3.2 (serial 300032), panel-split 1.10 (400011), tray-bridge 1.4 (500005).
+Install order: panel-split and tray-bridge first, then the bar. Toasts stay native for 30 s after the bar starts,
+and are only hidden once the notification listener has succeeded (fail-safe: no bar, hung bar, stale heartbeat
+over 45 s, fullscreen or no permission means toasts show normally).
+
+Registry values to set (by you):
+1. HKCU\Software\Microsoft\Windows\CurrentVersion\SystemSettings\ConfirmatorPosition
+   PositionIndex = 3 (DWORD)  -> top centre, the fallback when the hook is absent. (Currently 1.)
+   Nothing else. Listener consent is already Allow (HKCU/HKLM ConsentStore\userNotificationListener).
+Optional mod settings (Windhawk UI, stored by Windhawk) on tray-bridge:
+   osdOverride = 1 (default), osdUnits = 0 (DIP, default). Set osdUnits = 1 if the log shows pixels.
+
+Styler rules for the popup (windows-11-taskbar-styler theme; apply by hand). Colour must match the bubble: #101010.
+ Remove the existing theme rules (slots 17, 18, 41) for Grid#ConfirmatorMainGrid and any WindhawkBlur there.
+ Grid#ConfirmatorMainGrid:  Background=#FF101010, CornerRadius=0,0,10,10, BorderThickness=0, Shadow:=, Margin=0, Padding=0, MinHeight=0
+ Parent Grid of ConfirmatorMainGrid (ConfirmatorFrameCanvas > Grid): Padding=0, Margin=0
+ Grid#VolumeConfirmator / Grid#BrightnessConfirmator: Background=#00000000, Margin=0, Padding=0 (height 30 DIP, matches kNotchH)
+ volumeSlider / brightnessSlider: Width=90 (STYLER precedent g_themeBottomDensy), Margin=0
+ Do NOT use Translation= (crashes Windows.UI.Xaml).
+
+What the first version logs (Windhawk log, tray-bridge and top-bar): GetPositionRect input, original and returned rect with the scale
+used and whether the bar's rect was applied; the bar's published rect; every XamlExplorerHostIslandWindow SHOW/HIDE with rect and DPI;
+panel-split logs the toast title and position it saw, and "cold panel clip hidden".
+
+Not built: Progress, Num Lock, privacy dot tap, DND-off helper (the tap opens Settings; the IQuietHoursSettings vtable is unverified,
+and a wrong guess inside explorer.exe could crash it).
+Shared-core edits (small): includes.inc (winrt, setupapi, dbt headers), surface.inc (PresentCrop alpha), island.inc (g_cover spring,
+SetCovered, overlay and geometry hooks, demo alert removed), module.inc (demo alert removed, alerts registered, clock pill reserves
+room for privacy dots), placement.inc (one call), window.inc (g_cover.Step), manifest, build-bar.ps1 (libs: runtimeobject, setupapi, oleaut32),
+panels.inc (P7: cold tick property, 5 s follow-timer deadline).

@@ -1,10 +1,10 @@
 param([ValidateSet('both','32','64')][string]$Arch = 'both', [switch]$CheckOnly)
 $s = $PSScriptRoot
 # Version and serial live on this line only; the header, the DLL name and the defines take them from here.
-$id = 'local@top-bar'; $ver = '3.1'; $serial = '300031'
+$id = 'local@top-bar'; $ver = '3.2'; $serial = '300032'
 $utf8 = New-Object Text.UTF8Encoding($false)
 # One library list, used for the generated @compilerOptions and for the clang call.
-$libs = @('-lgdi32','-luser32','-lshell32','-ladvapi32','-lole32','-lversion','-lwininet','-liphlpapi','-luuid','-ld2d1','-ldwrite','-lwindowscodecs','-ldwmapi')
+$libs = @('-lgdi32','-luser32','-lshell32','-ladvapi32','-lole32','-lversion','-lwininet','-liphlpapi','-luuid','-ld2d1','-ldwrite','-lwindowscodecs','-ldwmapi','-lruntimeobject','-lsetupapi','-loleaut32')
 
 # Unity build: topbar\manifest.txt lists the files, each preceded by a #line so errors name the real file.
 $src = "$s\topbar"

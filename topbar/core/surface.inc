@@ -90,10 +90,10 @@ public:
 
     // Pushes only the crop (srcX, 0, size) of the DIB, and moves and resizes the window to match. Used by the
     // island, whose window is just the current shape while the DIB is the largest stage.
-    void PresentCrop(HWND hwnd, POINT pos, POINT src, SIZE size) {
+    void PresentCrop(HWND hwnd, POINT pos, POINT src, SIZE size, BYTE alpha = 255) {
         if (!mem_) return;
         HDC screen = GetDC(nullptr);
-        BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        BLENDFUNCTION blend{AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA};
         UPDATELAYEREDWINDOWINFO info{};
         info.cbSize = sizeof(info);
         info.hdcDst = screen;

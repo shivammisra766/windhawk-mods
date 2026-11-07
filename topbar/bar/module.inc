@@ -92,32 +92,15 @@ void DrawCentredText(const DrawCtx& c, const std::wstring& text, D2D1_RECT_F r, 
     g_text.Draw(c.rt, text, r.left, r.top, c.brush, o);
 }
 
+void AlertsFullscreenChanged();  // topbar/alerts/alerts.inc
+float AlertsDotsReserve();  // Extra pill width (DIP, both sides) while a privacy dot is shown.
+
 // The collapsed content: date and time.
 class ClockModule : public IModule {
 public:
     const wchar_t* Id() const override { return L"clock"; }
-    Size2 Measure(View) override { return {ToDip(g_text.Measure(ClockText())) + 2 * kPillPadX, kNotchH}; }
+    Size2 Measure(View) override { return {ToDip(g_text.Measure(ClockText())) + 2 * kPillPadX + AlertsDotsReserve(), kNotchH}; }
     void Draw(const DrawCtx& c) override { DrawCentredText(c, ClockText(), c.rect); }
-};
-
-// Stub alert, raised by right-clicking the island so the alert queue can be seen. Replaced by P6b.
-class DemoAlertModule : public IModule {
-public:
-    const wchar_t* Id() const override { return L"demo-alert"; }
-    void Start(Services& s) override { services_ = &s; }
-    Size2 Measure(View) override { return {240.0f, kNotchH}; }
-    void Draw(const DrawCtx& c) override {
-        D2D1_COLOR_F col = kFg;
-        col.a *= c.alpha;
-        c.brush->SetColor(col);
-        const float cy = (c.rect.top + c.rect.bottom) / 2.0f;
-        g_icons.Draw(c.rt, c.brush, I_bell, c.rect.left + 22.0f * c.scale, cy, 16.0f * c.scale);
-        DrawCentredText(c, L"Demo alert", D2D1::RectF(c.rect.left + 40.0f * c.scale, c.rect.top, c.rect.right, c.rect.bottom));
-    }
-    void OnClickAlert() override { if (services_) services_->ClearAlert(this); }
-    void Raise() { if (services_) services_->ShowAlert(this, 1, 3000); }
-private:
-    Services* services_ = nullptr;
 };
 
 // Stub dashboard page. Replaced by the real dashboards (P6c).
@@ -140,6 +123,6 @@ private:
 };
 
 ClockModule g_clockModule;
-DemoAlertModule g_demoAlert;
 PlaceholderPage g_page1(1, 2), g_page2(2, 2);
-IModule* const g_modules[] = {&g_clockModule, &g_demoAlert, &g_page1, &g_page2};
+IModule* AlertsModuleInstance();  // topbar/alerts/alerts.inc
+IModule* const g_modules[] = {&g_clockModule, AlertsModuleInstance(), &g_page1, &g_page2};

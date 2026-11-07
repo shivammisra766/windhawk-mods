@@ -20,6 +20,23 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include <deque>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <setupapi.h>
+#include <dbt.h>
+#undef GetCurrentTime  // winrt headers need this macro gone
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.ApplicationModel.h>
+#include <winrt/Windows.Storage.Streams.h>
+#include <winrt/Windows.UI.Notifications.h>
+#include <winrt/Windows.UI.Notifications.Management.h>
+#include <winrt/Windows.Devices.Enumeration.h>
+#include <winrt/Windows.Devices.Bluetooth.h>
+#include <winrt/Windows.Devices.Bluetooth.GenericAttributeProfile.h>
 
 // From iphlpapi. Windhawk includes windows.h first, which rules out winsock2.h,
 // so these two are declared directly.
