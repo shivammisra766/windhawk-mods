@@ -4193,6 +4193,8 @@ struct ShelfItem {
     bool isDir = false, missing = false;
     Pixmap* icon = nullptr;
     bool iconTried = false;
+    std::shared_ptr<Pixmap> thumb;  // Small shell or WIC thumbnail, made off the bar thread.
+    bool thumbAsked = false;
 };
 
 constexpr size_t kShelfMaxItems = 100;
@@ -4412,12 +4414,292 @@ DWORD PickDropEffect(DWORD allowed) {  // Never MOVE: the source keeps its data.
     return DROPEFFECT_NONE;
 }
 
+// ---- Thumbnails: one worker thread, started on demand, gone after 20 s idle ----
+// IShellItemImageFactory gives thumbnails only (no icons: the row already has the shell icon). Images it
+// cannot thumbnail are decoded with WIC. Results are small premultiplied pixmaps, posted to the bar thread.
+void ShelfThumbReady(unsigned id, std::shared_ptr<Pixmap> pm);  // after the page
+
+struct ThumbJob {
+    unsigned id;
+    std::wstring path;
+    bool image;
+    int px;
+};
+
+SRWLOCK g_thumbLock = SRWLOCK_INIT;
+std::deque<ThumbJob> g_thumbQueue;
+HANDLE g_thumbThread = nullptr;
+HANDLE g_thumbEvent = nullptr;
+bool g_thumbRunning = false, g_thumbStop = false;
+
+// Scales any WIC source to fit px x px and copies it out as premultiplied BGRA.
+std::shared_ptr<Pixmap> ThumbFromSource(IWICImagingFactory* wic, IWICBitmapSource* src, int px) {
+    UINT w = 0, h = 0;
+    if (FAILED(src->GetSize(&w, &h)) || !w || !h) return nullptr;
+    const double f = std::min(1.0, std::min((double)px / w, (double)px / h));
+    const UINT tw = std::max(1u, (UINT)(w * f + 0.5)), th = std::max(1u, (UINT)(h * f + 0.5));
+    Com<IWICFormatConverter> conv;
+    Com<IWICBitmapScaler> scaler;
+    if (FAILED(wic->CreateFormatConverter(conv.Put())) ||
+        FAILED(conv->Initialize(src, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom)) ||
+        FAILED(wic->CreateBitmapScaler(scaler.Put())) || FAILED(scaler->Initialize(conv.Get(), tw, th, WICBitmapInterpolationModeFant)))
+        return nullptr;
+    auto pm = std::make_shared<Pixmap>();
+    pm->w = (int)tw;
+    pm->h = (int)th;
+    pm->px.resize((size_t)tw * th);
+    if (FAILED(scaler->CopyPixels(nullptr, tw * 4, tw * th * 4, reinterpret_cast<BYTE*>(pm->px.data())))) return nullptr;
+    return pm;
+}
+
+std::shared_ptr<Pixmap> ThumbFromShell(IWICImagingFactory* wic, const ThumbJob& j) {
+    Com<IShellItemImageFactory> fac;
+    if (FAILED(SHCreateItemFromParsingName(j.path.c_str(), nullptr, IID_PPV_ARGS(fac.Put())))) return nullptr;
+    HBITMAP hbm = nullptr;
+    if (FAILED(fac->GetImage(SIZE{j.px, j.px}, SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK, &hbm)) || !hbm) return nullptr;
+    std::shared_ptr<Pixmap> out;
+    BITMAP bm{};
+    if (GetObjectW(hbm, sizeof(bm), &bm) && bm.bmWidth > 0 && bm.bmHeight > 0 && (long long)bm.bmWidth * bm.bmHeight <= 4096LL * 4096) {
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = bm.bmWidth;
+        bi.bmiHeader.biHeight = -bm.bmHeight;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        std::vector<DWORD> pix((size_t)bm.bmWidth * bm.bmHeight);
+        HDC dc = GetDC(nullptr);
+        const bool got = GetDIBits(dc, hbm, 0, bm.bmHeight, pix.data(), &bi, DIB_RGB_COLORS) != 0;
+        ReleaseDC(nullptr, dc);
+        if (got) {
+            bool alpha = false;
+            for (DWORD v : pix) if (v >> 24) { alpha = true; break; }
+            for (DWORD& v : pix) {
+                if (!alpha) { v |= 0xFF000000; continue; }  // Photos come back with alpha 0: opaque.
+                const DWORD a = v >> 24;                    // Otherwise premultiplied; keep channels within alpha.
+                const DWORD r = std::min((v >> 16) & 0xFF, a), g = std::min((v >> 8) & 0xFF, a), b = std::min(v & 0xFF, a);
+                v = (a << 24) | (r << 16) | (g << 8) | b;
+            }
+            Com<IWICBitmap> wb;
+            if (SUCCEEDED(wic->CreateBitmapFromMemory(bm.bmWidth, bm.bmHeight, GUID_WICPixelFormat32bppPBGRA, bm.bmWidth * 4,
+                                                      (UINT)(pix.size() * 4), reinterpret_cast<BYTE*>(pix.data()), wb.Put())))
+                out = ThumbFromSource(wic, wb.Get(), j.px);
+        }
+    }
+    DeleteObject(hbm);
+    return out;
+}
+
+std::shared_ptr<Pixmap> ThumbFromWic(IWICImagingFactory* wic, const ThumbJob& j) {
+    Com<IWICBitmapDecoder> dec;
+    Com<IWICBitmapFrameDecode> frame;
+    if (FAILED(wic->CreateDecoderFromFilename(j.path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, dec.Put())) ||
+        FAILED(dec->GetFrame(0, frame.Put())))
+        return nullptr;
+    UINT w = 0, h = 0;
+    if (FAILED(frame->GetSize(&w, &h)) || (unsigned long long)w * h > 64000000ULL) return nullptr;  // Skip huge images.
+    return ThumbFromSource(wic, frame.Get(), j.px);
+}
+
+DWORD WINAPI ThumbThread(void*) {
+    const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    Com<IWICImagingFactory> wic;
+    CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, __uuidof(IWICImagingFactory), reinterpret_cast<void**>(wic.Put()));
+    bool idle = false;
+    for (;;) {
+        AcquireSRWLockExclusive(&g_thumbLock);
+        if (g_thumbStop || (g_thumbQueue.empty() && idle) || !wic) {
+            g_thumbRunning = false;
+            g_thumbQueue.clear();
+            ReleaseSRWLockExclusive(&g_thumbLock);
+            break;
+        }
+        if (g_thumbQueue.empty()) {
+            ReleaseSRWLockExclusive(&g_thumbLock);
+            idle = WaitForSingleObject(g_thumbEvent, 20000) == WAIT_TIMEOUT;
+            continue;
+        }
+        ThumbJob j = std::move(g_thumbQueue.front());
+        g_thumbQueue.pop_front();
+        ReleaseSRWLockExclusive(&g_thumbLock);
+        idle = false;
+        std::shared_ptr<Pixmap> pm = ThumbFromShell(wic.Get(), j);
+        if (!pm && j.image) pm = ThumbFromWic(wic.Get(), j);
+        // Posted even on failure, so the row stops waiting. The heap lambda owns the pixmap until it runs.
+        auto* fn = new std::function<void()>([id = j.id, pm] { ShelfThumbReady(id, pm); });
+        HWND hwnd = g_hwnd;
+        if (!hwnd || !PostMessageW(hwnd, WM_APP_POST, 0, reinterpret_cast<LPARAM>(fn))) delete fn;
+    }
+    wic.Reset();
+    if (SUCCEEDED(co)) CoUninitialize();
+    return 0;
+}
+
+bool ThumbRequest(ThumbJob j) {
+    if (!g_thumbEvent) g_thumbEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_thumbEvent) return false;
+    bool ok = true;
+    AcquireSRWLockExclusive(&g_thumbLock);
+    if (g_thumbStop) ok = false;
+    else {
+        g_thumbQueue.push_back(std::move(j));
+        if (!g_thumbRunning) {
+            if (g_thumbThread) CloseHandle(g_thumbThread);  // A worker that went idle has exited.
+            g_thumbThread = CreateThread(nullptr, 0, ThumbThread, nullptr, 0, nullptr);
+            g_thumbRunning = g_thumbThread != nullptr;
+            if (!g_thumbRunning) { g_thumbQueue.clear(); ok = false; }
+        }
+    }
+    ReleaseSRWLockExclusive(&g_thumbLock);
+    if (ok) SetEvent(g_thumbEvent);
+    return ok;
+}
+
+// Bar thread, before the window's resources go: the worker runs code from this DLL.
+void ShelfShutdown() {
+    AcquireSRWLockExclusive(&g_thumbLock);
+    g_thumbStop = true;
+    g_thumbQueue.clear();
+    HANDLE t = g_thumbThread;
+    g_thumbThread = nullptr;
+    ReleaseSRWLockExclusive(&g_thumbLock);
+    if (g_thumbEvent) SetEvent(g_thumbEvent);
+    if (t) {
+        WaitForSingleObject(t, 3000);
+        CloseHandle(t);
+    }
+    if (g_thumbEvent) { CloseHandle(g_thumbEvent); g_thumbEvent = nullptr; }
+}
+
+// Uploads a pixmap for the current render target when needed.
+ID2D1Bitmap* PixmapBitmap(const Pg& p, Pixmap& px) {
+    const unsigned gen = IslandSurfaceGen();
+    if (!px.bmp || px.gen != gen) {
+        px.bmp.Reset();
+        D2D1_BITMAP_PROPERTIES bp = D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+        if (SUCCEEDED(p.c.rt->CreateBitmap(D2D1::SizeU(px.w, px.h), px.px.data(), px.w * 4, &bp, px.bmp.Put()))) px.gen = gen;
+    }
+    return px.bmp.Get();
+}
+
+// ---- Drag-out data helpers ----
+HGLOBAL MakeHGlobal(const void* data, size_t bytes) {
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes ? bytes : 1);
+    if (!mem) return nullptr;
+    if (void* p = GlobalLock(mem)) {
+        if (bytes) memcpy(p, data, bytes);
+        GlobalUnlock(mem);
+        return mem;
+    }
+    GlobalFree(mem);
+    return nullptr;
+}
+
+bool SetHGlobal(IDataObject* d, CLIPFORMAT cf, const void* data, size_t bytes, LONG index = -1) {
+    HGLOBAL mem = MakeHGlobal(data, bytes);
+    if (!mem) return false;
+    FORMATETC f{cf, nullptr, DVASPECT_CONTENT, index, TYMED_HGLOBAL};
+    STGMEDIUM m{};
+    m.tymed = TYMED_HGLOBAL;
+    m.hGlobal = mem;
+    if (FAILED(d->SetData(&f, &m, TRUE))) { GlobalFree(mem); return false; }  // Owned by the object on success.
+    return true;
+}
+
+bool SetText(IDataObject* d, const std::wstring& t) {
+    bool ok = SetHGlobal(d, CF_UNICODETEXT, t.c_str(), (t.size() + 1) * sizeof(wchar_t));
+    const int n = WideCharToMultiByte(CP_ACP, 0, t.c_str(), (int)t.size() + 1, nullptr, 0, nullptr, nullptr);
+    if (n > 0) {
+        std::string a((size_t)n, '\0');
+        WideCharToMultiByte(CP_ACP, 0, t.c_str(), (int)t.size() + 1, &a[0], n, nullptr, nullptr);
+        SetHGlobal(d, CF_TEXT, a.data(), a.size());
+    }
+    return ok;
+}
+
+// One virtual file (descriptor + contents at index 0): Explorer and upload targets get a real file.
+bool SetVirtualFile(IDataObject* d, const std::wstring& name, const std::string& bytes) {
+    InitFormats();
+    FILEGROUPDESCRIPTORW g{};
+    g.cItems = 1;
+    FILEDESCRIPTORW& fd = g.fgd[0];
+    fd.dwFlags = FD_FILESIZE | FD_PROGRESSUI | FD_ATTRIBUTES;
+    fd.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+    fd.nFileSizeLow = (DWORD)bytes.size();
+    fd.nFileSizeHigh = (DWORD)((unsigned long long)bytes.size() >> 32);
+    wcsncpy_s(fd.cFileName, name.c_str(), _TRUNCATE);
+    if (!SetHGlobal(d, g_cfDesc, &g, sizeof(g))) return false;
+    return SetHGlobal(d, g_cfContents, bytes.data(), bytes.size(), 0);
+}
+
+bool SetHDrop(IDataObject* d, const std::wstring& path) {
+    std::vector<BYTE> buf(sizeof(DROPFILES) + (path.size() + 2) * sizeof(wchar_t), 0);
+    auto* df = reinterpret_cast<DROPFILES*>(buf.data());
+    df->pFiles = sizeof(DROPFILES);
+    df->fWide = TRUE;
+    memcpy(buf.data() + sizeof(DROPFILES), path.c_str(), path.size() * sizeof(wchar_t));
+    return SetHGlobal(d, CF_HDROP, buf.data(), buf.size());
+}
+
+// A file name made from a row title: no separators or reserved characters, short.
+std::wstring SafeFileName(const std::wstring& title, const wchar_t* fallback, const wchar_t* ext) {
+    std::wstring o;
+    for (wchar_t c : OneLine(title, 60)) o += (c < 32 || wcschr(L"\\/:*?\"<>|", c)) ? L'_' : c;
+    while (!o.empty() && (o.back() == L' ' || o.back() == L'.' || o.back() == L'…')) o.pop_back();
+    while (!o.empty() && o.front() == L' ') o.erase(0, 1);
+    return (o.empty() ? std::wstring(fallback) : o) + ext;
+}
+
+// The picture as CF_DIB (BITMAPINFOHEADER + bottom-up 32 bpp rows), for apps that paste pictures. Capped at 4K.
+bool ImageDib(const std::wstring& path, std::string& out) {
+    Com<IWICImagingFactory> wic;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, __uuidof(IWICImagingFactory), reinterpret_cast<void**>(wic.Put())))) return false;
+    Com<IWICBitmapDecoder> dec;
+    Com<IWICBitmapFrameDecode> frame;
+    Com<IWICFormatConverter> conv;
+    UINT w = 0, h = 0;
+    if (FAILED(wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, dec.Put())) ||
+        FAILED(dec->GetFrame(0, frame.Put())) || FAILED(frame->GetSize(&w, &h)) || !w || !h || (unsigned long long)w * h > 8400000ULL ||
+        FAILED(wic->CreateFormatConverter(conv.Put())) ||
+        FAILED(conv->Initialize(frame.Get(), GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom)))
+        return false;
+    const size_t stride = (size_t)w * 4;
+    out.assign(sizeof(BITMAPINFOHEADER) + stride * h, '\0');
+    auto* bi = reinterpret_cast<BITMAPINFOHEADER*>(&out[0]);
+    bi->biSize = sizeof(BITMAPINFOHEADER);
+    bi->biWidth = (LONG)w;
+    bi->biHeight = (LONG)h;
+    bi->biPlanes = 1;
+    bi->biBitCount = 32;
+    bi->biCompression = BI_RGB;
+    bi->biSizeImage = (DWORD)(stride * h);
+    BYTE* px = reinterpret_cast<BYTE*>(&out[sizeof(BITMAPINFOHEADER)]);
+    if (FAILED(conv->CopyPixels(nullptr, (UINT)stride, (UINT)(stride * h), px))) { out.clear(); return false; }
+    std::vector<BYTE> row(stride);
+    for (UINT y = 0; y < h / 2; y++) {  // Top-down from WIC, bottom-up for CF_DIB
+        BYTE* a = px + y * stride;
+        BYTE* b = px + (h - 1 - y) * stride;
+        memcpy(row.data(), a, stride);
+        memcpy(a, b, stride);
+        memcpy(b, row.data(), stride);
+    }
+    return true;
+}
+
 // ---- The page ----
 class ShelfPage : public PageBase {
 public:
     const wchar_t* Id() const override { return L"page-shelf"; }
     int DashboardOrder() const override { return 60; }
     int Count() { EnsureLoaded(); return (int)items_.size(); }
+
+    // A thumbnail arrived from the worker. The row may be gone by now; it is found by id.
+    void SetThumb(unsigned id, std::shared_ptr<Pixmap> pm) {
+        ShelfItem* it = Find(id);
+        if (!it || !pm) return;
+        it->thumb = std::move(pm);
+        if (sv_) sv_->Invalidate();
+    }
 
     // Adds what a data object offers. Reads finish before this returns; items are built in locals and committed at the end.
     int Ingest(IDataObject* d) {
@@ -4637,7 +4919,13 @@ public:
 
 protected:
     void Shown() override { EnsureLoaded(); }
-    void Hidden() override { scroll_ = 0; }
+    void Hidden() override {
+        scroll_ = 0;
+        for (ShelfItem& it : items_) {  // Keep the small CPU pixels as the cache; drop the GPU copies.
+            if (it.icon) it.icon->bmp.Reset();
+            if (it.thumb) it.thumb->bmp.Reset();
+        }
+    }
     void Click(int id) override {
         if (id == 1) {
             Com<IDataObject> obj;
@@ -4681,6 +4969,7 @@ private:
         if (it.kind != SK::File && !it.path.empty() && SafeBlobName(it.path)) DeleteFileW((BlobDir() + L"\\" + it.path).c_str());
         delete it.icon;
         it.icon = nullptr;
+        it.thumb.reset();
     }
     void Remove(unsigned id) {
         for (size_t i = 0; i < items_.size(); i++) {
@@ -4756,15 +5045,23 @@ private:
                 DestroyIcon(sfi.hIcon);
             }
         }
-        if (it.icon) {
-            Pixmap& px = *it.icon;
-            const unsigned gen = IslandSurfaceGen();
-            if (!px.bmp || px.gen != gen) {
-                px.bmp.Reset();
-                D2D1_BITMAP_PROPERTIES bp = D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-                if (SUCCEEDED(p.c.rt->CreateBitmap(D2D1::SizeU(px.w, px.h), px.px.data(), px.w * 4, &bp, px.bmp.Put()))) px.gen = gen;
+        // Thumbnails for files, stored files and images; asked once, for rows that are drawn.
+        if (!it.thumbAsked && !it.missing && !it.isDir && (it.kind == SK::File || SafeBlobName(it.path))) {
+            it.thumbAsked = true;
+            const int px = std::max(16, std::min(64, (int)ceilf(18 * p.s)));
+            ThumbRequest(ThumbJob{it.id, BlobPath(it), it.kind == SK::Image || IsImageExt(ExtOf(it.title)), px});
+        }
+        if (it.thumb && it.thumb->w > 0 && it.thumb->h > 0) {
+            Pixmap& px = *it.thumb;
+            if (ID2D1Bitmap* b = PixmapBitmap(p, px)) {
+                const float f = 18.0f / std::max(px.w, px.h), w = px.w * f, h = px.h * f;  // Fit, keep aspect
+                const float l = x + (18 - w) / 2, t = y + (18 - h) / 2;
+                p.c.rt->DrawBitmap(b, p.R(l, t, l + w, t + h), p.c.alpha * alpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                return;
             }
-            if (px.bmp) p.c.rt->DrawBitmap(px.bmp.Get(), p.R(x, y, x + 18, y + 18), p.c.alpha * alpha);
+        }
+        if (it.icon) {
+            if (ID2D1Bitmap* b = PixmapBitmap(p, *it.icon)) p.c.rt->DrawBitmap(b, p.R(x, y, x + 18, y + 18), p.c.alpha * alpha);
         } else {
             p.Fill(x + 3, y + 1, x + 15, y + 17, 2, kMuted, alpha);
         }
@@ -4818,46 +5115,80 @@ private:
         HRESULT STDMETHODCALLTYPE GiveFeedback(DWORD) override { return DRAGDROP_S_USEDEFAULTCURSORS; }
     };
 
-    static bool SetHGlobal(IDataObject* d, CLIPFORMAT cf, const void* data, size_t bytes) {
-        HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
-        if (!mem) return false;
-        if (void* p = GlobalLock(mem)) { memcpy(p, data, bytes); GlobalUnlock(mem); }
-        FORMATETC f{cf, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
-        STGMEDIUM m{};
-        m.tymed = TYMED_HGLOBAL;
-        m.hGlobal = mem;
-        if (FAILED(d->SetData(&f, &m, TRUE))) { GlobalFree(mem); return false; }
-        return true;
+    // An empty shell container that accepts SetData of any format (measured; see the spec).
+    static bool EmptyDataObject(Com<IDataObject>& obj) {
+        return SUCCEEDED(SHCreateDataObject(nullptr, 0, nullptr, nullptr, IID_IDataObject, reinterpret_cast<void**>(obj.Put()))) && obj;
+    }
+
+    // Files: the shell's own data object (CF_HDROP, the ID list, names), else CF_HDROP by hand.
+    static bool FileDataObject(const std::wstring& path, Com<IDataObject>& obj) {
+        PIDLIST_ABSOLUTE pidl = nullptr;
+        if (SUCCEEDED(SHParseDisplayName(path.c_str(), nullptr, &pidl, 0, nullptr)) && pidl) {
+            if (PIDLIST_ABSOLUTE parent = ILClone(pidl)) {
+                ILRemoveLastID(parent);
+                PCUITEMID_CHILD child = ILFindLastID(pidl);
+                if (FAILED(SHCreateDataObject(parent, 1, &child, nullptr, IID_IDataObject, reinterpret_cast<void**>(obj.Put())))) obj.Reset();
+                ILFree(parent);
+            }
+            ILFree(pidl);
+        }
+        if (obj) return true;
+        return EmptyDataObject(obj) && SetHDrop(obj.Get(), path);
     }
 
     void DragOut(unsigned id) {
         ShelfItem* it = Find(id);
         if (!it) return;
         const ShelfItem copy = *it;  // The list can change while the drag blocks.
+        InitFormats();
         Com<IDataObject> obj;
         if (copy.kind == SK::File || copy.kind == SK::Stored || copy.kind == SK::Image) {
             if (copy.kind != SK::File && !SafeBlobName(copy.path)) return;
             const std::wstring path = BlobPath(copy);
-            PIDLIST_ABSOLUTE pidl = nullptr;
-            if (FAILED(SHParseDisplayName(path.c_str(), nullptr, &pidl, 0, nullptr)) || !pidl) { Flash(L"File not found"); return; }
-            PIDLIST_ABSOLUTE parent = ILClone(pidl);
-            ILRemoveLastID(parent);
-            PCUITEMID_CHILD child = ILFindLastID(pidl);
-            SHCreateDataObject(parent, 1, &child, nullptr, IID_IDataObject, reinterpret_cast<void**>(obj.Put()));
-            ILFree(parent);
-            ILFree(pidl);
+            if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                if (ShelfItem* now = Find(copy.id)) now->missing = true;
+                Flash(L"File not found");
+                sv_->Invalidate();
+                return;
+            }
+            if (!FileDataObject(path, obj)) return;
+            if (copy.kind == SK::Image || (copy.kind == SK::File && IsImageExt(ExtOf(copy.title)))) {
+                // The picture itself too, for apps that take pasted images rather than files.
+                std::string png, dib;
+                bool set = true;
+                if (ExtOf(path) == L".png" && ReadWholeFile(path, png, 32u << 20)) set = SetHGlobal(obj.Get(), g_cfPng, png.data(), png.size());
+                png = std::string();
+                if (set && ImageDib(path, dib)) set = SetHGlobal(obj.Get(), CF_DIB, dib.data(), dib.size());
+                if (!set) {  // The shell object refused extra formats: a plain container with CF_HDROP.
+                    Com<IDataObject> plain;
+                    if (EmptyDataObject(plain) && SetHDrop(plain.Get(), path)) {
+                        obj = plain;
+                        if (!dib.empty() || ImageDib(path, dib)) SetHGlobal(obj.Get(), CF_DIB, dib.data(), dib.size());
+                    }
+                }
+            }
         } else {
-            if (FAILED(SHCreateDataObject(nullptr, 0, nullptr, nullptr, IID_IDataObject, reinterpret_cast<void**>(obj.Put())))) return;
+            if (!EmptyDataObject(obj)) return;
             std::wstring body = copy.text;
             if (copy.kind == SK::Text && !copy.path.empty() && SafeBlobName(copy.path)) {
                 std::string raw;
                 if (ReadWholeFile(BlobPath(copy), raw, 8u << 20)) body = Wide(raw);
             }
-            InitFormats();
-            SetHGlobal(obj.Get(), CF_UNICODETEXT, body.c_str(), (body.size() + 1) * sizeof(wchar_t));
-            if (copy.kind == SK::Link) SetHGlobal(obj.Get(), g_cfUrlW, copy.text.c_str(), (copy.text.size() + 1) * sizeof(wchar_t));
+            SetText(obj.Get(), body);
+            // Never CF_HDROP for text rows: editors would open a file instead of inserting text.
+            if (copy.kind == SK::Link) {
+                SetHGlobal(obj.Get(), g_cfUrlW, copy.text.c_str(), (copy.text.size() + 1) * sizeof(wchar_t));
+                const std::string a = Utf8(copy.text);
+                SetHGlobal(obj.Get(), g_cfUrlA, a.c_str(), a.size() + 1);
+                if (LooksLikeLink(copy.text)) SetVirtualFile(obj.Get(), SafeFileName(copy.title, L"Link", L".url"), "[InternetShortcut]\r\nURL=" + a + "\r\n");
+            } else {
+                SetVirtualFile(obj.Get(), SafeFileName(copy.title, L"Text", L".txt"), "\xEF\xBB\xBF" + Utf8(body));
+            }
         }
         if (!obj) return;
+        static const CLIPFORMAT cfPreferred = (CLIPFORMAT)RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT);
+        const DWORD copyEffect = DROPEFFECT_COPY;
+        SetHGlobal(obj.Get(), cfPreferred, &copyEffect, sizeof(copyEffect));
         static Source source;
         DWORD effect = 0;
         g_shelfInternalDrag = true;
@@ -4995,6 +5326,7 @@ private:
 
 ShelfPage g_shelf;
 IModule* ShelfModule() { return &g_shelf; }
+void ShelfThumbReady(unsigned id, std::shared_ptr<Pixmap> pm) { g_shelf.SetThumb(id, std::move(pm)); }
 
 // ---- Drop target: one object for the bar window and the island ----
 class ShelfDropTarget : public IDropTarget {
@@ -8273,6 +8605,7 @@ DWORD WINAPI BarThread(void*) {
         delete icon.pix;
     }
     g_tray.clear();
+    ShelfShutdown();  // Joins the thumbnail worker before the DLL can go.
     IslandShutdown();
     ReleaseGfx();
     OleUninitialize();
