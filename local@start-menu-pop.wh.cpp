@@ -2,7 +2,7 @@
 // @id              start-menu-pop
 // @name            Start menu pop
 // @description     Pops Start out of the dock, and eases the search page into place
-// @version         2.1
+// @version         2.4
 // @author          local
 // @include         StartMenuExperienceHost.exe
 // @include         SearchHost.exe
@@ -19,6 +19,7 @@
 #include <winrt/Windows.Foundation.Numerics.h>
 #include <winrt/Windows.UI.Composition.h>
 #include <winrt/Windows.UI.Core.h>
+#include <winrt/Windows.UI.Input.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.UI.Xaml.h>
 #include <winrt/Windows.UI.Xaml.Automation.Peers.h>
@@ -55,6 +56,7 @@ bool g_isSearch = false;
 winrt::weak_ref<FrameworkElement> g_target;
 winrt::event_token g_visibilityToken{};
 winrt::event_token g_activatedToken{};
+winrt::event_token g_pointerToken{};
 bool g_hooked = false;
 bool g_isOpen = false;
 
@@ -388,6 +390,53 @@ void OnStateChange(bool nowOpen) {
     }
 }
 
+// Search only loses focus when the user clicks elsewhere, staying open behind them. Escape is
+// what closes it, so send that, once focus has settled somewhere other than Search or Start:
+// the two work as a pair, and clicking inside Start also takes focus from Search.
+DispatcherTimer g_searchCloseTimer{nullptr};
+
+bool ForegroundIsStartOrSearch() {
+    HWND fg = GetForegroundWindow();
+    if (!fg) {
+        return true;
+    }
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    if (pid == GetCurrentProcessId()) {
+        return true;
+    }
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!proc) {
+        return false;
+    }
+    wchar_t path[MAX_PATH] = {};
+    DWORD size = MAX_PATH;
+    const bool match = QueryFullProcessImageNameW(proc, 0, path, &size) &&
+                       (wcsstr(path, L"\\StartMenuExperienceHost.exe") || wcsstr(path, L"\\SearchHost.exe"));
+    CloseHandle(proc);
+    return match;
+}
+
+void CloseSearchIfFocusLeft() {
+    if (g_searchCloseTimer) {
+        g_searchCloseTimer.Stop();
+    }
+    g_searchCloseTimer = DispatcherTimer();
+    g_searchCloseTimer.Interval(std::chrono::milliseconds(80));
+    g_searchCloseTimer.Tick([](auto const&, auto const&) {
+        try {
+            g_searchCloseTimer.Stop();
+            g_searchCloseTimer = nullptr;
+            if (!ForegroundIsStartOrSearch() && g_coreWindow) {
+                PostMessageW(g_coreWindow, WM_KEYDOWN, VK_ESCAPE, 0x00010001);
+                PostMessageW(g_coreWindow, WM_KEYUP, VK_ESCAPE, 0xC0010001);
+            }
+        } catch (...) {
+        }
+    });
+    g_searchCloseTimer.Start();
+}
+
 void HookOnUiThread() {
     if (g_hooked) {
         return;
@@ -409,11 +458,37 @@ void HookOnUiThread() {
             }
             OnStateChange(args.Visible());
         });
+    if (g_isSearch) {
+        // Search's window is much taller than its panel, and its invisible part takes clicks, so
+        // focus stays when the user clicks there. A press outside the panel closes it instead.
+        // Only presses nothing in the panel handled get here, so the panel itself is unaffected.
+        g_pointerToken = window.CoreWindow().PointerPressed(
+            [](winrt::Windows::UI::Core::CoreWindow const&, winrt::Windows::UI::Core::PointerEventArgs const& args) {
+                try {
+                    auto panel = GetTarget();
+                    if (!panel || !g_coreWindow) {
+                        return;
+                    }
+                    const auto at = panel.TransformToVisual(nullptr).TransformPoint({0.0f, 0.0f});
+                    const auto p = args.CurrentPoint().Position();
+                    if (p.X < at.X || p.Y < at.Y || p.X > at.X + panel.ActualWidth() ||
+                        p.Y > at.Y + panel.ActualHeight()) {
+                        PostMessageW(g_coreWindow, WM_KEYDOWN, VK_ESCAPE, 0x00010001);
+                        PostMessageW(g_coreWindow, WM_KEYUP, VK_ESCAPE, 0xC0010001);
+                    }
+                } catch (...) {
+                }
+            });
+    }
     g_activatedToken = window.Activated(
         [](winrt::Windows::Foundation::IInspectable const&,
            winrt::Windows::UI::Core::WindowActivatedEventArgs const& args) {
-            OnStateChange(args.WindowActivationState() !=
-                          winrt::Windows::UI::Core::CoreWindowActivationState::Deactivated);
+            const bool active = args.WindowActivationState() !=
+                                winrt::Windows::UI::Core::CoreWindowActivationState::Deactivated;
+            if (!active && g_isSearch) {
+                CloseSearchIfFocusLeft();
+            }
+            OnStateChange(active);
         });
     g_hooked = true;
 }
@@ -426,6 +501,9 @@ void UnhookOnUiThread() {
     if (window) {
         window.VisibilityChanged(g_visibilityToken);
         window.Activated(g_activatedToken);
+        if (g_isSearch) {
+            window.CoreWindow().PointerPressed(g_pointerToken);
+        }
     }
     if (auto target = g_target.get()) {
         auto visual = Hosting::ElementCompositionPreview::GetElementVisual(target);

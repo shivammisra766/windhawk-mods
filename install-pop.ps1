@@ -10,6 +10,6 @@ try {
   Set-ItemProperty $key -Name LibraryFileName -Value $dll -Type String
   Set-ItemProperty $key -Name Version -Value $ver -Type String
   Set-ItemProperty $key -Name SettingsChangeTime -Value ([int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) -Type DWord
-  Stop-Process -Name StartMenuExperienceHost -Force -ErrorAction SilentlyContinue
+  Stop-Process -Name StartMenuExperienceHost, SearchHost -Force -ErrorAction SilentlyContinue
   "ok" | Out-File $out
 } catch { "ERROR: $($_.Exception.Message)" | Out-File $out }
