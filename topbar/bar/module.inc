@@ -61,6 +61,8 @@ public:
     void Post(std::function<void()>);  // From any thread to the UI thread.
     void SetTimer(IModule*, UINT ms, std::function<void()>);  // One timer per module; repeats until KillTimer.
     void KillTimer(IModule*);
+    void Relayout();         // Re-measure the views after a module's size or presence changed.
+    void Expand(IModule*, int ms);  // Open the island on that module's dashboard for at least ms (then hover rules).
     void OpenPanel(PanelKind, int anchorX);  // The native notification or calendar panel.
     const Settings& GetSettings() const;
     const wchar_t* Loc(const wchar_t* key) const;
@@ -147,4 +149,4 @@ private:
 
 ClockModule g_clockModule;
 PlaceholderPage g_page1(1, 2), g_page2(2, 2);
-IModule* const g_modules[] = {&g_clockModule, &g_page1, &g_page2};
+// g_modules lives in bar/modules.inc, after the feature modules.

@@ -12,6 +12,8 @@ struct Settings {
     std::wstring dateFormat;  // empty: "ddd d MMM"; otherwise a GetDateFormat pattern
     bool dateAbove = false;   // date on a line above the time
     int monitor = 0;          // 0 primary, -1 follow the pointer (island only), n: the nth monitor
+    bool mediaAutoExpand = true;
+    std::wstring mediaBlocklist;  // comma separated, lowercased and trimmed by the media module
 };
 
 Settings g_settings;
@@ -33,6 +35,8 @@ Settings LoadSettings() {
     }
     s.clockSeconds = Wh_GetIntSetting(L"clockSeconds") != 0;
     s.dateAbove = Wh_GetIntSetting(L"dateAbove") != 0;
+    s.mediaAutoExpand = Wh_GetIntSetting(L"mediaAutoExpand") != 0;
+    if (PCWSTR v = Wh_GetStringSetting(L"mediaExpandBlocklist")) { s.mediaBlocklist = v; Wh_FreeStringSetting(v); }
     const int scale = Wh_GetIntSetting(L"fontScale");
     s.fontScale = scale >= 50 && scale <= 200 ? scale : 100;
     g_uiLang.clear();

@@ -57,5 +57,11 @@
   - "2": Monitor 2
   - "3": Monitor 3
   - "4": Monitor 4
+- mediaAutoExpand: true
+  $name: Media - open on a new track
+  $description: Opens the media player for a few seconds when a new song or video starts.
+- mediaExpandBlocklist: ""
+  $name: Media - no auto-open for
+  $description: Comma separated words. A match in the app name, app id or title keeps the player closed.
 */
 // ==/WindhawkModSettings==

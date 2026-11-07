@@ -1,5 +1,5 @@
 # key	en	hi	zh	ja	ko	de	es	fr	pt	ru	ar	it	tr
-window.title	Top bar
+window.title	Top bar												
 Media	Media	मीडिया	媒体	メディア	미디어	Medien	Multimedia	Média	Mídia	Медиа		Media	Medya
 Calendar	Calendar	कैलेंडर	日历	カレンダー	캘린더	Kalender	Calendario	Calendrier	Calendário	Календарь		Calendario	Takvim
 Weather	Weather	मौसम	天气	天気	날씨	Wetter	Tiempo	Météo	Tempo	Погода		Meteo	Hava
@@ -37,3 +37,6 @@ Playing from %s	Playing from %s	%s से चल रहा है	正在 %s 中�
 menu.pin	Pin island open	खुला रखें	固定展开	開いたままにする	열어 두기	Offen halten	Mantener abierta	Garder ouvert	Manter aberta	Держать открытым	إبقاء مفتوحًا	Tieni aperta	Açık tut
 menu.unpin	Unpin island	अनपिन करें	取消固定	固定を解除	고정 해제	Lösen	Soltar	Détacher	Soltar	Открепить	إلغاء التثبيت	Sblocca	Sabitlemeyi kaldır
 menu.hide	Hide bar (Ctrl+Alt+D)	बार छिपाएँ (Ctrl+Alt+D)	隐藏栏 (Ctrl+Alt+D)	バーを隠す (Ctrl+Alt+D)	바 숨기기 (Ctrl+Alt+D)	Leiste ausblenden (Strg+Alt+D)	Ocultar barra (Ctrl+Alt+D)	Masquer la barre (Ctrl+Alt+D)	Ocultar barra (Ctrl+Alt+D)	Скрыть панель (Ctrl+Alt+D)	إخفاء الشريط (Ctrl+Alt+D)	Nascondi barra (Ctrl+Alt+D)	Çubuğu gizle (Ctrl+Alt+D)
+media.playingfrom	Playing from %ls												
+media.pausedin	Paused in %ls												
+media.unknown	Unknown												
