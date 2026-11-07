@@ -95,6 +95,7 @@ public:
             engine_.SetPanelOpen(shown);
             if (shown) { meter_.Reset(); lastSample_ = 0; dragging_ = false; pressed_ = Z_none; }
         }
+        engine_.SetShown(visPill_ || visDash_);
         UpdateTimer();
     }
 

@@ -2260,6 +2260,10 @@ public:
     void SetPanelOpen(bool open) {
         if (panelOpen_.exchange(open) != open && wake_) SetEvent(wake_);
     }
+    // The island shows media (pill or player). Only then does the 1-2 s polling fallback run.
+    void SetShown(bool shown) {
+        if (shown_.exchange(shown) != shown && wake_) SetEvent(wake_);
+    }
     std::shared_ptr<std::atomic<bool>> Alive() const { return alive_; }
 
 private:
@@ -2291,12 +2295,16 @@ private:
             const DWORD w = WaitForMultipleObjects(2, h, FALSE, timeout);
             if (w == WAIT_OBJECT_0) break;
             if (w == WAIT_OBJECT_0 + 1 && WaitForSingleObject(stop_, 100) == WAIT_OBJECT_0) break;  // Coalesce bursts.
+            // A timeout wake is a fallback poll: players whose events are missing or late get re-read here.
+            pollTick_ = w == WAIT_TIMEOUT;
             try {
                 RunCommands();
                 Refresh();
             } catch (...) {
                 Wh_Log(L"media: refresh failed");
+                forceRebuild_ = true;
             }
+            pollTick_ = false;
             timeout = NextTimeout();
         }
         recs_.clear();
@@ -2306,15 +2314,50 @@ private:
     }
 
     // No sessions: only events and a slow health check. Playing: events plus a fallback, faster with the panel open.
+    // Polling fallback: while the island shows media, re-read every 1.5-2 s (playing, or paused under 30 s ago),
+    // then 15 s for a long pause. Hidden or idle keeps the slow health checks, so nothing playing costs nothing.
     DWORD NextTimeout() {
+        const ULONGLONG now = GetTickCount64();
         DWORD t = 120000;
         if (!recs_.empty()) t = 30000;
         if (cur_.playing) t = panelOpen_ ? 1500 : 5000;
-        if (artRetryAt_) {
-            const ULONGLONG now = GetTickCount64();
-            t = std::min<DWORD>(t, artRetryAt_ > now ? (DWORD)(artRetryAt_ - now) + 5 : 5);
+        if (shown_ && cur_.has) {
+            if (cur_.playing || now - lastPlayingTick_ < 30000) t = std::min<DWORD>(t, panelOpen_ ? 1500 : 2000);
+            else t = std::min<DWORD>(t, 15000);
         }
+        if ((forceRebuild_ || !mgr_) && cur_.has) t = std::min<DWORD>(t, 2000);  // Recovering a dropped session.
+        if (artRetryAt_) t = std::min<DWORD>(t, artRetryAt_ > now ? (DWORD)(artRetryAt_ - now) + 5 : 5);
         return t;
+    }
+
+    void DropManager() {
+        recs_.clear();
+        mgrSess_.revoke();
+        mgrCur_.revoke();
+        mgr_ = nullptr;
+        sessionsDirty_ = true;
+    }
+
+    // Clears the shown media, keeping the auto-expand sequence.
+    void ClearSnapshot(std::vector<MSource> sources) {
+        const unsigned seq = cur_.trackSeq;
+        cur_ = MSnap();
+        cur_.trackSeq = seq;
+        cur_.sources = std::move(sources);
+        firstRead_ = false;
+        lastKey_.clear();
+        artKey_.clear();
+        artRetryAt_ = 0;
+        Publish(false);
+    }
+
+    // The manager can drop and recreate sessions without raising SessionsChanged. On a poll, compare the list.
+    void VerifySessions() {
+        auto list = mgr_.GetSessions();
+        if (list.Size() != recs_.size()) { sessionsDirty_ = true; return; }
+        for (uint32_t i = 0; i < list.Size(); i++) {
+            if (recs_[i].aumid != list.GetAt(i).SourceAppUserModelId().c_str()) { sessionsDirty_ = true; return; }
+        }
     }
 
     bool EnsureManager() {
@@ -2469,23 +2512,30 @@ private:
 
     void Refresh() {
         const ULONGLONG now = GetTickCount64();
-        if (!EnsureManager()) { return; }
+        if (!EnsureManager()) {
+            // The broker stays away: after a few tries, stop showing media that can no longer be confirmed.
+            if (cur_.has && ++mgrFails_ >= 3) ClearSnapshot({});
+            return;
+        }
+        mgrFails_ = 0;
         std::wstring systemCurrent;
         try {
+            if (pollTick_ && !sessionsDirty_ && !forceRebuild_ && !recs_.empty()) VerifySessions();
             if (sessionsDirty_ || recs_.empty() || forceRebuild_) { RebuildSessions(); forceRebuild_ = false; }
             if (auto c = mgr_.GetCurrentSession()) systemCurrent = c.SourceAppUserModelId().c_str();
         } catch (...) {
-            mgr_ = nullptr;
-            mgrSess_.revoke();
-            mgrCur_.revoke();
-            return;  // Keep the last snapshot.
+            DropManager();
+            return;  // Keep the last snapshot; the next tick asks for a new manager.
         }
         // Playback state of every session, so a start in another player is noticed.
         for (SessRec& r : recs_) {
             try {
                 r.playing = r.s.GetPlaybackInfo().PlaybackStatus() ==
                             wm::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
-            } catch (...) {}
+            } catch (...) {
+                r.playing = false;
+                forceRebuild_ = true;  // A dead session object: rebuild the list on the next wake.
+            }
         }
         // Merge by AUMID, stable order, history forgotten when the source goes away.
         std::vector<std::wstring> present;
@@ -2525,17 +2575,7 @@ private:
 
         auto* sess = Chosen();
         if (!sess) {  // Session loss: only now drop the snapshot (bug 3).
-            if (recs_.empty() || !chosenAumid_.empty()) {
-                const unsigned seq = cur_.trackSeq;
-                cur_ = MSnap();
-                cur_.trackSeq = seq;
-                cur_.sources = next.sources;
-                firstRead_ = false;
-                lastKey_.clear();
-                artKey_.clear();
-                artRetryAt_ = 0;
-                Publish(false);
-            }
+            if (recs_.empty() || !chosenAumid_.empty()) ClearSnapshot(next.sources);
             return;
         }
         bool readOk = true;
@@ -2555,7 +2595,9 @@ private:
             next.rate = rate > 0.05 && rate < 8 ? rate : 1.0;
 
             const bool srcChanged = chosenAumid_ != prevAumid;
-            if (propsDirty_ || forceRead_ || srcChanged || lastKey_.empty() || cur_.title.empty() || artRetryAt_ || next.playing != cur_.playing) {
+            // pollTick_: players that never raise MediaPropertiesChanged still get their new track read.
+            if (propsDirty_ || forceRead_ || pollTick_ || srcChanged || lastKey_.empty() || cur_.title.empty() || artRetryAt_ ||
+                next.playing != cur_.playing) {
                 propsDirty_ = false;
                 auto pop = sess->TryGetMediaPropertiesAsync();
                 if (!AwaitOp(pop)) throw std::runtime_error("props");
@@ -2600,14 +2642,25 @@ private:
                 curStartMs_ = duration_cast<milliseconds>(tl.StartTime()).count();
                 const long long endMs = duration_cast<milliseconds>(tl.EndTime()).count();
                 next.durMs = std::max(0LL, endMs - curStartMs_);  // Bug 13: duration is end - start.
-                long long pos = duration_cast<milliseconds>(tl.Position()).count() - curStartMs_;
+                const long long rawPos = duration_cast<milliseconds>(tl.Position()).count();
+                const long long updated = tl.LastUpdatedTime().time_since_epoch().count();
+                long long pos = rawPos - curStartMs_;
                 const long long age = duration_cast<milliseconds>(winrt::clock::now() - tl.LastUpdatedTime()).count();
                 if (next.playing && age >= 0 && age < 10000) pos += (long long)(age * next.rate);
                 pos = std::max(0LL, std::min(pos, next.durMs > 0 ? next.durMs : pos));
                 // Spotify refreshes LastUpdatedTime without moving Position: hold a backward jump until confirmed.
                 const long long expected = cur_.posMs + (cur_.playing ? (long long)((now - cur_.baseTick) * cur_.rate) : 0);
                 const bool sameTrack = next.title == cur_.title && next.aumid == cur_.aumid;
-                if (sameTrack && next.playing && cur_.playing && pos < expected - 1500 && !backPending_) {
+                // Some players publish the timeline once and never again: neither Position nor LastUpdatedTime moves.
+                // Re-basing on that stale reading would snap the thumb back each poll, so keep extrapolating locally.
+                const bool frozen = sameTrack && next.playing && cur_.playing && cur_.baseTick &&
+                                    rawPos == lastRawPos_ && updated == lastUpdated_;
+                lastRawPos_ = rawPos;
+                lastUpdated_ = updated;
+                if (frozen) {
+                    next.posMs = cur_.posMs;
+                    next.baseTick = cur_.baseTick;
+                } else if (sameTrack && next.playing && cur_.playing && pos < expected - 1500 && !backPending_) {
                     backPending_ = true;  // keep the old base
                     next.posMs = cur_.posMs;
                     next.baseTick = cur_.baseTick;
@@ -2621,11 +2674,17 @@ private:
             readOk = false;  // Bug 3: keep the last snapshot instead of publishing an empty one.
         }
         if (!readOk) {
+            // The session may have been dropped and recreated under the same id: rebuild, and after
+            // several failures in a row ask for a fresh manager.
+            forceRebuild_ = true;
+            if (++readFails_ >= 3) { readFails_ = 0; DropManager(); }
             cur_.sources = next.sources;
             cur_.active = next.active;
             Publish(false);
             return;
         }
+        readFails_ = 0;
+        if (next.playing) lastPlayingTick_ = now;
         firstRead_ = false;
         cur_ = std::move(next);
         Publish(false);
@@ -2662,7 +2721,7 @@ private:
     std::shared_ptr<const MSnap> snap_;
     std::deque<MCmd> cmds_;
     std::shared_ptr<std::atomic<bool>> alive_;
-    std::atomic<bool> panelOpen_{false};
+    std::atomic<bool> panelOpen_{false}, shown_{false};
     std::atomic<bool> sessionsDirty_{true}, propsDirty_{false};
 
     // Media thread only.
@@ -2675,11 +2734,11 @@ private:
     std::wstring chosenAumid_, dockPick_, lastKey_, artKey_, lastTrackKey_;
     unsigned startCounter_ = 0, startedBefore_ = 0;
     MSnap cur_;
-    bool firstRead_ = true, forceRead_ = false, forceRebuild_ = false, backPending_ = false;
+    bool firstRead_ = true, forceRead_ = false, forceRebuild_ = false, backPending_ = false, pollTick_ = false;
     size_t artHash_ = 0;
-    int artTries_ = 0;
-    ULONGLONG artRetryAt_ = 0, userSwitchUntil_ = 0, ignoreTimelineUntil_ = 0;
-    long long curStartMs_ = 0;
+    int artTries_ = 0, readFails_ = 0, mgrFails_ = 0;
+    ULONGLONG artRetryAt_ = 0, userSwitchUntil_ = 0, ignoreTimelineUntil_ = 0, lastPlayingTick_ = 0;
+    long long curStartMs_ = 0, lastRawPos_ = -1, lastUpdated_ = 0;
 };
 
 #line 1 "media/media.inc"
@@ -2780,6 +2839,7 @@ public:
             engine_.SetPanelOpen(shown);
             if (shown) { meter_.Reset(); lastSample_ = 0; dragging_ = false; pressed_ = Z_none; }
         }
+        engine_.SetShown(visPill_ || visDash_);
         UpdateTimer();
     }
 
