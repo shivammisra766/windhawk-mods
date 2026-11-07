@@ -5,6 +5,11 @@
 #include <windows.h>
 #include <objbase.h>
 #include <shellapi.h>
+#include <ole2.h>
+#include <shlobj.h>
+#include <shobjidl.h>
+#include <pdh.h>
+#include <pdhmsg.h>
 #include <sddl.h>
 #include <wininet.h>
 #include <d2d1.h>
@@ -18,6 +23,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 

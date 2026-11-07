@@ -22,6 +22,7 @@ constexpr UINT_PTR kDwellTimer = 9;    // Hover dwell before the island expands.
 constexpr UINT_PTR kZoneTimer = 10;    // Polls the pointer against the hover zone, only while expanded.
 constexpr UINT_PTR kAlertTimer = 11;   // Next alert deadline.
 constexpr UINT_PTR kWingTimer = 12;    // End of the hold that keeps bell and calendar out while a panel opens.
+constexpr UINT_PTR kDropTimer = 13;     // Dwell before a drag over the bar opens the shelf.
 constexpr UINT_PTR kModuleTimerBase = 100;  // Module timers: base + slot.
 
 // From the tray-bridge mod in Explorer, which declares the same layout.
@@ -110,6 +111,7 @@ struct TrayIcon {
 };
 
 HWND g_hwnd = nullptr;
+HWND g_isHwnd = nullptr;  // The island window (island.inc).
 HANDLE g_thread = nullptr;
 DWORD g_threadId = 0;
 UINT g_taskbarCreated = 0;

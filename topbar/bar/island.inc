@@ -3,7 +3,6 @@
 // each frame presents the crop that holds the shape, so a settled notch is a small window and an
 // idle one costs nothing. Hover, alerts and tabs are decided here; modules draw the content.
 
-HWND g_isHwnd = nullptr;
 LayeredSurface g_isSurface;
 Com<ID2D1SolidColorBrush> g_isBrush;
 unsigned g_isBrushGen = 0;
@@ -36,6 +35,7 @@ bool g_covered = false;    // Reserved for the native volume popup (P5b): blocks
 bool g_isTracking = false;
 bool g_dwelling = false;
 int g_tab = 0;
+int g_tabDir = 1;  // Direction of the last page change, for the slide.
 int g_wheelAcc = 0;
 ULONGLONG g_leaveSince = 0;
 ULONGLONG g_wingHold = 0;
@@ -180,9 +180,12 @@ void IslandMoved() {  // The bar moved (monitor, work area): the notch follows r
     RequestPaint();
 }
 
+bool ShelfHoldsOpen();  // shelf.inc: a drag is over the bar or the island, or just left it.
+
 void SetExpanded(bool expanded) {
     if (g_expanded == expanded) return;
     g_expanded = expanded;
+    if (!expanded) g_tab = 0;  // Always open on the first page.
     g_leaveSince = 0;
     IslandRecompute();
 }
@@ -225,7 +228,7 @@ void IslandZoneTick() {
         HWND at = WindowFromPoint(p);
         if (at != g_isHwnd && at != g_hwnd) in = false;
     }
-    if (in || g_pinned) {
+    if (in || g_pinned || ShelfHoldsOpen()) {
         g_leaveSince = 0;
         return;
     }
@@ -321,25 +324,27 @@ void IslandPaint() {
     // Content, laid out at its own size and clipped to the body, inset so the corners never touch it.
     const double now = QpcSeconds();
     rt->PushAxisAlignedClip(D2D1::RectF(L + r * 0.5f, 0, R - r * 0.5f, B - r * 0.25f), D2D1_ANTIALIAS_MODE_ALIASED);
-    auto drawView = [&](const ViewSel& v, const Size2& sz, float alpha) {
+    auto drawView = [&](const ViewSel& v, const Size2& sz, float alpha, float slide) {
         if (!v.m || alpha <= 0.01f) return;
         const float vw = sz.w * s, vh = sz.h * s;
-        DrawCtx c{rt, brush, D2D1::RectF(cx - vw / 2.0f, 0, cx + vw / 2.0f, vh), alpha, s, now, g_frameDt, v.v};
+        const bool pages = v.v == View::Dashboard && g_viewCur.v == View::Dashboard && g_viewPrev.v == View::Dashboard;
+        const float dx = pages ? slide * s : 0.0f;  // Page change: travel 34 px, in the direction of the scroll.
+        DrawCtx c{rt, brush, D2D1::RectF(cx - vw / 2.0f + dx, 0, cx + vw / 2.0f + dx, vh), alpha, s, now, g_frameDt, v.v};
         v.m->Draw(c);
-        if (v == g_viewCur) g_isView = c.rect;
+        if (v == g_viewCur) g_isView = D2D1::RectF(cx - vw / 2.0f, 0, cx + vw / 2.0f, vh);
     };
     const float mix = Clamp01(g_mix.x);
-    if (mix < 1.0f) drawView(g_viewPrev, g_prevSize, 1.0f - mix);
-    drawView(g_viewCur, g_curSize, mix);
+    if (mix < 1.0f) drawView(g_viewPrev, g_prevSize, 1.0f - mix, -g_tabDir * 34.0f * mix);
+    drawView(g_viewCur, g_curSize, mix, g_tabDir * 34.0f * (1.0f - mix));
     if (g_viewCur.v == View::Dashboard) {
         const int n = (int)Dashboards().size();
-        if (n > 1) {
-            const float step = 10.0f * s, y = B - 10.0f * s;
+        if (n > 1) {  // A column at the right edge, so rows and cards keep the bottom.
+            const float step = 9.0f * s, x = R - 10.0f * s, cyDots = B / 2.0f;
             for (int i = 0; i < n; i++) {
                 D2D1_COLOR_F c = kFg;
-                c.a *= mix * (i == g_tab ? 1.0f : 0.35f);
+                c.a *= mix * (i == g_tab ? 0.9f : 0.22f);
                 brush->SetColor(c);
-                rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx + (i - (n - 1) / 2.0f) * step, y), 2.5f * s, 2.5f * s), brush);
+                rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x, cyDots + (i - (n - 1) / 2.0f) * step), 2.5f * s, 2.5f * s), brush);
             }
         }
     }
@@ -396,8 +401,10 @@ LRESULT CALLBACK IslandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (steps) {
                     g_wheelAcc -= steps * WHEEL_DELTA;
                     const int count = (int)Dashboards().size();
+                    if (g_viewCur.m && g_viewCur.v == View::Dashboard && g_viewCur.m->OnWheel(steps)) return 0;
                     const int tab = std::min(std::max(g_tab - steps, 0), std::max(count - 1, 0));
                     if (tab != g_tab) {
+                        g_tabDir = tab > g_tab ? 1 : -1;
                         g_tab = tab;
                         IslandRecompute();
                     }
@@ -418,6 +425,7 @@ LRESULT CALLBACK IslandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_demoAlert.Raise();  // Stub: shows the alert queue until the real alert modules exist.
             return 0;
         case WM_DESTROY:
+            ShelfDropRevoke(hwnd);
             g_isHwnd = nullptr;
             return 0;
     }
@@ -442,6 +450,27 @@ void Services::ClearAlert(IModule* m) {
 void Services::Invalidate() {
     g_isDirty = true;
     RequestPaint();
+}
+
+void Services::Refresh() { IslandRecompute(); }
+unsigned IslandSurfaceGen() { return g_isSurface.Generation(); }
+void IslandRepaint() {
+    g_isDirty = true;
+    RequestPaint();
+}
+
+// A drag reached the bar: show the shelf (the island opens over apps; nothing resizes).
+void IslandOpenShelf() {
+    const std::vector<IModule*> dashes = Dashboards();
+    for (size_t i = 0; i < dashes.size(); i++) {
+        if (dashes[i] == ShelfModule()) {
+            if (g_tab != (int)i) g_tabDir = (int)i > g_tab ? 1 : -1;
+            g_tab = (int)i;
+        }
+    }
+    g_expanded = true;
+    g_leaveSince = 0;
+    IslandRecompute();
 }
 
 void Services::WakeAnimation() {

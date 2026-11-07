@@ -11,6 +11,9 @@ core/loc.inc
 bar/state.inc
 bar/render.inc
 bar/module.inc
+bar/dash.inc
+bar/shelf.inc
+bar/modules.inc
 bar/placement.inc
 bar/panels.inc
 bar/tray.inc

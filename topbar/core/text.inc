@@ -8,6 +8,9 @@ struct TextOpts {
     float maxH = 1e6f;
     bool ellipsis = false;
     bool center = false;              // centred both ways inside maxW x maxH
+    int weight = 400;                 // DWRITE_FONT_WEIGHT: 600 semibold, 700 bold
+    bool right = false;               // right-aligned inside maxW
+    bool wrap = false;                // wrap words inside maxW
 };
 
 class TextService {
@@ -29,13 +32,13 @@ public:
         const wchar_t* family = o.family ? o.family : family_.c_str();
         const float size = o.size > 0 ? o.size : size_;
         wchar_t head[160];
-        swprintf_s(head, L"%ls|%.2f|%.1f|%.1f|%d%d|", family, size, o.maxW, o.maxH, o.ellipsis, o.center);
+        swprintf_s(head, L"%ls|%.2f|%.1f|%.1f|%d%d%d%d|%d|", family, size, o.maxW, o.maxH, o.ellipsis, o.center, o.right, o.wrap, o.weight);
         const std::wstring key = std::wstring(head) + text;
         auto it = cache_.find(key);
         if (it != cache_.end()) return it->second;
         if (cache_.size() > 200) cache_.clear();
         Com<IDWriteTextFormat> fmt;
-        if (FAILED(factory_->CreateTextFormat(family, nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+        if (FAILED(factory_->CreateTextFormat(family, nullptr, (DWRITE_FONT_WEIGHT)o.weight, DWRITE_FONT_STYLE_NORMAL,
                                               DWRITE_FONT_STRETCH_NORMAL, size, L"", fmt.Put()))) {
             return {};
         }
@@ -44,7 +47,8 @@ public:
                                               layout.Put()))) {
             return {};
         }
-        layout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        layout->SetWordWrapping(o.wrap ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP);
+        if (o.right) layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
         if (o.center) {
             layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
             layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);

@@ -18,5 +18,11 @@
 - language: ""
   $name: Language
   $description: A code such as de, fr, hi, ja. Leave empty to follow Windows.
+- weatherCity: ""
+  $name: Weather city
+  $description: Leave empty to let wttr.in guess from your address.
+- fahrenheit: true
+  $name: Fahrenheit
+  $description: Off for Celsius and km/h.
 */
 // ==/WindhawkModSettings==

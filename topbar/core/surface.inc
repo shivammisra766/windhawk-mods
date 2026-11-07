@@ -51,7 +51,7 @@ public:
         rt_->BeginDraw();
         rt_->PushAxisAlignedClip(D2D1::RectF((float)dirty.left, (float)dirty.top, (float)dirty.right, (float)dirty.bottom),
                                  D2D1_ANTIALIAS_MODE_ALIASED);
-        rt_->Clear(D2D1::ColorF(0, 0.0f));
+        rt_->Clear(D2D1::ColorF(0, baseAlpha_));
         return rt_.Get();
     }
 
@@ -107,6 +107,8 @@ public:
         ReleaseDC(nullptr, screen);
     }
 
+    // Alpha of the cleared background. 1/255 keeps transparent areas hit-testable, so a drag over them still reaches OLE.
+    void SetBaseAlpha(float a) { baseAlpha_ = a; }
     ID2D1DCRenderTarget* Target() const { return rt_.Get(); }
     unsigned Generation() const { return generation_; }
     int Width() const { return w_; }
@@ -133,5 +135,6 @@ private:
     void* bits_ = nullptr;
     int w_ = 0, h_ = 0;
     unsigned generation_ = 0;
+    float baseAlpha_ = 0.0f;
     Com<ID2D1DCRenderTarget> rt_;
 };
