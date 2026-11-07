@@ -5,7 +5,7 @@
 // @version         3.1
 // @author          local
 // @include         windhawk.exe
-// @compilerOptions -lgdi32 -luser32 -lshell32 -ladvapi32 -lole32 -lversion -lwininet -liphlpapi -luuid -ld2d1 -ldwrite -lwindowscodecs -ldwmapi
+// @compilerOptions -lgdi32 -luser32 -lshell32 -ladvapi32 -lole32 -lversion -lwininet -liphlpapi -luuid -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -lruntimeobject -loleaut32
 // ==/WindhawkMod==
 // ==WindhawkModSettings==
 /*
@@ -18,6 +18,12 @@
 - language: ""
   $name: Language
   $description: A code such as de, fr, hi, ja. Leave empty to follow Windows.
+- mediaAutoExpand: true
+  $name: Media - open on a new track
+  $description: Opens the media player for a few seconds when a new song or video starts.
+- mediaExpandBlocklist: ""
+  $name: Media - no auto-open for
+  $description: Comma separated words. A match in the app name, app id or title keeps the player closed.
 */
 // ==/WindhawkModSettings==
 #line 1 "core/includes.inc"
@@ -33,6 +39,19 @@
 #include <d2d1.h>
 #include <dwrite.h>
 #include <wincodec.h>
+#include <mmdeviceapi.h>
+#include <unknwn.h>
+#include <winrt/base.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Media.Control.h>
+#include <winrt/Windows.Storage.Streams.h>
+#include <chrono>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <string_view>
 #include <dwmapi.h>
 #include <cmath>
 #include <cstdlib>
@@ -866,6 +885,8 @@ struct Settings {
     std::wstring fontFamily;  // empty: Segoe UI Variable Text, then Segoe UI
     int fontScale = 100;      // percent of the usual text size
     std::wstring language;    // empty: follow Windows
+    bool mediaAutoExpand = true;
+    std::wstring mediaBlocklist;  // comma separated, lowercased and trimmed by the media module
 };
 
 Settings g_settings;
@@ -874,6 +895,8 @@ Settings LoadSettings() {
     Settings s;
     if (PCWSTR v = Wh_GetStringSetting(L"fontFamily")) { s.fontFamily = v; Wh_FreeStringSetting(v); }
     if (PCWSTR v = Wh_GetStringSetting(L"language")) { s.language = v; Wh_FreeStringSetting(v); }
+    s.mediaAutoExpand = Wh_GetIntSetting(L"mediaAutoExpand") != 0;
+    if (PCWSTR v = Wh_GetStringSetting(L"mediaExpandBlocklist")) { s.mediaBlocklist = v; Wh_FreeStringSetting(v); }
     const int scale = Wh_GetIntSetting(L"fontScale");
     s.fontScale = scale >= 50 && scale <= 200 ? scale : 100;
     return s;
@@ -888,6 +911,9 @@ const wchar_t* const kLocLangs[kLocLangCount] = { L"en", L"hi", L"zh", L"ja", L"
 struct LocEntry { const wchar_t* key; const wchar_t* text[kLocLangCount]; };
 const LocEntry kLoc[] = {
     { L"window.title", { L"Top bar", L"", L"", L"", L"", L"", L"", L"", L"", L"", L"", L"" } },
+    { L"media.playingfrom", { L"Playing from %ls", L"", L"", L"", L"", L"", L"", L"", L"", L"", L"", L"" } },
+    { L"media.pausedin", { L"Paused in %ls", L"", L"", L"", L"", L"", L"", L"", L"", L"", L"", L"" } },
+    { L"media.unknown", { L"Unknown", L"", L"", L"", L"", L"", L"", L"", L"", L"", L"", L"" } },
 };
 
 // Language of the current settings: the chosen one, else the Windows display language, else English.
@@ -1679,6 +1705,8 @@ public:
     void Post(std::function<void()>);  // From any thread to the UI thread.
     void SetTimer(IModule*, UINT ms, std::function<void()>);  // One timer per module; repeats until KillTimer.
     void KillTimer(IModule*);
+    void Relayout();         // Re-measure the views after a module's size or presence changed.
+    void Expand(IModule*, int ms);  // Open the island on that module's dashboard for at least ms (then hover rules).
     void OpenPanel(PanelKind, int anchorX);  // The native notification or calendar panel.
     const Settings& GetSettings() const;
     const wchar_t* Loc(const wchar_t* key) const;
@@ -1760,7 +1788,1307 @@ private:
 ClockModule g_clockModule;
 DemoAlertModule g_demoAlert;
 PlaceholderPage g_page1(1, 2), g_page2(2, 2);
-IModule* const g_modules[] = {&g_clockModule, &g_demoAlert, &g_page1, &g_page2};
+// g_modules lives in bar/modules.inc, after the feature modules.
+
+#line 1 "media/engine.inc"
+// ---- Media engine: SMTC on one MTA thread, event driven. See specs/media.md. ----
+// Nothing here touches Direct2D. It publishes immutable snapshots; the UI thread (media.inc) draws them.
+
+extern Services g_services;  // Defined in island.inc.
+extern LayeredSurface g_isSurface;
+
+namespace wm = winrt::Windows::Media::Control;
+namespace ws = winrt::Windows::Storage::Streams;
+
+struct MArt {
+    int w = 0, h = 0;
+    std::vector<DWORD> px;  // premultiplied BGRA
+    float acc[3] = {0.298f, 0.788f, 0.941f};
+    bool hasAccent = false;
+    size_t hash = 0;
+};
+
+struct MSource {
+    std::wstring aumid, name;
+    bool playing = false;
+    std::shared_ptr<const MArt> icon;
+};
+
+struct MSnap {
+    bool has = false, playing = false;
+    std::wstring title, artist, album, aumid, sourceName;
+    std::shared_ptr<const MArt> art;
+    std::vector<MSource> sources;
+    int active = -1;
+    long long posMs = 0, durMs = 0;
+    ULONGLONG baseTick = 0;  // GetTickCount64 when posMs was true
+    double rate = 1.0;
+    bool canNext = true, canPrev = true, canSeek = false, canToggle = true;
+    unsigned trackSeq = 0;  // Bumped for each new track that may open the panel.
+};
+
+std::wstring LowerW(std::wstring s) {
+    for (wchar_t& c : s) c = (wchar_t)towlower(c);
+    return s;
+}
+
+bool HasWord(const std::wstring& lower, const wchar_t* w) { return lower.find(w) != std::wstring::npos; }
+
+// Display name. Fix for the old substring bug: "edge" and "media" matched unrelated ids, so use whole tokens.
+std::wstring FriendlySourceName(const std::wstring& aumid) {
+    const std::wstring l = LowerW(aumid);
+    struct { const wchar_t* key; const wchar_t* name; } table[] = {
+        {L"spotify", L"Spotify"}, {L"msedge", L"Edge"}, {L"chrome", L"Chrome"}, {L"firefox", L"Firefox"},
+        {L"brave", L"Brave"}, {L"opera", L"Opera"}, {L"vlc", L"VLC"}, {L"zunemusic", L"Media Player"},
+        {L"zunevideo", L"Movies & TV"}, {L"applemusic", L"Apple Music"}, {L"itunes", L"iTunes"},
+        {L"musicbee", L"MusicBee"}, {L"foobar", L"foobar2000"}, {L"tidal", L"TIDAL"}, {L"vivaldi", L"Vivaldi"}};
+    for (auto& t : table) if (HasWord(l, t.key)) return t.name;
+    std::wstring s = aumid;
+    size_t p = s.find_last_of(L"!\\/");
+    if (p != std::wstring::npos) s = s.substr(p + 1);
+    if (s.size() > 4 && !_wcsicmp(s.c_str() + s.size() - 4, L".exe")) s.resize(s.size() - 4);
+    p = s.find_last_of(L'.');
+    if (p != std::wstring::npos && p + 1 < s.size()) s = s.substr(p + 1);
+    if (!s.empty()) s[0] = (wchar_t)towupper(s[0]);
+    return s.empty() ? aumid : s;
+}
+
+// The base name of the process that owns `hwnd`, lowercase, without .exe. Also fills the full path.
+std::wstring ProcessOfWindow(HWND hwnd, std::wstring* path) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (!pid || pid == GetCurrentProcessId()) return L"";
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return L"";
+    wchar_t buf[MAX_PATH * 2] = {};
+    DWORD n = (DWORD)std::size(buf);
+    std::wstring out;
+    if (QueryFullProcessImageNameW(h, 0, buf, &n)) {
+        if (path) *path = buf;
+        std::wstring base = buf;
+        const size_t p = base.find_last_of(L"\\/");
+        if (p != std::wstring::npos) base = base.substr(p + 1);
+        if (base.size() > 4 && !_wcsicmp(base.c_str() + base.size() - 4, L".exe")) base.resize(base.size() - 4);
+        out = LowerW(base);
+    }
+    CloseHandle(h);
+    return out;
+}
+
+bool ProcessMatchesAumid(const std::wstring& procBase, const std::wstring& aumidLower) {
+    if (procBase.size() < 3) return false;
+    if (HasWord(aumidLower, procBase.c_str())) return true;
+    if (procBase == L"msedge" && HasWord(aumidLower, L"msedge")) return true;
+    return false;
+}
+
+struct WinFind {
+    const std::wstring* aumidLower;
+    const std::wstring* title;
+    HWND byTitle = nullptr, byProcess = nullptr;
+    std::wstring exePath;
+};
+
+BOOL CALLBACK FindWinProc(HWND hwnd, LPARAM lp) {
+    auto* f = reinterpret_cast<WinFind*>(lp);
+    if (!IsWindowVisible(hwnd) || GetWindow(hwnd, GW_OWNER)) return TRUE;
+    wchar_t cls[64] = {};
+    GetClassNameW(hwnd, cls, 64);
+    if (!wcscmp(cls, kClassName) || !wcscmp(cls, kIslandClass) || !wcscmp(cls, L"Shell_TrayWnd")) return TRUE;
+    wchar_t cap[256] = {};
+    GetWindowTextW(hwnd, cap, 256);
+    if (!cap[0]) return TRUE;
+    std::wstring path;
+    const std::wstring proc = ProcessOfWindow(hwnd, &path);
+    if (proc.empty() || !ProcessMatchesAumid(proc, *f->aumidLower)) return TRUE;
+    if (f->exePath.empty()) f->exePath = path;
+    if (!f->byProcess) f->byProcess = hwnd;
+    // Bug 7 of the old mod: an empty title matched the first window. Only match a non-empty one.
+    if (!f->title->empty() && !f->byTitle && LowerW(cap).find(LowerW(*f->title)) != std::wstring::npos) f->byTitle = hwnd;
+    return TRUE;
+}
+
+// VLC with no title in SMTC: use its window caption, which ends in "VLC media player".
+struct VlcCtx { std::wstring out; };
+BOOL CALLBACK VlcEnumProc(HWND hwnd, LPARAM lp) {
+    auto* c = reinterpret_cast<VlcCtx*>(lp);
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    wchar_t cap[256] = {};
+    GetWindowTextW(hwnd, cap, 256);
+    const std::wstring s = cap;
+    const std::wstring tail = L" - VLC media player";
+    if (s.size() > tail.size() && s.compare(s.size() - tail.size(), tail.size(), tail) == 0 &&
+        ProcessOfWindow(hwnd, nullptr) == L"vlc") {
+        c->out = s.substr(0, s.size() - tail.size());
+        return FALSE;
+    }
+    return TRUE;
+}
+
+std::wstring VlcCaption() {
+    VlcCtx ctx;
+    EnumWindows(VlcEnumProc, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.out;
+}
+
+// ---- Art decode and accent ----
+
+void RgbToHsl(float r, float g, float b, float& h, float& s, float& l) {
+    const float mx = std::max({r, g, b}), mn = std::min({r, g, b});
+    l = (mx + mn) / 2;
+    const float d = mx - mn;
+    h = 0; s = 0;
+    if (d > 1e-5f) {
+        s = l > 0.5f ? d / (2 - mx - mn) : d / (mx + mn);
+        if (mx == r) h = (g - b) / d + (g < b ? 6 : 0);
+        else if (mx == g) h = (b - r) / d + 2;
+        else h = (r - g) / d + 4;
+        h /= 6;
+    }
+}
+
+float HueToRgb(float p, float q, float t) {
+    if (t < 0) t += 1;
+    if (t > 1) t -= 1;
+    if (t < 1.0f / 6) return p + (q - p) * 6 * t;
+    if (t < 0.5f) return q;
+    if (t < 2.0f / 3) return p + (q - p) * (2.0f / 3 - t) * 6;
+    return p;
+}
+
+void HslToRgb(float h, float s, float l, float& r, float& g, float& b) {
+    if (s <= 1e-5f) { r = g = b = l; return; }
+    const float q = l < 0.5f ? l * (1 + s) : l + s - l * s, p = 2 * l - q;
+    r = HueToRgb(p, q, h + 1.0f / 3);
+    g = HueToRgb(p, q, h);
+    b = HueToRgb(p, q, h - 1.0f / 3);
+}
+
+float RelLum(float r, float g, float b) {
+    auto f = [](float c) { return c <= 0.03928f ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f); };
+    return 0.2126f * f(r) + 0.7152f * f(g) + 0.0722f * f(b);
+}
+
+// Spec section 9.2: vivid dominant colour, 16^3 buckets, at least 3:1 against the bar's surface.
+void ComputeAccent(MArt& a) {
+    struct B { float w = 0; int n = 0; double r = 0, g = 0, b = 0, sat = 0; };
+    std::vector<B> bk(4096);
+    for (DWORD px : a.px) {
+        const int a8 = px >> 24;
+        if (a8 < 32) continue;
+        const int r = std::min(255, (int)(((px >> 16) & 255) * 255 / a8)), g = std::min(255, (int)(((px >> 8) & 255) * 255 / a8)),
+                  b = std::min(255, (int)((px & 255) * 255 / a8));
+        const int lum = (299 * r + 587 * g + 114 * b) / 1000;
+        if (lum < 36 || lum > 220) continue;
+        const int mx = std::max({r, g, b}), mn = std::min({r, g, b});
+        const int sat = mx ? (mx - mn) * 255 / mx : 0;
+        if (sat < 28) continue;
+        B& x = bk[((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4)];
+        x.w += 1.0f + sat / 32.0f;
+        x.n++; x.r += r; x.g += g; x.b += b; x.sat += sat;
+    }
+    int top[3] = {-1, -1, -1};
+    for (int i = 0; i < 4096; i++) {
+        if (!bk[i].n) continue;
+        for (int k = 0; k < 3; k++) {
+            if (top[k] < 0 || bk[i].w > bk[top[k]].w) {
+                for (int m = 2; m > k; m--) top[m] = top[m - 1];
+                top[k] = i;
+                break;
+            }
+        }
+    }
+    int best = -1;
+    for (int k = 0; k < 3; k++) {
+        if (top[k] < 0) continue;
+        if (best < 0 || bk[top[k]].sat / bk[top[k]].n > bk[best].sat / bk[best].n) best = top[k];
+    }
+    if (best < 0) return;  // Black and white art keeps the default.
+    double sr = 0, sg = 0, sb = 0;
+    long cnt = 0;
+    const int br = best >> 8, bg = (best >> 4) & 15, bb = best & 15;
+    for (int dr = -1; dr <= 1; dr++) for (int dg = -1; dg <= 1; dg++) for (int db = -1; db <= 1; db++) {
+        const int r = br + dr, g = bg + dg, b = bb + db;
+        if (r < 0 || g < 0 || b < 0 || r > 15 || g > 15 || b > 15) continue;
+        const B& x = bk[(r << 8) | (g << 4) | b];
+        sr += x.r; sg += x.g; sb += x.b; cnt += x.n;
+    }
+    if (!cnt) return;
+    float r = (float)(sr / cnt / 255), g = (float)(sg / cnt / 255), b = (float)(sb / cnt / 255);
+    float h, s, l;
+    RgbToHsl(r, g, b, h, s, l);
+    s = std::max(s, 0.35f);
+    const float bgLum = RelLum(0x10 / 255.0f, 0x10 / 255.0f, 0x10 / 255.0f);
+    for (int i = 0; i < 20; i++) {
+        HslToRgb(h, s, l, r, g, b);
+        if ((RelLum(r, g, b) + 0.05f) / (bgLum + 0.05f) >= 3.0f) break;
+        l = std::min(1.0f, l + 0.04f);
+    }
+    a.acc[0] = r; a.acc[1] = g; a.acc[2] = b;
+    a.hasAccent = true;
+}
+
+// Bytes -> 128x128 premultiplied BGRA (centre crop). Bug 10 of the old mod: big art was rejected; now it is scaled.
+std::shared_ptr<MArt> DecodeArt(const std::vector<uint8_t>& bytes) {
+    Com<IWICImagingFactory> wic;
+    if (bytes.empty() || FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                                 __uuidof(IWICImagingFactory), reinterpret_cast<void**>(wic.Put())))) return nullptr;
+    Com<IWICStream> stream;
+    Com<IWICBitmapDecoder> dec;
+    Com<IWICBitmapFrameDecode> frame;
+    Com<IWICFormatConverter> conv;
+    Com<IWICBitmapScaler> scaler;
+    if (FAILED(wic->CreateStream(stream.Put())) ||
+        FAILED(stream->InitializeFromMemory(const_cast<BYTE*>(bytes.data()), (DWORD)bytes.size())) ||
+        FAILED(wic->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnDemand, dec.Put())) ||
+        FAILED(dec->GetFrame(0, frame.Put())) || FAILED(wic->CreateFormatConverter(conv.Put())) ||
+        FAILED(conv->Initialize(frame.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0,
+                                WICBitmapPaletteTypeCustom))) return nullptr;
+    UINT w = 0, h = 0;
+    conv->GetSize(&w, &h);
+    if (!w || !h || w > 16384 || h > 16384) return nullptr;
+    constexpr UINT N = 128;
+    const float k = (float)N / (float)std::min(w, h);
+    const UINT sw = std::max<UINT>(N, (UINT)lroundf(w * k)), sh = std::max<UINT>(N, (UINT)lroundf(h * k));
+    if (FAILED(wic->CreateBitmapScaler(scaler.Put())) ||
+        FAILED(scaler->Initialize(conv.Get(), sw, sh, WICBitmapInterpolationModeFant))) return nullptr;
+    auto art = std::make_shared<MArt>();
+    art->w = art->h = N;
+    art->px.resize((size_t)N * N);
+    WICRect rc{(INT)((sw - N) / 2), (INT)((sh - N) / 2), (INT)N, (INT)N};
+    if (FAILED(scaler->CopyPixels(&rc, N * 4, (UINT)(art->px.size() * 4), reinterpret_cast<BYTE*>(art->px.data())))) return nullptr;
+    ComputeAccent(*art);
+    return art;
+}
+
+// ---- The engine ----
+
+enum class MCmdKind { Toggle, Next, Prev, Seek, Pick, Open };
+struct MCmd { MCmdKind kind; long long arg = 0; std::wstring s; };
+
+template <class Op>
+bool AwaitOp(const Op& op, int ms = 2000) {
+    try {
+        if (op.wait_for(std::chrono::milliseconds(ms)) == winrt::Windows::Foundation::AsyncStatus::Completed) return true;
+        op.Cancel();
+    } catch (...) {}
+    return false;
+}
+
+class MediaEngine {
+public:
+    void Start(std::function<void()> notify) {
+        notify_ = std::move(notify);
+        stop_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        wake_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        snap_ = std::make_shared<const MSnap>();
+        alive_ = std::make_shared<std::atomic<bool>>(true);
+        thread_ = CreateThread(nullptr, 0, ThreadMain, this, 0, nullptr);
+    }
+    void Stop() {
+        if (alive_) *alive_ = false;
+        if (stop_) SetEvent(stop_);
+        if (thread_) {
+            WaitForSingleObject(thread_, 2000);
+            CloseHandle(thread_);
+            thread_ = nullptr;
+        }
+        if (stop_) { CloseHandle(stop_); stop_ = nullptr; }
+        if (wake_) { CloseHandle(wake_); wake_ = nullptr; }
+    }
+    std::shared_ptr<const MSnap> Snapshot() {
+        std::lock_guard<std::mutex> g(mu_);
+        return snap_;
+    }
+    void Command(MCmd c) {
+        {
+            std::lock_guard<std::mutex> g(mu_);
+            if (c.kind == MCmdKind::Seek) {  // Only the newest seek matters.
+                cmds_.erase(std::remove_if(cmds_.begin(), cmds_.end(), [](const MCmd& m) { return m.kind == MCmdKind::Seek; }), cmds_.end());
+            }
+            cmds_.push_back(std::move(c));
+        }
+        if (wake_) SetEvent(wake_);
+    }
+    // The panel is open: read the timeline every 1.5 s, like the old mod, so the jitter guard works unchanged.
+    void SetPanelOpen(bool open) {
+        if (panelOpen_.exchange(open) != open && wake_) SetEvent(wake_);
+    }
+    std::shared_ptr<std::atomic<bool>> Alive() const { return alive_; }
+
+private:
+    struct SessRec {
+        wm::GlobalSystemMediaTransportControlsSession s{nullptr};
+        std::wstring aumid;
+        bool playing = false;
+        wm::GlobalSystemMediaTransportControlsSession::PlaybackInfoChanged_revoker r1;
+        wm::GlobalSystemMediaTransportControlsSession::MediaPropertiesChanged_revoker r2;
+    };
+    struct SrcState {
+        bool wasPlaying = false;
+        unsigned startedSeq = 0;
+        std::shared_ptr<const MArt> icon;
+        ULONGLONG iconTry = 0;
+    };
+
+    static DWORD WINAPI ThreadMain(void* self) {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        static_cast<MediaEngine*>(self)->Run();
+        winrt::uninit_apartment();
+        return 0;
+    }
+
+    void Run() {
+        HANDLE h[2] = {stop_, wake_};
+        DWORD timeout = 0;
+        for (;;) {
+            const DWORD w = WaitForMultipleObjects(2, h, FALSE, timeout);
+            if (w == WAIT_OBJECT_0) break;
+            if (w == WAIT_OBJECT_0 + 1 && WaitForSingleObject(stop_, 100) == WAIT_OBJECT_0) break;  // Coalesce bursts.
+            try {
+                RunCommands();
+                Refresh();
+            } catch (...) {
+                Wh_Log(L"media: refresh failed");
+            }
+            timeout = NextTimeout();
+        }
+        recs_.clear();
+        mgrSess_.revoke();
+        mgrCur_.revoke();
+        mgr_ = nullptr;
+    }
+
+    // No sessions: only events and a slow health check. Playing: events plus a fallback, faster with the panel open.
+    DWORD NextTimeout() {
+        DWORD t = 120000;
+        if (!recs_.empty()) t = 30000;
+        if (cur_.playing) t = panelOpen_ ? 1500 : 5000;
+        if (artRetryAt_) {
+            const ULONGLONG now = GetTickCount64();
+            t = std::min<DWORD>(t, artRetryAt_ > now ? (DWORD)(artRetryAt_ - now) + 5 : 5);
+        }
+        return t;
+    }
+
+    bool EnsureManager() {
+        if (mgr_) return true;
+        try {
+            auto op = wm::GlobalSystemMediaTransportControlsSessionManager::RequestAsync();
+            if (!AwaitOp(op, 3000)) return false;
+            mgr_ = op.GetResults();
+            mgrSess_ = mgr_.SessionsChanged(winrt::auto_revoke, [this](auto&&, auto&&) { sessionsDirty_ = true; SetEvent(wake_); });
+            mgrCur_ = mgr_.CurrentSessionChanged(winrt::auto_revoke, [this](auto&&, auto&&) { sessionsDirty_ = true; SetEvent(wake_); });
+            sessionsDirty_ = true;
+            return true;
+        } catch (...) {
+            mgr_ = nullptr;  // Bug 4: a dead broker left the manager stale forever. Retry on the next health tick.
+            return false;
+        }
+    }
+
+    wm::GlobalSystemMediaTransportControlsSession* Chosen() {
+        for (SessRec& r : recs_) if (r.aumid == chosenAumid_ && r.playing) return &r.s;
+        for (SessRec& r : recs_) if (r.aumid == chosenAumid_) return &r.s;  // Bug 12: prefer the playing duplicate.
+        return nullptr;
+    }
+
+    void RunCommands() {
+        std::deque<MCmd> cmds;
+        {
+            std::lock_guard<std::mutex> g(mu_);
+            cmds.swap(cmds_);
+        }
+        for (MCmd& c : cmds) {
+            try {
+                if (c.kind == MCmdKind::Pick) {
+                    dockPick_ = c.s;
+                    userSwitchUntil_ = GetTickCount64() + 4000;
+                    forceRead_ = true;
+                    continue;
+                }
+                if (c.kind == MCmdKind::Open) { OpenPlayer(); continue; }
+                auto* s = Chosen();
+                if (!s) continue;  // No media key fallback: it can double-skip.
+                if (c.kind == MCmdKind::Toggle) AwaitOp(s->TryTogglePlayPauseAsync());
+                else if (c.kind == MCmdKind::Next) AwaitOp(s->TrySkipNextAsync());
+                else if (c.kind == MCmdKind::Prev) AwaitOp(s->TrySkipPreviousAsync());
+                else if (c.kind == MCmdKind::Seek && cur_.durMs > 0) {
+                    const long long target = std::max(0LL, std::min(c.arg, cur_.durMs));
+                    AwaitOp(s->TryChangePlaybackPositionAsync((curStartMs_ + target) * 10000));
+                    cur_.posMs = target;
+                    cur_.baseTick = GetTickCount64();
+                    ignoreTimelineUntil_ = cur_.baseTick + 1500;
+                    backPending_ = false;
+                    Publish(true);
+                }
+            } catch (...) {}
+        }
+        if (!cmds.empty()) forceRead_ = true;
+    }
+
+    void OpenPlayer() {
+        const std::wstring al = LowerW(chosenAumid_);
+        WinFind f{&al, &cur_.title};
+        EnumWindows(FindWinProc, reinterpret_cast<LPARAM>(&f));
+        HWND hw = f.byTitle ? f.byTitle : f.byProcess;
+        if (hw) {
+            if (IsIconic(hw)) ShowWindow(hw, SW_RESTORE);
+            SetForegroundWindow(hw);
+        } else if (chosenAumid_.find(L'!') != std::wstring::npos) {
+            ShellExecuteW(nullptr, L"open", (L"shell:AppsFolder\\" + chosenAumid_).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+    }
+
+    void RebuildSessions() {
+        recs_.clear();
+        sessionsDirty_ = false;
+        auto list = mgr_.GetSessions();
+        for (uint32_t i = 0; i < list.Size(); i++) {
+            auto s = list.GetAt(i);
+            recs_.emplace_back();
+            SessRec& r = recs_.back();
+            r.s = s;
+            r.aumid = s.SourceAppUserModelId().c_str();
+            r.r1 = s.PlaybackInfoChanged(winrt::auto_revoke, [this](auto&&, auto&&) { SetEvent(wake_); });
+            r.r2 = s.MediaPropertiesChanged(winrt::auto_revoke, [this](auto&&, auto&&) { propsDirty_ = true; SetEvent(wake_); });
+        }
+    }
+
+    // Spec section 6.2, kept: dock pick, then auto (playing beats paused, newest start wins).
+    void ChooseSource(const std::wstring& systemCurrent) {
+        std::wstring want;
+        unsigned best = 0;
+        bool newStart = false;
+        for (auto& o : order_) if (srcs_[o].startedSeq > startedBefore_) newStart = true;
+        if (newStart) dockPick_.clear();
+        bool pickAlive = false;
+        for (auto& o : order_) if (o == dockPick_) pickAlive = true;
+        if (!pickAlive) dockPick_.clear();
+        if (!dockPick_.empty()) { chosenAumid_ = dockPick_; return; }
+        for (auto& o : order_) {
+            bool playing = false;
+            for (SessRec& r : recs_) if (r.aumid == o && r.playing) playing = true;
+            const unsigned score = srcs_[o].startedSeq + (playing ? 1000000u : 0u);
+            if (srcs_[o].startedSeq == 0 && !playing) continue;
+            if (!want.size() || score > best) { want = o; best = score; }
+        }
+        if (want.empty()) want = !systemCurrent.empty() ? systemCurrent : (order_.empty() ? L"" : order_[0]);
+        chosenAumid_ = want;
+    }
+
+    std::shared_ptr<const MArt> SourceIcon(const std::wstring& aumid, SrcState& st) {
+        if (st.icon) return st.icon;
+        const ULONGLONG now = GetTickCount64();
+        if (st.iconTry && now - st.iconTry < 15000) return nullptr;  // Bug 6: throttle the window scan.
+        st.iconTry = now;
+        const std::wstring al = LowerW(aumid);
+        const std::wstring none;
+        WinFind f{&al, &none};
+        EnumWindows(FindWinProc, reinterpret_cast<LPARAM>(&f));
+        if (f.exePath.empty()) return nullptr;
+        SHFILEINFOW info{};
+        if (!SHGetFileInfoW(f.exePath.c_str(), 0, &info, sizeof(info), SHGFI_ICON | SHGFI_LARGEICON) || !info.hIcon) return nullptr;
+        std::unique_ptr<Pixmap> pm(PixmapFromIcon(info.hIcon));
+        DestroyIcon(info.hIcon);
+        if (!pm) return nullptr;
+        auto art = std::make_shared<MArt>();
+        art->w = pm->w; art->h = pm->h; art->px = std::move(pm->px);
+        st.icon = art;
+        return art;
+    }
+
+    bool ReadArt(const wm::GlobalSystemMediaTransportControlsSessionMediaProperties& props, std::shared_ptr<const MArt>& out, size_t& hash) {
+        auto ref = props.Thumbnail();
+        if (!ref) return false;
+        auto op = ref.OpenReadAsync();
+        if (!AwaitOp(op)) return false;
+        auto stream = op.GetResults();
+        const uint64_t size = stream.Size();
+        if (!size || size > (24u << 20)) return false;
+        ws::DataReader reader(stream);
+        auto load = reader.LoadAsync((uint32_t)size);
+        if (!AwaitOp(load)) return false;
+        std::vector<uint8_t> bytes((size_t)size);
+        reader.ReadBytes(bytes);
+        const size_t hsh = std::hash<std::string_view>()(std::string_view((const char*)bytes.data(), bytes.size()));
+        if (out && hash == hsh) return true;  // Same bytes: keep the decoded art.
+        auto art = DecodeArt(bytes);
+        if (!art) return false;
+        art->hash = hsh;
+        hash = hsh;
+        out = art;
+        return true;
+    }
+
+    void Refresh() {
+        const ULONGLONG now = GetTickCount64();
+        if (!EnsureManager()) { return; }
+        std::wstring systemCurrent;
+        try {
+            if (sessionsDirty_ || recs_.empty() || forceRebuild_) { RebuildSessions(); forceRebuild_ = false; }
+            if (auto c = mgr_.GetCurrentSession()) systemCurrent = c.SourceAppUserModelId().c_str();
+        } catch (...) {
+            mgr_ = nullptr;
+            mgrSess_.revoke();
+            mgrCur_.revoke();
+            return;  // Keep the last snapshot.
+        }
+        // Playback state of every session, so a start in another player is noticed.
+        for (SessRec& r : recs_) {
+            try {
+                r.playing = r.s.GetPlaybackInfo().PlaybackStatus() ==
+                            wm::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
+            } catch (...) {}
+        }
+        // Merge by AUMID, stable order, history forgotten when the source goes away.
+        std::vector<std::wstring> present;
+        for (SessRec& r : recs_) if (std::find(present.begin(), present.end(), r.aumid) == present.end()) present.push_back(r.aumid);
+        order_.erase(std::remove_if(order_.begin(), order_.end(), [&](const std::wstring& o) {
+            if (std::find(present.begin(), present.end(), o) != present.end()) return false;
+            srcs_.erase(o);
+            return true;
+        }), order_.end());
+        for (auto& p : present) if (std::find(order_.begin(), order_.end(), p) == order_.end()) { order_.push_back(p); srcs_[p]; }
+        startedBefore_ = startCounter_;
+        for (int pass = 0; pass < 2; pass++) {  // The system's current session counts as the newest of several.
+            for (auto& o : order_) {
+                if ((o == systemCurrent) != (pass == 1)) continue;
+                bool playing = false;
+                for (SessRec& r : recs_) if (r.aumid == o && r.playing) playing = true;
+                SrcState& st = srcs_[o];
+                if (playing && !st.wasPlaying) st.startedSeq = ++startCounter_;
+                st.wasPlaying = playing;
+            }
+        }
+        const std::wstring prevAumid = chosenAumid_;
+        ChooseSource(systemCurrent);
+
+        MSnap next = cur_;
+        next.sources.clear();
+        for (auto& o : order_) {
+            MSource ms;
+            ms.aumid = o;
+            ms.name = FriendlySourceName(o);
+            for (SessRec& r : recs_) if (r.aumid == o && r.playing) ms.playing = true;
+            ms.icon = SourceIcon(o, srcs_[o]);
+            next.sources.push_back(ms);
+        }
+        next.active = -1;
+        for (size_t i = 0; i < order_.size(); i++) if (order_[i] == chosenAumid_) next.active = (int)i;
+
+        auto* sess = Chosen();
+        if (!sess) {  // Session loss: only now drop the snapshot (bug 3).
+            if (recs_.empty() || !chosenAumid_.empty()) {
+                const unsigned seq = cur_.trackSeq;
+                cur_ = MSnap();
+                cur_.trackSeq = seq;
+                cur_.sources = next.sources;
+                firstRead_ = false;
+                lastKey_.clear();
+                artKey_.clear();
+                artRetryAt_ = 0;
+                Publish(false);
+            }
+            return;
+        }
+        bool readOk = true;
+        try {
+            next.has = true;
+            next.aumid = chosenAumid_;
+            next.sourceName = FriendlySourceName(chosenAumid_);
+            auto info = sess->GetPlaybackInfo();
+            next.playing = info.PlaybackStatus() == wm::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
+            auto ctl = info.Controls();
+            next.canNext = ctl.IsNextEnabled();
+            next.canPrev = ctl.IsPreviousEnabled();
+            next.canSeek = ctl.IsPlaybackPositionEnabled();
+            next.canToggle = ctl.IsPlayPauseToggleEnabled() || ctl.IsPlayEnabled() || ctl.IsPauseEnabled();
+            double rate = 1.0;
+            if (auto r = info.PlaybackRate()) rate = r.Value();
+            next.rate = rate > 0.05 && rate < 8 ? rate : 1.0;
+
+            const bool srcChanged = chosenAumid_ != prevAumid;
+            if (propsDirty_ || forceRead_ || srcChanged || lastKey_.empty() || cur_.title.empty() || artRetryAt_ || next.playing != cur_.playing) {
+                propsDirty_ = false;
+                auto pop = sess->TryGetMediaPropertiesAsync();
+                if (!AwaitOp(pop)) throw std::runtime_error("props");
+                auto props = pop.GetResults();
+                next.title = props.Title().c_str();
+                next.artist = props.Artist().c_str();
+                next.album = props.AlbumTitle().c_str();
+                if (next.title.empty() && LowerW(chosenAumid_).find(L"vlc") != std::wstring::npos) next.title = VlcCaption();
+                const std::wstring key = chosenAumid_ + L"\n" + next.title + L"\n" + next.artist + L"\n" + next.album;
+                const bool newTrack = key != lastKey_;
+                if (newTrack) {
+                    next.art = nullptr;  // Never keep old art across a real track change.
+                    artHash_ = 0;
+                    artRetryAt_ = now + 1500;
+                    artTries_ = 0;
+                }
+                // Art: replaced only when the bytes differ (bug 5). Retry at +1.5 s and +3 s for slow players.
+                if (newTrack || (artRetryAt_ && now >= artRetryAt_)) {
+                    std::shared_ptr<const MArt> a = next.art;
+                    size_t hsh = artHash_;
+                    bool got = false;
+                    try { got = ReadArt(props, a, hsh); } catch (...) {}
+                    if (got) { next.art = a; artHash_ = hsh; }
+                    if (artTries_ < 2) { artRetryAt_ = now + 1500; artTries_++; } else artRetryAt_ = 0;
+                }
+                // Auto-expand trigger. Skipped on the first read, after a user switch, and for resume-from-pause (bug 2).
+                const std::wstring tkey = next.title + L"\n" + next.artist;
+                if (newTrack && !firstRead_ && now >= userSwitchUntil_ && !next.title.empty() && next.playing &&
+                    tkey != lastTrackKey_) {
+                    next.trackSeq++;
+                }
+                lastTrackKey_ = tkey;
+                lastKey_ = key;
+                forceRead_ = false;
+            } else if (artRetryAt_ && now >= artRetryAt_) {
+                artRetryAt_ = 0;
+            }
+            // Timeline.
+            if (now >= ignoreTimelineUntil_) {
+                auto tl = sess->GetTimelineProperties();
+                using namespace std::chrono;
+                curStartMs_ = duration_cast<milliseconds>(tl.StartTime()).count();
+                const long long endMs = duration_cast<milliseconds>(tl.EndTime()).count();
+                next.durMs = std::max(0LL, endMs - curStartMs_);  // Bug 13: duration is end - start.
+                long long pos = duration_cast<milliseconds>(tl.Position()).count() - curStartMs_;
+                const long long age = duration_cast<milliseconds>(winrt::clock::now() - tl.LastUpdatedTime()).count();
+                if (next.playing && age >= 0 && age < 10000) pos += (long long)(age * next.rate);
+                pos = std::max(0LL, std::min(pos, next.durMs > 0 ? next.durMs : pos));
+                // Spotify refreshes LastUpdatedTime without moving Position: hold a backward jump until confirmed.
+                const long long expected = cur_.posMs + (cur_.playing ? (long long)((now - cur_.baseTick) * cur_.rate) : 0);
+                const bool sameTrack = next.title == cur_.title && next.aumid == cur_.aumid;
+                if (sameTrack && next.playing && cur_.playing && pos < expected - 1500 && !backPending_) {
+                    backPending_ = true;  // keep the old base
+                    next.posMs = cur_.posMs;
+                    next.baseTick = cur_.baseTick;
+                } else {
+                    backPending_ = false;
+                    next.posMs = pos;
+                    next.baseTick = now;
+                }
+            }
+        } catch (...) {
+            readOk = false;  // Bug 3: keep the last snapshot instead of publishing an empty one.
+        }
+        if (!readOk) {
+            cur_.sources = next.sources;
+            cur_.active = next.active;
+            Publish(false);
+            return;
+        }
+        firstRead_ = false;
+        cur_ = std::move(next);
+        Publish(false);
+    }
+
+    // Posts to the UI only when something visible changed, or when the panel is open (it shows the position).
+    void Publish(bool force) {
+        auto snap = std::make_shared<MSnap>(cur_);
+        bool visible = force;
+        {
+            std::lock_guard<std::mutex> g(mu_);
+            const MSnap& o = *snap_;
+            visible = visible || o.has != snap->has || o.playing != snap->playing || o.title != snap->title ||
+                      o.artist != snap->artist || o.album != snap->album || o.art != snap->art || o.aumid != snap->aumid ||
+                      o.sources.size() != snap->sources.size() || o.active != snap->active || o.trackSeq != snap->trackSeq ||
+                      o.durMs != snap->durMs || o.canNext != snap->canNext || o.canPrev != snap->canPrev ||
+                      o.canSeek != snap->canSeek || o.rate != snap->rate;
+            if (!visible) {
+                for (size_t i = 0; i < o.sources.size(); i++)
+                    if (o.sources[i].playing != snap->sources[i].playing || o.sources[i].icon != snap->sources[i].icon) visible = true;
+            }
+            snap_ = snap;
+        }
+        if (visible || panelOpen_) {
+            auto alive = alive_;
+            auto fn = notify_;
+            g_services.Post([alive, fn] { if (*alive) fn(); });
+        }
+    }
+
+    std::function<void()> notify_;
+    HANDLE stop_ = nullptr, wake_ = nullptr, thread_ = nullptr;
+    std::mutex mu_;
+    std::shared_ptr<const MSnap> snap_;
+    std::deque<MCmd> cmds_;
+    std::shared_ptr<std::atomic<bool>> alive_;
+    std::atomic<bool> panelOpen_{false};
+    std::atomic<bool> sessionsDirty_{true}, propsDirty_{false};
+
+    // Media thread only.
+    wm::GlobalSystemMediaTransportControlsSessionManager mgr_{nullptr};
+    wm::GlobalSystemMediaTransportControlsSessionManager::SessionsChanged_revoker mgrSess_;
+    wm::GlobalSystemMediaTransportControlsSessionManager::CurrentSessionChanged_revoker mgrCur_;
+    std::vector<SessRec> recs_;
+    std::unordered_map<std::wstring, SrcState> srcs_;
+    std::vector<std::wstring> order_;
+    std::wstring chosenAumid_, dockPick_, lastKey_, artKey_, lastTrackKey_;
+    unsigned startCounter_ = 0, startedBefore_ = 0;
+    MSnap cur_;
+    bool firstRead_ = true, forceRead_ = false, forceRebuild_ = false, backPending_ = false;
+    size_t artHash_ = 0;
+    int artTries_ = 0;
+    ULONGLONG artRetryAt_ = 0, userSwitchUntil_ = 0, ignoreTimelineUntil_ = 0;
+    long long curStartMs_ = 0;
+};
+
+#line 1 "media/media.inc"
+// ---- Media module: the collapsed pill (art, clock, bars) and the player page. UI thread only. ----
+
+// IAudioMeterInformation is only forward-declared by this compiler's headers, so it is declared here.
+struct IMeterInfo : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE GetPeakValue(float* peak) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetMeteringChannelCount(UINT* n) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetChannelsPeakValues(UINT32 n, float* peaks) = 0;
+    virtual HRESULT STDMETHODCALLTYPE QueryHardwareSupport(DWORD* mask) = 0;
+};
+const GUID kIidMeterInfo = {0xC02216F6, 0x8C67, 0x4B5B, {0x9D, 0x00, 0xD0, 0x08, 0xE7, 0x3E, 0x00, 0x64}};
+
+// The pill keeps the clock exactly centred: both slots are the same width.
+constexpr float kMediaSlot = 26.0f;
+constexpr float kPlayerW = 380.0f, kPlayerH = 182.0f;
+constexpr int kBarsHist = 7;
+
+// Digits differ in width; measuring with the widest one stops the pill from shifting each minute.
+std::wstring WidestDigitForm(const std::wstring& s) {
+    wchar_t best = L'0';
+    float bw = 0;
+    for (wchar_t d = L'0'; d <= L'9'; d++) {
+        const float w = g_text.Measure(std::wstring(1, d));
+        if (w > bw) { bw = w; best = d; }
+    }
+    std::wstring o = s;
+    for (wchar_t& c : o) if (c >= L'0' && c <= L'9') c = best;
+    return o;
+}
+
+// Comma separated, case-insensitive substring match against name, app id and title.
+bool MediaBlocked(const std::wstring& list, const MSnap& s) {
+    if (list.empty()) return false;
+    const std::wstring hay = LowerW(s.sourceName + L"\n" + s.aumid + L"\n" + s.title);
+    size_t i = 0;
+    while (i <= list.size()) {
+        size_t j = list.find(L',', i);
+        if (j == std::wstring::npos) j = list.size();
+        std::wstring e = LowerW(list.substr(i, j - i));
+        const size_t a = e.find_first_not_of(L" \t"), b = e.find_last_not_of(L" \t");
+        if (a != std::wstring::npos) {
+            e = e.substr(a, b - a + 1);
+            if (hay.find(e) != std::wstring::npos) return true;
+        }
+        i = j + 1;
+    }
+    return false;
+}
+
+std::wstring FormatMs(long long ms) {
+    if (ms < 0) ms = 0;
+    const long long t = ms / 1000;
+    wchar_t b[32];
+    if (t >= 3600) swprintf_s(b, L"%lld:%02lld:%02lld", t / 3600, (t / 60) % 60, t % 60);
+    else swprintf_s(b, L"%lld:%02lld", t / 60, t % 60);
+    return b;
+}
+
+class MediaModule : public IModule {
+public:
+    const wchar_t* Id() const override { return L"media"; }
+
+    void Start(Services& s) override {
+        services_ = &s;
+        OnSettings(s.GetSettings());
+        engine_.Start([this] { OnSnapshot(); });
+    }
+    void Stop() override {
+        services_->KillTimer(this);
+        engine_.Stop();
+        meter_.Reset();
+    }
+    void OnSettings(const Settings& s) override {
+        autoExpand_ = s.mediaAutoExpand;
+        blocklist_ = s.mediaBlocklist;
+    }
+
+    int PillPriority() const override { return snap_ && snap_->has ? 10 : 0; }
+    bool HasDashboard() const override { return snap_ && snap_->has; }
+    int DashboardOrder() const override { return 5; }
+
+    Size2 Measure(View v) override {
+        if (v == View::Dashboard) return {kPlayerW, kPlayerH};
+        const float clockW = ToDip(g_text.Measure(WidestDigitForm(ClockText())));
+        return {clockW + 2 * kPillPadX + 2 * kMediaSlot, kNotchH};
+    }
+
+    bool Animating(View v) const override {
+        return v == View::Dashboard && snap_ && (snap_->playing || morph_ != (snap_->playing ? 1.0f : 0.0f));
+    }
+
+    void OnVisibility(View v, bool shown) override {
+        if (v == View::Pill) visPill_ = shown;
+        else {
+            visDash_ = shown;
+            engine_.SetPanelOpen(shown);
+            if (shown) { meter_.Reset(); lastSample_ = 0; dragging_ = false; pressed_ = Z_none; }
+        }
+        UpdateTimer();
+    }
+
+    void Draw(const DrawCtx& c) override {
+        if (!snap_ || !snap_->has) return;
+        if (c.view == View::Dashboard) DrawPlayer(c);
+        else DrawPill(c);
+    }
+
+    bool OnPointer(const PointerEvent& e, View v) override;
+
+private:
+    enum Zone { Z_none, Z_prev, Z_play, Z_next, Z_scrub, Z_open, Z_dock0 = 10 };
+
+    // ---- Snapshot handling ----
+    void OnSnapshot() {
+        auto old = snap_;
+        snap_ = engine_.Snapshot();
+        const bool presence = !old || old->has != snap_->has;
+        const bool dockChange = !old || old->sources.size() != snap_->sources.size();
+        if (snap_->has && snap_->trackSeq != lastSeq_) {
+            const bool first = lastSeq_ == ~0u;
+            lastSeq_ = snap_->trackSeq;
+            if (!first && autoExpand_ && !g_fullscreen && !MediaBlocked(blocklist_, *snap_)) services_->Expand(this, 5000);
+        }
+        lastSeq_ = snap_->trackSeq;
+        UpdateTimer();
+        if (presence || dockChange || !old || old->title != snap_->title || old->durMs != snap_->durMs) services_->Relayout();
+        services_->Invalidate();
+        services_->WakeAnimation();
+    }
+
+    // Collapsed: bars move at about 12 fps, only while the pill shows and music plays. Otherwise no timer.
+    void UpdateTimer() {
+        const bool want = visPill_ && snap_ && snap_->has && snap_->playing;
+        if (want == timerOn_) return;
+        timerOn_ = want;
+        if (want) {
+            meter_.Reset();
+            services_->SetTimer(this, 80, [this] { Sample(); services_->Invalidate(); });
+        } else {
+            services_->KillTimer(this);
+            services_->Invalidate();
+        }
+    }
+
+    // ---- Audio peak ----
+    bool EnsureMeter() {
+        if (meter_) return true;
+        Com<IMMDeviceEnumerator> en;
+        Com<IMMDevice> dev;
+        if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
+                                    reinterpret_cast<void**>(en.Put()))) ||
+            FAILED(en->GetDefaultAudioEndpoint(eRender, eConsole, dev.Put()))) return false;
+        void* p = nullptr;
+        if (FAILED(dev->Activate(kIidMeterInfo, CLSCTX_ALL, nullptr, &p)) || !p) return false;
+        *meter_.Put() = static_cast<IMeterInfo*>(p);
+        return true;
+    }
+
+    void Sample() {
+        float peak = 0;
+        if (EnsureMeter()) {
+            if (FAILED(meter_->GetPeakValue(&peak))) { meter_.Reset(); peak = 0; }  // Default device changed: re-resolve.
+        }
+        float v = std::min(1.0f, sqrtf(peak) * 1.15f);
+        if (!snap_ || !snap_->playing) v = 0;
+        const float prev = hist_[(histPos_ + kBarsHist - 1) % kBarsHist];
+        v = v > prev ? prev * 0.3f + v * 0.7f : prev * 0.15f + v * 0.85f;  // Attack 0.7, release 0.85, as the old one.
+        hist_[histPos_] = v;
+        histPos_ = (histPos_ + 1) % kBarsHist;
+    }
+
+    // ---- Images ----
+    struct Img {
+        std::shared_ptr<const MArt> src;
+        Com<ID2D1Bitmap> bmp;
+        unsigned gen = 0;
+    };
+    ID2D1Bitmap* BitmapFor(ID2D1RenderTarget* rt, Img& img, const std::shared_ptr<const MArt>& a) {
+        if (!a) return nullptr;
+        if (img.src != a || !img.bmp || img.gen != g_isSurface.Generation()) {
+            img.bmp.Reset();
+            D2D1_BITMAP_PROPERTIES p = D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+            if (FAILED(rt->CreateBitmap(D2D1::SizeU(a->w, a->h), a->px.data(), a->w * 4, &p, img.bmp.Put()))) return nullptr;
+            img.src = a;
+            img.gen = g_isSurface.Generation();
+        }
+        return img.bmp.Get();
+    }
+
+    static void FillBitmapRounded(ID2D1RenderTarget* rt, ID2D1Bitmap* bmp, D2D1_RECT_F r, float radius, float alpha) {
+        Com<ID2D1BitmapBrush> bb;
+        if (!bmp || FAILED(rt->CreateBitmapBrush(bmp, bb.Put()))) return;
+        const D2D1_SIZE_F sz = bmp->GetSize();
+        bb->SetOpacity(alpha);
+        bb->SetTransform(D2D1::Matrix3x2F::Scale((r.right - r.left) / sz.width, (r.bottom - r.top) / sz.height) *
+                         D2D1::Matrix3x2F::Translation(r.left, r.top));
+        rt->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius), bb.Get());
+    }
+
+    D2D1_COLOR_F Accent(float a = 1.0f) const {
+        float r = 0.298f, g = 0.788f, b = 0.941f;
+        if (snap_ && snap_->art && snap_->art->hasAccent) { r = snap_->art->acc[0]; g = snap_->art->acc[1]; b = snap_->art->acc[2]; }
+        return D2D1::ColorF(r, g, b, a);
+    }
+
+    static void SetCol(const DrawCtx& c, D2D1_COLOR_F col, float a = 1.0f) {
+        col.a *= a * c.alpha;
+        c.brush->SetColor(col);
+    }
+
+    void DrawArt(const DrawCtx& c, D2D1_RECT_F r, float radius) {
+        const float s = c.scale;
+        if (snap_->art) {
+            if (ID2D1Bitmap* b = BitmapFor(c.rt, art_, snap_->art)) { FillBitmapRounded(c.rt, b, r, radius * s, c.alpha); return; }
+        }
+        SetCol(c, Accent(), 0.24f);
+        c.rt->FillRoundedRectangle(D2D1::RoundedRect(r, radius * s, radius * s), c.brush);
+        const std::wstring letter = snap_->sourceName.empty() ? L"" : snap_->sourceName.substr(0, 1);
+        SetCol(c, kFg, 0.9f);
+        TextOpts o;
+        o.center = true;
+        o.maxW = r.right - r.left;
+        o.maxH = r.bottom - r.top;
+        g_text.Draw(c.rt, letter, r.left, r.top, c.brush, o);
+    }
+
+    // Bars from the history ring, oldest on the left. Paused: a row of dots.
+    void DrawBars(const DrawCtx& c, float x, float y, float w, float h, int n) {
+        const float s = c.scale;
+        const float gap = 1.6f * s;
+        const float bw = (w - (n - 1) * gap) / n;
+        for (int i = 0; i < n; i++) {
+            if (!snap_->playing) {
+                SetCol(c, kFg, 0.5f);
+                c.rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x + i * (bw + gap) + bw / 2, y + h / 2), bw / 2, bw / 2), c.brush);
+                continue;
+            }
+            const float amp = hist_[(histPos_ + kBarsHist - n + i + kBarsHist) % kBarsHist];
+            const float bh = std::max(3.0f * s, amp * 0.86f * h);
+            SetCol(c, Accent(), 0.45f + 0.5f * amp);
+            const float bx = x + i * (bw + gap);
+            c.rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(bx, y + (h - bh) / 2, bx + bw, y + (h + bh) / 2), bw / 2, bw / 2), c.brush);
+        }
+    }
+
+    void DrawPill(const DrawCtx& c) {
+        const float s = c.scale, cy = (c.rect.top + c.rect.bottom) / 2;
+        const float slot = kMediaSlot * s;
+        const float art = 18.0f * s;
+        DrawArt(c, D2D1::RectF(c.rect.left + (slot - art) / 2 + 3 * s, cy - art / 2, c.rect.left + (slot + art) / 2 + 3 * s, cy + art / 2), 4.0f);
+        DrawCentredText(c, ClockText(), D2D1::RectF(c.rect.left + slot, c.rect.top, c.rect.right - slot, c.rect.bottom));
+        const float bw = 18.0f * s, bh = 14.0f * s;
+        DrawBars(c, c.rect.right - slot + (slot - bw) / 2 - 3 * s, cy - bh / 2, bw, bh, 5);
+    }
+
+    // ---- Player page ----
+    struct Geo { float x, y, w, h; };
+    static D2D1_RECT_F R(const DrawCtx& c, float x, float y, float w, float h) {
+        const float s = c.scale;
+        return D2D1::RectF(c.rect.left + x * s, c.rect.top + y * s, c.rect.left + (x + w) * s, c.rect.top + (y + h) * s);
+    }
+
+    long long CurPos() const {
+        const ULONGLONG now = GetTickCount64();
+        if (dragging_ && snap_->durMs > 0) return (long long)(dragFrac_ * snap_->durMs);
+        if (now < ovTick_ + 1500) return std::min<long long>(ovPos_ + (snap_->playing ? (long long)((now - ovTick_) * snap_->rate) : 0), snap_->durMs);
+        long long p = snap_->posMs + (snap_->playing ? (long long)((now - snap_->baseTick) * snap_->rate) : 0);
+        return std::max(0LL, snap_->durMs > 0 ? std::min(p, snap_->durMs) : p);
+    }
+
+    void Poly(const DrawCtx& c, const D2D1_POINT_2F* p, int n) {
+        Com<ID2D1PathGeometry> g;
+        Com<ID2D1GeometrySink> sk;
+        if (FAILED(g_factory->CreatePathGeometry(g.Put())) || FAILED(g->Open(sk.Put()))) return;
+        sk->BeginFigure(p[0], D2D1_FIGURE_BEGIN_FILLED);
+        for (int i = 1; i < n; i++) sk->AddLine(p[i]);
+        sk->EndFigure(D2D1_FIGURE_END_CLOSED);
+        sk->Close();
+        c.rt->FillGeometry(g.Get(), c.brush);
+    }
+
+    // The play/pause morph: two quads, each blending a half of the play triangle into a pause bar.
+    void DrawPlayPause(const DrawCtx& c, float cx, float cy, float size, float t) {
+        const float L = cx - size / 2, T = cy - size / 2;
+        auto lerp = [](float a, float b, float k) { return a + (b - a) * k; };
+        const float pl[2][4][2] = {{{0.15f, 0}, {0.55f, 0.25f}, {0.55f, 0.75f}, {0.15f, 1}},
+                                   {{0.55f, 0.25f}, {1.0f, 0.5f}, {1.0f, 0.5f}, {0.55f, 0.75f}}};
+        const float pa[2][4][2] = {{{0.12f, 0}, {0.40f, 0}, {0.40f, 1}, {0.12f, 1}},
+                                   {{0.60f, 0}, {0.88f, 0}, {0.88f, 1}, {0.60f, 1}}};
+        for (int q = 0; q < 2; q++) {
+            D2D1_POINT_2F pts[4];
+            for (int i = 0; i < 4; i++) pts[i] = D2D1::Point2F(L + lerp(pl[q][i][0], pa[q][i][0], t) * size, T + lerp(pl[q][i][1], pa[q][i][1], t) * size);
+            Poly(c, pts, 4);
+        }
+    }
+
+    void DrawSkip(const DrawCtx& c, float cx, float cy, float size, bool next) {
+        const float d = next ? 1.0f : -1.0f;
+        const float h = size / 2;
+        D2D1_POINT_2F a[3] = {{cx - d * h * 0.9f, cy - h}, {cx - d * h * 0.9f, cy + h}, {cx + d * h * 0.5f, cy}};
+        Poly(c, a, 3);
+        c.rt->FillRectangle(D2D1::RectF(std::min(cx + d * h * 0.62f, cx + d * h * 0.98f), cy - h, std::max(cx + d * h * 0.62f, cx + d * h * 0.98f), cy + h), c.brush);
+    }
+
+    void DrawPlayer(const DrawCtx& c) {
+        const MSnap& m = *snap_;
+        const float s = c.scale;
+        morph_ += (((m.playing ? 1.0f : 0.0f) - morph_) * std::min(1.0f, (float)c.dt * 14.0f));
+        if (fabsf(morph_ - (m.playing ? 1.0f : 0.0f)) < 0.01f) morph_ = m.playing ? 1.0f : 0.0f;
+        if (m.playing && c.now - lastSample_ >= 0.033) { Sample(); lastSample_ = c.now; }
+
+        // Album wash: a soft radial of the accent from the top middle.
+        {
+            const float w = c.rect.right - c.rect.left, h = c.rect.bottom - c.rect.top;
+            D2D1_GRADIENT_STOP st[2] = {{0.0f, Accent(0.115f * c.alpha)}, {1.0f, Accent(0.0f)}};
+            Com<ID2D1GradientStopCollection> col;
+            Com<ID2D1RadialGradientBrush> rb;
+            if (SUCCEEDED(c.rt->CreateGradientStopCollection(st, 2, col.Put())) &&
+                SUCCEEDED(c.rt->CreateRadialGradientBrush(D2D1::RadialGradientBrushProperties(D2D1::Point2F(c.rect.left + w / 2, c.rect.top), D2D1::Point2F(0, 0), w * 0.75f, h * 1.15f), col.Get(), rb.Put()))) {
+                c.rt->FillRectangle(c.rect, rb.Get());
+            }
+        }
+        // Art with a source badge, text column, bars.
+        const auto artR = R(c, 24, 18, 64, 64);
+        DrawArt(c, artR, 16.0f);
+        if (m.active >= 0 && (size_t)m.active < m.sources.size() && m.sources[m.active].icon) {
+            const auto bad = D2D1::RectF(artR.right - 24 * s, artR.bottom - 22 * s, artR.right - 3 * s, artR.bottom - 1 * s);
+            SetCol(c, Rgb(0x10, 0x10, 0x10), 1.0f);
+            c.rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F((bad.left + bad.right) / 2, (bad.top + bad.bottom) / 2), 11 * s, 11 * s), c.brush);
+            if (ID2D1Bitmap* b = BitmapFor(c.rt, srcImg_[m.sources[m.active].aumid], m.sources[m.active].icon))
+                c.rt->DrawBitmap(b, D2D1::RectF(bad.left + 2.5f * s, bad.top + 2.5f * s, bad.right - 2.5f * s, bad.bottom - 2.5f * s), c.alpha);
+        }
+        const float textSize = g_text.DefaultSize();
+        auto text = [&](const std::wstring& t, float y, float h, float size, float a) {
+            SetCol(c, kFg, a);
+            TextOpts o;
+            o.maxW = 202 * s;
+            o.maxH = h * s;
+            o.ellipsis = true;
+            o.size = size;
+            const auto r = R(c, 106, y, 202, h);
+            g_text.Draw(c.rt, t, r.left, r.top, c.brush, o);
+        };
+        text(m.title.empty() ? Loc(L"media.unknown") : m.title, 18, 22, textSize * 1.15f, 1.0f);
+        text(m.artist, 40, 18, textSize, 0.8f);
+        float srcY = 62;
+        if (!m.album.empty()) { text(m.album, 58, 16, textSize * 0.92f, 0.7f); srcY = 76; }
+        {
+            wchar_t line[160];
+            swprintf_s(line, Loc(m.playing ? L"media.playingfrom" : L"media.pausedin"), m.sourceName.c_str());
+            text(line, srcY, 14, textSize * 0.85f, 0.55f);
+        }
+        DrawBars(c, R(c, 324, 24, 32, 20).left, R(c, 324, 24, 32, 20).top, 32 * s, 20 * s, 7);
+
+        // Scrubber and time labels; hidden for live streams (duration 0).
+        if (m.durMs > 0) {
+            const long long pos = CurPos();
+            const float frac = (float)pos / (float)m.durMs;
+            const auto tr = R(c, 72, 111.5f, 236, 5);
+            const float cx = tr.left + frac * (tr.right - tr.left), half = (dragging_ ? 3.5f : 2.5f) * s;
+            SetCol(c, kFg, m.canSeek ? 0.18f : 0.1f);
+            c.rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(tr.left, (tr.top + tr.bottom) / 2 - half, tr.right, (tr.top + tr.bottom) / 2 + half), half, half), c.brush);
+            SetCol(c, Accent(), m.canSeek ? 1.0f : 0.5f);
+            c.rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(tr.left, (tr.top + tr.bottom) / 2 - half, cx, (tr.top + tr.bottom) / 2 + half), half, half), c.brush);
+            if (m.canSeek) {
+                const float rad = (dragging_ ? 6.5f : 4.5f) * s, my = (tr.top + tr.bottom) / 2;
+                if (dragging_) { SetCol(c, Accent(), 0.22f); c.rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, my), rad * 2.2f, rad * 2.2f), c.brush); }
+                SetCol(c, Accent());
+                c.rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, my), rad + 1.6f * s, rad + 1.6f * s), c.brush);
+                SetCol(c, Rgb(255, 255, 255));
+                c.rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, my), rad, rad), c.brush);
+            }
+            auto label = [&](const std::wstring& t, float x, float w, bool right) {
+                SetCol(c, kFg, 0.6f);
+                TextOpts o;
+                o.maxW = w * s;
+                o.maxH = 16 * s;
+                o.size = textSize * 0.85f;
+                const auto r = R(c, x, 106, w, 16);
+                const float tw = g_text.Measure(t) * (o.size / textSize);
+                g_text.Draw(c.rt, t, right ? r.right - tw : r.left, r.top, c.brush, o);
+            };
+            label(FormatMs(pos), 24, 40, true);
+            label(L"-" + FormatMs(m.durMs - pos), 316, 40, false);
+        }
+
+        // Transport.
+        const float cxm = c.rect.left + (kPlayerW / 2) * s, cyb = c.rect.top + 140 * s;
+        struct Btn { Zone z; float dx, r; bool enabled; };
+        const Btn btns[3] = {{Z_prev, -64, 16, m.canPrev}, {Z_play, 0, 22, m.canToggle}, {Z_next, 64, 16, m.canNext}};
+        for (const Btn& b : btns) {
+            const bool hot = hover_ == b.z, down = pressed_ == b.z;
+            const float rad = b.r * s * (down ? 0.87f : 1.0f);
+            const bool big = b.z == Z_play;
+            if (down) SetCol(c, Accent(), 0.5f);
+            else SetCol(c, Rgb(255, 255, 255), (big ? (hot ? 0.16f : 0.08f) : (hot ? 0.09f : 0.04f)) * (b.enabled ? 1.0f : 0.5f));
+            c.rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cxm + b.dx * s, cyb), rad, rad), c.brush);
+            SetCol(c, kFg, (big ? (hot ? 1.0f : 0.88f) : (hot ? 0.92f : 0.62f)) * (b.enabled ? 1.0f : 0.35f));
+            if (big) DrawPlayPause(c, cxm, cyb, 18 * s * (down ? 0.87f : 1.0f), morph_);
+            else DrawSkip(c, cxm + b.dx * s, cyb, 12 * s * (down ? 0.87f : 1.0f), b.z == Z_next);
+        }
+
+        // Source dock, only with two or more sources.
+        const std::vector<int> dock = DockSlots();
+        if (dock.size() >= 2 || (dock.size() == 1 && m.sources.size() >= 2)) {
+            const auto pill = R(c, 20, 125, 2 + (float)dock.size() * 28, 30);
+            SetCol(c, Rgb(255, 255, 255), 0.06f);
+            c.rt->FillRoundedRectangle(D2D1::RoundedRect(pill, 15 * s, 15 * s), c.brush);
+            for (size_t i = 0; i < dock.size(); i++) {
+                const int si = dock[i];
+                const auto sr = R(c, 22 + (float)i * 28, 127, 26, 26);
+                const float scx = (sr.left + sr.right) / 2, scy = (sr.top + sr.bottom) / 2;
+                const bool active = si == m.active, hot = hover_ == Z_dock0 + (int)i;
+                if (si < 0) {  // "+N"
+                    SetCol(c, kFg, hot ? 1.0f : 0.6f);
+                    wchar_t t[16];
+                    swprintf_s(t, L"+%d", (int)m.sources.size() - 2);
+                    TextOpts o; o.center = true; o.maxW = sr.right - sr.left; o.maxH = sr.bottom - sr.top; o.size = textSize * 0.9f;
+                    g_text.Draw(c.rt, t, sr.left, sr.top, c.brush, o);
+                    continue;
+                }
+                if (active) {
+                    SetCol(c, Accent());
+                    c.rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(scx, scy), 12.25f * s, 12.25f * s), c.brush, 1.5f * s);
+                }
+                const MSource& src = m.sources[si];
+                const float ia = active || hot ? 1.0f : 0.5f;
+                if (ID2D1Bitmap* b = src.icon ? BitmapFor(c.rt, srcImg_[src.aumid], src.icon) : nullptr) {
+                    c.rt->DrawBitmap(b, D2D1::RectF(scx - 8 * s, scy - 8 * s, scx + 8 * s, scy + 8 * s), ia * c.alpha);
+                } else {
+                    SetCol(c, kFg, ia);
+                    TextOpts o; o.center = true; o.maxW = sr.right - sr.left; o.maxH = sr.bottom - sr.top; o.size = textSize;
+                    g_text.Draw(c.rt, src.name.substr(0, 1), sr.left, sr.top, c.brush, o);
+                }
+                if (src.playing) {
+                    SetCol(c, Rgb(0x10, 0x10, 0x10));
+                    c.rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(sr.right - 4 * s, sr.bottom - 4 * s), 4.5f * s, 4.5f * s), c.brush);
+                    SetCol(c, Rgb(0x3a, 0xd0, 0x6c));
+                    c.rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(sr.right - 4 * s, sr.bottom - 4 * s), 3.5f * s, 3.5f * s), c.brush);
+                }
+            }
+        }
+    }
+
+    // Up to 3 sources: one slot each. More: first, active, "+N" (index -1).
+    std::vector<int> DockSlots() const {
+        std::vector<int> out;
+        const int n = (int)snap_->sources.size();
+        if (n < 2) return out;
+        if (n <= 3) { for (int i = 0; i < n; i++) out.push_back(i); return out; }
+        out.push_back(0);
+        out.push_back(snap_->active > 0 ? snap_->active : 1);
+        out.push_back(-1);
+        return out;
+    }
+
+    Zone HitTest(D2D1_POINT_2F p) const {  // p in DIP
+        auto in = [&](float x, float y, float w, float h) { return p.x >= x && p.x < x + w && p.y >= y && p.y < y + h; };
+        const std::vector<int> dock = DockSlots();
+        for (size_t i = 0; i < dock.size(); i++) if (in(22 + (float)i * 28, 127, 26, 26)) return (Zone)(Z_dock0 + (int)i);
+        auto circ = [&](float cx, float r) { const float dx = p.x - cx, dy = p.y - 140; return dx * dx + dy * dy <= (r + 6) * (r + 6); };
+        if (circ(190, 22)) return Z_play;
+        if (circ(126, 16)) return Z_prev;
+        if (circ(254, 16)) return Z_next;
+        if (snap_->durMs > 0 && in(66, 104, 248, 22)) return Z_scrub;
+        if (in(24, 18, 64, 64) || in(106, 18, 202, 62)) return Z_open;
+        return Z_none;
+    }
+
+    Services* services_ = nullptr;
+    MediaEngine engine_;
+    std::shared_ptr<const MSnap> snap_;
+    unsigned lastSeq_ = ~0u;
+    bool autoExpand_ = true, visPill_ = false, visDash_ = false, timerOn_ = false;
+    std::wstring blocklist_;
+    Img art_;
+    std::unordered_map<std::wstring, Img> srcImg_;
+    Com<IMeterInfo> meter_;
+    float hist_[kBarsHist] = {};
+    int histPos_ = 0;
+    double lastSample_ = 0;
+    float morph_ = 0;
+    Zone hover_ = Z_none, pressed_ = Z_none;
+    bool dragging_ = false;
+    float dragFrac_ = 0;
+    long long ovPos_ = 0;
+    ULONGLONG ovTick_ = 0;
+    bool wasLeft_ = false;
+};
+
+bool MediaModule::OnPointer(const PointerEvent& e, View v) {
+    if (v != View::Dashboard || !snap_ || !snap_->has) return false;
+    const float s = Scale();
+    const D2D1_POINT_2F p = D2D1::Point2F(e.pt.x / s, e.pt.y / s);
+    auto fracAt = [&](float x) { return std::max(0.0f, std::min(1.0f, (x - 72.0f) / 236.0f)); };
+    auto finishScrub = [&] {
+        if (!dragging_) return;
+        dragging_ = false;
+        const long long target = (long long)(dragFrac_ * snap_->durMs);
+        ovPos_ = target;
+        ovTick_ = GetTickCount64();
+        engine_.Command({MCmdKind::Seek, target});
+    };
+    switch (e.kind) {
+        case PointerEvent::Move: {
+            if (dragging_) { dragFrac_ = fracAt(p.x); services_->Invalidate(); return true; }
+            const Zone z = HitTest(p);
+            if (z != hover_) { hover_ = z; services_->Invalidate(); }
+            return true;
+        }
+        case PointerEvent::Leave:
+            finishScrub();
+            hover_ = pressed_ = Z_none;
+            services_->Invalidate();
+            return true;
+        case PointerEvent::Down: {
+            const Zone z = HitTest(p);
+            pressed_ = z;
+            if (z == Z_scrub && snap_->canSeek) { dragging_ = true; dragFrac_ = fracAt(p.x); }
+            services_->Invalidate();
+            return true;
+        }
+        case PointerEvent::Up: {
+            const Zone z = HitTest(p);
+            const Zone was = pressed_;
+            pressed_ = Z_none;
+            if (dragging_) { dragFrac_ = fracAt(p.x); finishScrub(); services_->Invalidate(); return true; }
+            if (z == was) {
+                if (z == Z_prev) engine_.Command({MCmdKind::Prev});
+                else if (z == Z_next) engine_.Command({MCmdKind::Next});
+                else if (z == Z_play) engine_.Command({MCmdKind::Toggle});
+                else if (z == Z_open) engine_.Command({MCmdKind::Open});
+                else if (z >= Z_dock0) {
+                    const std::vector<int> dock = DockSlots();
+                    const size_t i = z - Z_dock0;
+                    if (i < dock.size()) {
+                        int target = dock[i];
+                        if (target < 0) target = (snap_->active + 1) % (int)snap_->sources.size();  // "+N" cycles.
+                        if (target != snap_->active) engine_.Command({MCmdKind::Pick, 0, snap_->sources[target].aumid});
+                    }
+                }
+            }
+            services_->Invalidate();
+            return true;
+        }
+    }
+    return false;
+}
+
+MediaModule g_mediaModule;
+
+#line 1 "bar/modules.inc"
+IModule* const g_modules[] = {&g_clockModule, &g_mediaModule, &g_demoAlert, &g_page1, &g_page2};
 
 #line 1 "bar/placement.inc"
 // ---- Bar placement and panels ----
@@ -2316,6 +3644,7 @@ int g_tab = 0;
 int g_wheelAcc = 0;
 ULONGLONG g_leaveSince = 0;
 ULONGLONG g_wingHold = 0;
+ULONGLONG g_autoUntil = 0;  // Services::Expand: stays open until then even without the pointer.
 ULONGLONG g_alertSeq = 0;
 std::vector<AlertItem> g_alerts;
 RECT g_isBody{};        // Screen rect of the body as drawn.
@@ -2471,6 +3800,7 @@ void IslandReset() {
     g_isTracking = false;
     g_leaveSince = 0;
     g_wingHold = 0;
+    g_autoUntil = 0;
     if (g_hwnd) {
         KillTimer(g_hwnd, kDwellTimer);
         KillTimer(g_hwnd, kZoneTimer);
@@ -2502,7 +3832,7 @@ void IslandZoneTick() {
         HWND at = WindowFromPoint(p);
         if (at != g_isHwnd && at != g_hwnd) in = false;
     }
-    if (in || g_pinned) {
+    if (in || g_pinned || GetTickCount64() < g_autoUntil) {
         g_leaveSince = 0;
         return;
     }
@@ -2746,6 +4076,21 @@ void Services::KillTimer(IModule* m) {
             g_moduleTimers[i].fn = nullptr;
         }
     }
+}
+
+void Services::Relayout() { IslandRecompute(); }
+
+void Services::Expand(IModule* m, int ms) {
+    if (!g_isHwnd || g_fullscreen || g_covered) return;
+    const std::vector<IModule*> dashes = Dashboards();
+    int idx = -1;
+    for (size_t i = 0; i < dashes.size(); i++) if (dashes[i] == m) idx = (int)i;
+    if (idx < 0) return;
+    g_tab = idx;
+    g_autoUntil = GetTickCount64() + ms;
+    g_expanded = true;
+    g_leaveSince = 0;
+    IslandRecompute();
 }
 
 void Services::OpenPanel(PanelKind kind, int anchorX) {

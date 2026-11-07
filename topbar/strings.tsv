@@ -1,2 +1,5 @@
 # key	en	hi	zh	ja	ko	de	es	fr	pt	ru	ar	it
 window.title	Top bar
+media.playingfrom	Playing from %ls
+media.pausedin	Paused in %ls
+media.unknown	Unknown

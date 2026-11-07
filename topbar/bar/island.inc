@@ -39,6 +39,7 @@ int g_tab = 0;
 int g_wheelAcc = 0;
 ULONGLONG g_leaveSince = 0;
 ULONGLONG g_wingHold = 0;
+ULONGLONG g_autoUntil = 0;  // Services::Expand: stays open until then even without the pointer.
 ULONGLONG g_alertSeq = 0;
 std::vector<AlertItem> g_alerts;
 RECT g_isBody{};        // Screen rect of the body as drawn.
@@ -194,6 +195,7 @@ void IslandReset() {
     g_isTracking = false;
     g_leaveSince = 0;
     g_wingHold = 0;
+    g_autoUntil = 0;
     if (g_hwnd) {
         KillTimer(g_hwnd, kDwellTimer);
         KillTimer(g_hwnd, kZoneTimer);
@@ -225,7 +227,7 @@ void IslandZoneTick() {
         HWND at = WindowFromPoint(p);
         if (at != g_isHwnd && at != g_hwnd) in = false;
     }
-    if (in || g_pinned) {
+    if (in || g_pinned || GetTickCount64() < g_autoUntil) {
         g_leaveSince = 0;
         return;
     }
@@ -469,6 +471,21 @@ void Services::KillTimer(IModule* m) {
             g_moduleTimers[i].fn = nullptr;
         }
     }
+}
+
+void Services::Relayout() { IslandRecompute(); }
+
+void Services::Expand(IModule* m, int ms) {
+    if (!g_isHwnd || g_fullscreen || g_covered) return;
+    const std::vector<IModule*> dashes = Dashboards();
+    int idx = -1;
+    for (size_t i = 0; i < dashes.size(); i++) if (dashes[i] == m) idx = (int)i;
+    if (idx < 0) return;
+    g_tab = idx;
+    g_autoUntil = GetTickCount64() + ms;
+    g_expanded = true;
+    g_leaveSince = 0;
+    IslandRecompute();
 }
 
 void Services::OpenPanel(PanelKind kind, int anchorX) {

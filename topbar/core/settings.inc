@@ -7,6 +7,8 @@ struct Settings {
     std::wstring fontFamily;  // empty: Segoe UI Variable Text, then Segoe UI
     int fontScale = 100;      // percent of the usual text size
     std::wstring language;    // empty: follow Windows
+    bool mediaAutoExpand = true;
+    std::wstring mediaBlocklist;  // comma separated, lowercased and trimmed by the media module
 };
 
 Settings g_settings;
@@ -15,6 +17,8 @@ Settings LoadSettings() {
     Settings s;
     if (PCWSTR v = Wh_GetStringSetting(L"fontFamily")) { s.fontFamily = v; Wh_FreeStringSetting(v); }
     if (PCWSTR v = Wh_GetStringSetting(L"language")) { s.language = v; Wh_FreeStringSetting(v); }
+    s.mediaAutoExpand = Wh_GetIntSetting(L"mediaAutoExpand") != 0;
+    if (PCWSTR v = Wh_GetStringSetting(L"mediaExpandBlocklist")) { s.mediaBlocklist = v; Wh_FreeStringSetting(v); }
     const int scale = Wh_GetIntSetting(L"fontScale");
     s.fontScale = scale >= 50 && scale <= 200 ? scale : 100;
     return s;
