@@ -320,7 +320,7 @@ void IslandPaint() {
     const RECT crop{cl, 0, cr, cb};
 
     if (!g_isSurface.Begin(crop)) return;
-    brush->SetColor(kCentreBg);
+    brush->SetColor(kSurface);  // The theme's surface; the notch shape keeps it hanging from the screen top.
     if (Com<ID2D1PathGeometry> body = NotchGeometry(L, R, B, r, rs, false)) rt->FillGeometry(body.Get(), brush);
     if (grow > 0.02f) {  // Faint edge once open, so a dark overlay stays apart from dark apps. Never along the top.
         if (Com<ID2D1PathGeometry> edge = NotchGeometry(L + 0.5f, R - 0.5f, B - 0.5f, r, rs, true)) {
@@ -530,14 +530,24 @@ void Services::Expand(IModule* m, int ms) {
     IslandRecompute();
 }
 
-// The calendar hangs under the island; the notifications open natively above the dock (anchor unused).
+// The calendar hangs under the island; the notifications hang under the bar's bell, wherever they
+// were asked for (the alerts' more line), so the anchor is the bell's when it is on the bar.
 void Services::OpenPanel(PanelKind kind, int anchorX) {
     if (kind == PanelKind::Calendar && !g_pinned) SetExpanded(false);  // The calendar takes the island's place.
+    if (kind == PanelKind::Notifications) {
+        for (const Hit& h : g_hits) {
+            if (h.id != H_bell) continue;
+            POINT c{(h.rect.left + h.rect.right) / 2, (h.rect.top + h.rect.bottom) / 2};
+            ClientToScreen(g_hwnd, &c);
+            anchorX = c.x;
+            break;
+        }
+    }
     g_anchorX = anchorX;
     g_anchorTick = GetTickCount64();
     SetPropW(g_hwnd, L"TopBarAnchorX", reinterpret_cast<HANDLE>((INT_PTR)anchorX));
     SetPropW(g_hwnd, L"TopBarAnchorTick", reinterpret_cast<HANDLE>((UINT_PTR)GetTickCount()));
-    TogglePanel(kind == PanelKind::Notifications ? kPanelNative : kPanelCalendar);
+    TogglePanel(kind == PanelKind::Notifications ? kPanelNotifications : kPanelCalendar);
 }
 
 void IslandOpenCalendar() {

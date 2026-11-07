@@ -721,7 +721,7 @@ void AlertsModule::Draw(const DrawCtx& c) {
         }
         fillT_ = c.now;
         const float frac = std::clamp(fill_.x, 0.0f, 1.0f);
-        col(Rgb(255, 255, 255, 0x2e));
+        col(kTile);  // Track.
         c.rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(tl, cy - th / 2, tr, cy + th / 2), th / 2, th / 2), c.brush);
         if (frac > 0) {
             col(kFg, cur_.on ? 0.4f : 1.0f);
@@ -756,7 +756,7 @@ void AlertsModule::Draw(const DrawCtx& c) {
     if (cur_.icon && cur_.icon->w > 0) {
         if (ID2D1Bitmap* bmp = AlBitmap(c.rt, *cur_.icon)) c.rt->DrawBitmap(bmp, br, c.alpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
     } else {
-        col(Rgb(255, 255, 255, 0x1e));
+        col(kTile);
         c.rt->FillRoundedRectangle(D2D1::RoundedRect(br, 8.0f * s, 8.0f * s), c.brush);
         col(kFg);
         const float cx = bx + badge / 2, cy = by + badge / 2;

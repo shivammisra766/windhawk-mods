@@ -309,10 +309,12 @@ struct BarTrayMessage {
     WCHAR tip[128];
 };
 // Modes understood by the panel-split mod inside ShellExperienceHost. Native: notifications alone at
-// their usual place above the dock (panel-split's default while the bar is up). Calendar: alone, under the island.
+// their usual place above the dock (panel-split's default while the bar is up). Notifications: alone,
+// under the bar's bell. Calendar: alone, under the island.
 constexpr WPARAM kPanelNative = 0;
+constexpr WPARAM kPanelNotifications = 1;
 constexpr WPARAM kPanelCalendar = 2;
-constexpr int kCalendarClaimMs = 4000;  // A panel host focused this soon after the bar opened the calendar is the calendar.
+constexpr int kPanelClaimMs = 4000;  // A panel host focused this soon after the bar opened one part is that part.
 
 // Seelen fancy-toolbar, in CSS px scaled by DPI: item size 16, padding 8, margin 0.
 constexpr float kItem = 16.0f;
@@ -346,18 +348,25 @@ D2D1_COLOR_F Rgb(int r, int g, int b, int a = 255) {
     return D2D1::ColorF(r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
 }
 
-// Side bubbles are a little see-through, the centre one is solid. Text is Seelen's gray.
-const D2D1_COLOR_F kSideBg = Rgb(0x10, 0x10, 0x10, 0xDC);
-const D2D1_COLOR_F kCentreBg = Rgb(0x10, 0x10, 0x10);
-const D2D1_COLOR_F kFg = Rgb(228, 228, 228);
+// The theme: Start's. Every surface the bar draws takes its colour from here.
+// Surface: Start's panel, #101010 at 86% (0xDC), no blur. Side bubbles, the island and notch, and
+// everything that opens in it (cards, alerts, dashboards, shelf).
+const D2D1_COLOR_F kSurface = Rgb(0x10, 0x10, 0x10, 0xDC);
+// The same colour, solid: rings that cut a badge out of the art under it.
+const D2D1_COLOR_F kSurfaceSolid = Rgb(0x10, 0x10, 0x10);
+// Inner elements: Start's tiles, #1F1F1F. Cards, chips, buttons, slider tracks, the hover under an icon.
+const D2D1_COLOR_F kTile = Rgb(0x1F, 0x1F, 0x1F);
+const D2D1_COLOR_F kTileHover = Rgb(0x2D, 0x2D, 0x2D);  // A tile under the pointer, or a tile on a tile.
+const D2D1_COLOR_F kTileRaised = Rgb(0x3A, 0x3A, 0x3A);  // A tile on a tile, under the pointer.
+const D2D1_COLOR_F kFg = Rgb(255, 255, 255);  // Text and glyphs; secondary text is this at lower alpha.
 
 const GUID kGuidBatteryPercent = {0xA7AD8041, 0xB45A, 0x4CAE, {0x87, 0xA3, 0xEE, 0xCB, 0xB4, 0x68, 0xA9, 0xE1}};
 const GUID kGuidAcDc = {0x5D3E9A59, 0xE9D5, 0x4B00, {0xA6, 0xBD, 0xFF, 0x34, 0xFF, 0x51, 0x65, 0x48}};
 
-enum class Action { None, QuickSettings, Wifi, Bluetooth, TrayIcon, Profile };
+enum class Action { None, QuickSettings, Wifi, Bluetooth, TrayIcon, Notifications, Profile };
 
 // Stable ids for hover, so a list that changes under the pointer doesn't move the highlight.
-enum HitId { H_none = 0, H_profile = 1, H_settings, H_battery, H_wifi, H_bluetooth, H_trayBase = 1000 };
+enum HitId { H_none = 0, H_profile = 1, H_settings, H_battery, H_wifi, H_bluetooth, H_bell, H_trayBase = 1000 };
 
 struct Hit {
     RECT rect;
@@ -395,9 +404,9 @@ Action g_quickPage = Action::None;
 int g_anchorX = 0;
 ULONGLONG g_anchorTick = 0;
 ULONGLONG g_panelOpenTick = 0;
-ULONGLONG g_calendarTick = 0;  // Last time the bar opened (or reopened) the calendar.
+ULONGLONG g_panelClaimTick = 0;  // Last time the bar opened (or reopened) the bell's or the calendar's part.
 RECT g_nativePanelRect{};      // The panel host's window where Windows keeps it, saved before the bar first moves it.
-bool g_panelMoved = false;     // The bar moved that window for the calendar and has not put it back yet.
+bool g_panelMoved = false;     // The bar moved that window (bell or calendar) and has not put it back yet.
 HWND g_notificationPanel = nullptr;
 int g_regionTop[3] = {};  // Clip top last seen for each mode, to place the panel before it opens.
 int g_hoverId = H_none;
@@ -1515,7 +1524,7 @@ void Layout(int W, int H) {
         g_cmds.push_back(c);
     };
 
-    // Right bubble: tray icons, Bluetooth, Wi-Fi, battery, settings, laid out from the right edge.
+    // Right bubble: tray icons, Bluetooth, Wi-Fi, battery, settings, bell, laid out from the right edge.
     float right = W - margin - bpad;
     auto iconItem = [&](IconId id, Action action, int hitId) {
         const float w = IconGeometries::Width(id, icon) + 2 * pad;
@@ -1524,6 +1533,7 @@ void Layout(int W, int H) {
         iconCmd(id, right + w / 2.0f, cy, icon);
         right -= gap;
     };
+    iconItem(I_bell, Action::Notifications, H_bell);  // Rightmost: the notifications hang under it.
     iconItem(I_settings, Action::QuickSettings, H_settings);
     if (g_battery >= 0) {
         wchar_t pct[8];
@@ -1634,14 +1644,14 @@ void DrawFrame(ID2D1RenderTarget* rt) {
 
     for (int i = 0; i < kBubbles; i++) {
         if (!g_hasBubble[i]) continue;
-        color(kSideBg);
+        color(kSurface);
         rt->FillRoundedRectangle(D2D1::RoundedRect(g_bubbles[i], g_bubbleRadius, g_bubbleRadius), brush);
     }
 
     for (const Cmd& c : g_cmds) {
         switch (c.kind) {
             case CmdKind::Hover:
-                color(Overlay(51));
+                color(kTile);  // The theme's hover: Start's tile.
                 rt->FillRoundedRectangle(D2D1::RoundedRect(c.r, c.radius, c.radius), brush);
                 break;
             case CmdKind::Text: {
@@ -3055,7 +3065,7 @@ private:
         DrawArt(c, artR, 16.0f);
         if (m.active >= 0 && (size_t)m.active < m.sources.size() && m.sources[m.active].icon) {
             const auto bad = D2D1::RectF(artR.right - 24 * s, artR.bottom - 22 * s, artR.right - 3 * s, artR.bottom - 1 * s);
-            SetCol(c, Rgb(0x10, 0x10, 0x10), 1.0f);
+            SetCol(c, kSurfaceSolid, 1.0f);
             c.rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F((bad.left + bad.right) / 2, (bad.top + bad.bottom) / 2), 11 * s, 11 * s), c.brush);
             if (ID2D1Bitmap* b = BitmapFor(c.rt, srcImg_[m.sources[m.active].aumid], m.sources[m.active].icon))
                 c.rt->DrawBitmap(b, D2D1::RectF(bad.left + 2.5f * s, bad.top + 2.5f * s, bad.right - 2.5f * s, bad.bottom - 2.5f * s), c.alpha);
@@ -3088,7 +3098,7 @@ private:
             const float frac = (float)pos / (float)m.durMs;
             const auto tr = R(c, 72, 111.5f, 236, 5);
             const float cx = tr.left + frac * (tr.right - tr.left), half = (dragging_ ? 3.5f : 2.5f) * s;
-            SetCol(c, kFg, m.canSeek ? 0.18f : 0.1f);
+            SetCol(c, kTile, m.canSeek ? 1.0f : 0.5f);  // Track.
             c.rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(tr.left, (tr.top + tr.bottom) / 2 - half, tr.right, (tr.top + tr.bottom) / 2 + half), half, half), c.brush);
             SetCol(c, Accent(), m.canSeek ? 1.0f : 0.5f);
             c.rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(tr.left, (tr.top + tr.bottom) / 2 - half, cx, (tr.top + tr.bottom) / 2 + half), half, half), c.brush);
@@ -3123,7 +3133,8 @@ private:
             const float rad = b.r * s * (down ? 0.87f : 1.0f);
             const bool big = b.z == Z_play;
             if (down) SetCol(c, Accent(), 0.5f);
-            else SetCol(c, Rgb(255, 255, 255), (big ? (hot ? 0.16f : 0.08f) : (hot ? 0.09f : 0.04f)) * (b.enabled ? 1.0f : 0.5f));
+            else if (big) SetCol(c, hot ? kTileHover : kTile, b.enabled ? 1.0f : 0.5f);
+            else SetCol(c, kTile, (hot ? 1.0f : 0.5f) * (b.enabled ? 1.0f : 0.5f));  // Skip buttons: half a tile until hovered.
             c.rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cxm + b.dx * s, cyb), rad, rad), c.brush);
             SetCol(c, kFg, (big ? (hot ? 1.0f : 0.88f) : (hot ? 0.92f : 0.62f)) * (b.enabled ? 1.0f : 0.35f));
             if (big) DrawPlayPause(c, cxm, cyb, 18 * s * (down ? 0.87f : 1.0f), morph_);
@@ -3134,7 +3145,7 @@ private:
         const std::vector<int> dock = DockSlots();
         if (dock.size() >= 2 || (dock.size() == 1 && m.sources.size() >= 2)) {
             const auto pill = R(c, 20, 125, 2 + (float)dock.size() * 28, 30);
-            SetCol(c, Rgb(255, 255, 255), 0.06f);
+            SetCol(c, kTile);
             c.rt->FillRoundedRectangle(D2D1::RoundedRect(pill, 15 * s, 15 * s), c.brush);
             for (size_t i = 0; i < dock.size(); i++) {
                 const int si = dock[i];
@@ -3163,7 +3174,7 @@ private:
                     g_text.Draw(c.rt, src.name.substr(0, 1), sr.left, sr.top, c.brush, o);
                 }
                 if (src.playing) {
-                    SetCol(c, Rgb(0x10, 0x10, 0x10));
+                    SetCol(c, kSurfaceSolid);
                     c.rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(sr.right - 4 * s, sr.bottom - 4 * s), 4.5f * s, 4.5f * s), c.brush);
                     SetCol(c, Rgb(0x3a, 0xd0, 0x6c));
                     c.rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(sr.right - 4 * s, sr.bottom - 4 * s), 3.5f * s, 3.5f * s), c.brush);
@@ -3284,9 +3295,7 @@ MediaModule g_mediaModule;
 // Pages are modules with HasDashboard(). The island owns switching, the dot column and the slide;
 // a page does work only between OnVisibility(Dashboard, true) and (…, false).
 
-// Fixed look (specs/dashboards.md section 2).
-const D2D1_COLOR_F kCard = Rgb(255, 255, 255, 22);
-const D2D1_COLOR_F kCardHover = Rgb(255, 255, 255, 38);
+// Fixed look (specs/dashboards.md section 2). Cards are the theme's tiles (kTile, kTileHover in types.inc).
 const D2D1_COLOR_F kHairline = Rgb(255, 255, 255, 26);
 const D2D1_COLOR_F kMuted = Rgb(228, 228, 228, 153);
 const D2D1_COLOR_F kAccent = Rgb(228, 228, 228);
@@ -3573,7 +3582,7 @@ public:
         const int dim = DaysInMonth(now.wYear, now.wMonth);
         const int rows = (startIdx + dim + 6) / 7;
 
-        p.Fill(22, 16, 115, 164, 12, kCard);
+        p.Fill(22, 16, 115, 164, 12, kTile);
         p.Text(month, 28, 22, 112, 38, 12, kAccent, TF_Ellipsis, 700);
         wchar_t year[8];
         swprintf_s(year, L"%d", now.wYear);
@@ -3714,7 +3723,7 @@ public:
         for (int i = 0; i < 6; i++) {
             const Card& k = cards[order[i]];
             const float l = 24 + (i % 2) * (cw + 9), t = 22 + (i / 2) * 44, r = l + cw, bt = t + 38;
-            p.Fill(l, t, r, bt, 9, kCard);
+            p.Fill(l, t, r, bt, 9, kTile);
             D2D1_COLOR_F tint = k.frac >= 0.90f ? kRed : k.frac >= 0.75f ? kAmber : kAccent;
             Glyph(p, k.glyph, l + 16, t + 19, tint);
             p.Text(k.label, l + 30, t + 2, r - 9, t + 15, 11, kMuted);
@@ -3957,7 +3966,7 @@ public:
         const wchar_t* values[3] = {wind, feels, hum};
         for (int i = 0; i < 3; i++) {
             const float top = 25 + i * 47;
-            p.Fill(214, top, 358, top + 40, 10, kCard, dim);
+            p.Fill(214, top, 358, top + 40, 10, kTile, dim);
             if (i == 0) { p.Line(222, top + 15, 235, top + 15, 1.4f, kAccent, dim); p.Line(222, top + 20, 232, top + 20, 1.4f, kAccent, dim); p.Line(222, top + 25, 236, top + 25, 1.4f, kAccent, dim); }
             else if (i == 1) { p.Line(229, top + 12, 229, top + 24, 1.6f, kAccent, dim); p.Dot(229, top + 27, 3, kAccent, dim); }
             else { p.Dot(229, top + 24, 4, kAccent, dim); p.Line(229, top + 12, 225.5f, top + 21, 1.4f, kAccent, dim); p.Line(229, top + 12, 232.5f, top + 21, 1.4f, kAccent, dim); }
@@ -4130,14 +4139,14 @@ public:
         }
         Pg p(c);
         hits_.clear();
-        p.Ring(86, 92, 44, 5, kCardHover);
+        p.Ring(86, 92, 44, 5, kTileHover);
         DrawArcFrac(p, 86, 92, 44, frac, 5, col);
         p.Text(active_ || finished_ ? tm : L"Ready", 46, 72, 126, 112, 18, kFg, TF_Center, 600);
         if (!running_ && active_) p.Text(L"Paused", 46, 108, 126, 124, 10, kMuted, TF_Center);
         const wchar_t* label = finished_ ? (isBreak_ ? L"Break Complete" : L"Focus Complete") : active_ ? (isBreak_ ? L"Break Timer" : L"Focus Timer") : L"Focus Timer";
         p.Text(label, 160, 26, 350, 48, 13.5f, finished_ ? kRed : kFg, TF_Ellipsis, 600);
         auto button = [&](int id, const wchar_t* text, float t) {
-            p.Fill(160, t, 340, t + 28, 8, hover_ == id ? kCardHover : kCard);
+            p.Fill(160, t, 340, t + 28, 8, hover_ == id ? kTileHover : kTile);
             p.Text(text, 160, t, 340, t + 28, 12, kFg, TF_Center, 600);
             Hit(160, t, 340, t + 28, id);
         };
@@ -4963,7 +4972,7 @@ public:
         swprintf_s(cnt, n == 1 ? L"%d item" : L"%d items", n);
         p.Text(status_.empty() ? std::wstring(cnt) : status_, 110, 14, 254, 34, 11, status_.empty() ? kMuted : kAccent, TF_Right | TF_Ellipsis);
         auto chip = [&](int id, float l, const wchar_t* text, D2D1_COLOR_F tint) {
-            p.Fill(l, 14, l + 44, 34, 7, hover_ == id ? kCardHover : kCard);
+            p.Fill(l, 14, l + 44, 34, 7, hover_ == id ? kTileHover : kTile);
             p.Text(text, l, 14, l + 44, 34, 11, tint, TF_Center, 600);
             Hit(l, 14, l + 44, 34, id);
         };
@@ -4988,7 +4997,7 @@ public:
             const float top = 46 + r * (kRowH + kGap), bot = top + kRowH;
             const int rowId = 1000 + (int)it.id, rmId = 100000 + (int)it.id;
             const bool hot = hover_ == rowId || hover_ == rmId || hover_ == kPhoneIdBase + (int)it.id;
-            if (hot) p.Fill(26, top, 354, bot, 9, kCard);
+            if (hot) p.Fill(26, top, 354, bot, 9, kTile);
             Hit(26, top, 354, bot, rowId);
             const float a = it.missing ? 0.45f : 1.0f;
             DrawKindIcon(p, it, 34, top + 6, a);
@@ -4998,7 +5007,7 @@ public:
             p.Text(SizeLabel(it), 258, top, phone ? 302 : 322, bot, 11, kMuted, TF_Right | TF_Ellipsis);
             if (hot) {
                 const float cx = 337, cy = top + kRowH / 2;
-                p.Dot(cx, cy, 7, hover_ == rmId ? kCardHover : kCard);
+                p.Dot(cx, cy, 7, hover_ == rmId ? kTileRaised : kTileHover);  // On the row's tile.
                 p.Line(cx - 2.5f, cy - 2.5f, cx + 2.5f, cy + 2.5f, 1.3f, kFg);
                 p.Line(cx - 2.5f, cy + 2.5f, cx + 2.5f, cy - 2.5f, 1.3f, kFg);
                 Hit(cx - 10, cy - 10, cx + 10, cy + 10, rmId);
@@ -5006,7 +5015,7 @@ public:
             if (phone) {  // Send to phone; the row stays.
                 const int phId = kPhoneIdBase + (int)it.id;
                 const float cx = 315, cy = top + kRowH / 2;
-                p.Dot(cx, cy, 7, hover_ == phId ? kCardHover : kCard);
+                p.Dot(cx, cy, 7, hover_ == phId ? kTileRaised : kTileHover);
                 PhoneGlyph(p, cx, cy, kFg);
                 Hit(cx - 9, cy - 10, cx + 9, cy + 10, phId);
             }
@@ -5242,8 +5251,7 @@ private:
         Pg q(cc);
         const float dy = (1.0f - choice_.x) * 22.0f;  // Overshoot shows as a small lift
         const float t = 116 + dy, b = 174 + dy;
-        q.Fill(22, t, 358, b, 13, kCentreBg);
-        q.Fill(22, t, 358, b, 13, kCard);
+        q.Fill(22, t, 358, b, 13, kTile);  // Solid: it covers the list under it.
         q.Outline(22.5f, t + 0.5f, 357.5f, b - 0.5f, 13, 1, kHairline);
         const bool open = !offer_.empty();
         if (open) Hit(22, t, 358, b, kChoiceCard);
@@ -5256,7 +5264,7 @@ private:
             const float bt = t + 14, bb = b - 14;
             const bool hot = open && hover_ == id;
             if (primary) q.Fill(l, bt, r, bb, 9, kAccent, hot ? 1.0f : 0.9f);
-            else q.Fill(l, bt, r, bb, 9, hot ? kCardHover : kCard);
+            else q.Fill(l, bt, r, bb, 9, hot ? kTileRaised : kTileHover);  // On the card's tile.
             if (id == kChoiceSend) {
                 PhoneGlyph(q, l + 14, (bt + bb) / 2, primary ? kInk : kFg);
                 q.Text(text, l + 22, bt, r - 6, bb, 11, primary ? kInk : kFg, TF_Center | TF_Ellipsis, 600);
@@ -5366,7 +5374,7 @@ private:
     void DrawKindIcon(const Pg& p, ShelfItem& it, float x, float y, float alpha) {
         const bool chip = it.kind == SK::Text || it.kind == SK::Link;
         if (chip) {
-            p.Fill(x, y, x + 18, y + 18, 5, kCardHover, alpha);
+            p.Fill(x, y, x + 18, y + 18, 5, kTileHover, alpha);
             p.Text(it.kind == SK::Text ? L"T" : L"↗", x, y, x + 18, y + 18, 11, kFg, TF_Center, 700);
             return;
         }
@@ -6003,13 +6011,14 @@ bool IsQuickSettingsWindow(HWND hwnd) {
     return !wcscmp(cls, L"ControlCenterWindow");
 }
 
-// The bar opened the calendar a moment ago, so the panel host now taking focus is that calendar.
-bool CalendarOpenWanted() {
-    return g_panelMode == kPanelCalendar && GetTickCount64() - g_calendarTick < (ULONGLONG)kCalendarClaimMs;
+// The bar opened one part (the bell's notifications or the island's calendar) a moment ago, so the
+// panel host now taking focus is that part, to hang from the bar.
+bool BarPanelOpenWanted() {
+    return g_panelMode != kPanelNative && GetTickCount64() - g_panelClaimTick < (ULONGLONG)kPanelClaimMs;
 }
 
-// The notification panel opens wherever its window was left, so before the bar moves it for the
-// calendar, remember the native place, and put it back before a native open. A place that does not
+// The notification panel opens wherever its window was left, so before the bar moves it under the
+// bell or the island, remember the native place, and put it back before a native open. A place that does not
 // end near the bottom of the work area was left by an older bar: use the native corner instead.
 void SaveNativePanelRect(HWND hwnd) {
     if (g_panelMoved || IsQuickSettingsWindow(hwnd)) {
@@ -6045,10 +6054,15 @@ void RestoreNativePanel(HWND hwnd) {
     }
 }
 
-// Centred under the clicked icon (the calendar: under the island).
-int AnchoredPanelX(HWND, const RECT& box, const MONITORINFO& mi, float s) {
+// Centred under the clicked icon (the calendar: under the island), except the notifications: the
+// bell is the bar's rightmost icon, so that panel ends where the bell's bubble ends.
+int AnchoredPanelX(HWND hwnd, const RECT& box, const MONITORINFO& mi, float s) {
+    constexpr float kBellToBubbleEdge = kItem / 2.0f + kItemPad + kBubblePad;  // From the bell's centre.
     const int edge = (int)(kPanelEdge * s + 0.5f);
     int x = g_anchorX - (box.left + box.right) / 2;
+    if (g_panelMode == kPanelNotifications && !IsQuickSettingsWindow(hwnd)) {
+        x = g_anchorX + (int)(kBellToBubbleEdge * s + 0.5f) - box.right;
+    }
     if (x + box.right > mi.rcMonitor.right - edge) x = mi.rcMonitor.right - edge - box.right;
     if (x + box.left < mi.rcMonitor.left + edge) x = mi.rcMonitor.left + edge - box.left;
     return x;
@@ -6058,8 +6072,9 @@ int AnchoredPanelX(HWND, const RECT& box, const MONITORINFO& mi, float s) {
 // only paint inside it. Moving the window is what puts the content under the bar;
 // moving the content inside the window would push it out of the region.
 void PlacePanel(HWND hwnd) {
-    // Only Quick Settings and the bar's calendar hang from the bar; the notifications stay native.
-    if (!IsQuickSettingsWindow(hwnd) && g_panelMode != kPanelCalendar) {
+    // Quick Settings, the bell's notifications and the island's calendar hang from the bar; the
+    // notifications opened any other way stay native.
+    if (!IsQuickSettingsWindow(hwnd) && g_panelMode == kPanelNative) {
         return;
     }
     RECT box;
@@ -6164,8 +6179,8 @@ void StepPanelFollow() {
     }
 }
 
-// Shows one half of the native notification and calendar panel: the calendar under the island, or
-// the notifications at their native place (kPanelNative).
+// Shows one half of the native notification and calendar panel: the calendar under the island, the
+// notifications under the bell, or the notifications at their native place (kPanelNative).
 void TogglePanel(WPARAM mode) {
     HWND fg = GetForegroundWindow();
     const bool open = fg && IsShellExperienceWindow(fg);
@@ -6174,7 +6189,7 @@ void TogglePanel(WPARAM mode) {
         return;
     }
     g_panelMode = mode;
-    if (mode == kPanelCalendar) g_calendarTick = GetTickCount64();
+    if (mode != kPanelNative) g_panelClaimTick = GetTickCount64();
     if (open) {
         // Windows sizes the panel's clip region as it opens, so changing parts means reopening.
         SendWinKey('N');
@@ -6191,7 +6206,7 @@ void TogglePanel(WPARAM mode) {
     SendPanelMode(mode);
     // This panel opens wherever it was left, so put it in place first. The clip only updates
     // once it opens, so use its top from the last time this mode was shown.
-    if (mode == kPanelCalendar && g_notificationPanel && IsWindow(g_notificationPanel) && g_regionTop[mode]) {
+    if (mode != kPanelNative && g_notificationPanel && IsWindow(g_notificationPanel) && g_regionTop[mode]) {
         RECT box, bar, r;
         const int kind = GetWindowRgnBox(g_notificationPanel, &box);
         if (kind != ERROR && kind != NULLREGION) {
@@ -6937,7 +6952,7 @@ void IslandPaint() {
     const RECT crop{cl, 0, cr, cb};
 
     if (!g_isSurface.Begin(crop)) return;
-    brush->SetColor(kCentreBg);
+    brush->SetColor(kSurface);  // The theme's surface; the notch shape keeps it hanging from the screen top.
     if (Com<ID2D1PathGeometry> body = NotchGeometry(L, R, B, r, rs, false)) rt->FillGeometry(body.Get(), brush);
     if (grow > 0.02f) {  // Faint edge once open, so a dark overlay stays apart from dark apps. Never along the top.
         if (Com<ID2D1PathGeometry> edge = NotchGeometry(L + 0.5f, R - 0.5f, B - 0.5f, r, rs, true)) {
@@ -7147,14 +7162,24 @@ void Services::Expand(IModule* m, int ms) {
     IslandRecompute();
 }
 
-// The calendar hangs under the island; the notifications open natively above the dock (anchor unused).
+// The calendar hangs under the island; the notifications hang under the bar's bell, wherever they
+// were asked for (the alerts' more line), so the anchor is the bell's when it is on the bar.
 void Services::OpenPanel(PanelKind kind, int anchorX) {
     if (kind == PanelKind::Calendar && !g_pinned) SetExpanded(false);  // The calendar takes the island's place.
+    if (kind == PanelKind::Notifications) {
+        for (const Hit& h : g_hits) {
+            if (h.id != H_bell) continue;
+            POINT c{(h.rect.left + h.rect.right) / 2, (h.rect.top + h.rect.bottom) / 2};
+            ClientToScreen(g_hwnd, &c);
+            anchorX = c.x;
+            break;
+        }
+    }
     g_anchorX = anchorX;
     g_anchorTick = GetTickCount64();
     SetPropW(g_hwnd, L"TopBarAnchorX", reinterpret_cast<HANDLE>((INT_PTR)anchorX));
     SetPropW(g_hwnd, L"TopBarAnchorTick", reinterpret_cast<HANDLE>((UINT_PTR)GetTickCount()));
-    TogglePanel(kind == PanelKind::Notifications ? kPanelNative : kPanelCalendar);
+    TogglePanel(kind == PanelKind::Notifications ? kPanelNotifications : kPanelCalendar);
 }
 
 void IslandOpenCalendar() {
@@ -7932,7 +7957,7 @@ void AlertsModule::Draw(const DrawCtx& c) {
         }
         fillT_ = c.now;
         const float frac = std::clamp(fill_.x, 0.0f, 1.0f);
-        col(Rgb(255, 255, 255, 0x2e));
+        col(kTile);  // Track.
         c.rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(tl, cy - th / 2, tr, cy + th / 2), th / 2, th / 2), c.brush);
         if (frac > 0) {
             col(kFg, cur_.on ? 0.4f : 1.0f);
@@ -7967,7 +7992,7 @@ void AlertsModule::Draw(const DrawCtx& c) {
     if (cur_.icon && cur_.icon->w > 0) {
         if (ID2D1Bitmap* bmp = AlBitmap(c.rt, *cur_.icon)) c.rt->DrawBitmap(bmp, br, c.alpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
     } else {
-        col(Rgb(255, 255, 255, 0x1e));
+        col(kTile);
         c.rt->FillRoundedRectangle(D2D1::RoundedRect(br, 8.0f * s, 8.0f * s), c.brush);
         col(kFg);
         const float cx = bx + badge / 2, cy = by + badge / 2;
@@ -8801,14 +8826,14 @@ void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG object, LON
             const bool shellPanel = IsShellExperienceWindow(hwnd);
             if (shellPanel) {
                 g_notificationPanel = hwnd;
-                // Opened from the dock, Win+N or an alert: it stays at its native place above the dock.
-                if (!CalendarOpenWanted()) {
+                // Opened from the dock or Win+N (not the bar's bell): it stays at its native place above the dock.
+                if (!BarPanelOpenWanted()) {
                     g_panelMode = kPanelNative;
                     SaveNativePanelRect(hwnd);  // No-op if already saved; checks a place left by an older bar.
                     RestoreNativePanel(hwnd);
                 }
             }
-            if (!shellPanel || g_panelMode == kPanelCalendar) {
+            if (!shellPanel || g_panelMode != kPanelNative) {
                 if (GetTickCount64() - g_panelOpenTick > kPanelDropMs) {
                     g_panelOpenTick = GetTickCount64();  // Unless it was already started before opening.
                 }
@@ -8816,9 +8841,9 @@ void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG object, LON
                 FollowPanel();
             }
         }
-        else if (g_panelMoved && hwnd != g_hwnd && hwnd != g_isHwnd && g_panelMode == kPanelCalendar &&
-                 GetTickCount64() - g_calendarTick > 1500) {
-            // The calendar closed: put the window back now, so a native open from the dock is in place at once.
+        else if (g_panelMoved && hwnd != g_hwnd && hwnd != g_isHwnd && g_panelMode != kPanelNative &&
+                 GetTickCount64() - g_panelClaimTick > 1500) {
+            // The bell's or the calendar's part closed: put the window back now, so a native open from the dock is in place at once.
             RestoreNativePanel(g_notificationPanel);
         }
         if (!IsShellWindow(hwnd) && !ForegroundCoversMonitor()) {
@@ -8959,6 +8984,7 @@ void RunAction(Action action) {
         case Action::Bluetooth:
             OpenQuickPage(action);
             break;
+        case Action::Notifications: TogglePanel(kPanelNotifications); break;  // Under the bell.
         case Action::Profile:
             // Pressing the mouse can already have dismissed it: don't reopen it on release.
             if (!g_profileAtDown || g_profileOpen) {

@@ -325,7 +325,7 @@ private:
         DrawArt(c, artR, 16.0f);
         if (m.active >= 0 && (size_t)m.active < m.sources.size() && m.sources[m.active].icon) {
             const auto bad = D2D1::RectF(artR.right - 24 * s, artR.bottom - 22 * s, artR.right - 3 * s, artR.bottom - 1 * s);
-            SetCol(c, Rgb(0x10, 0x10, 0x10), 1.0f);
+            SetCol(c, kSurfaceSolid, 1.0f);
             c.rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F((bad.left + bad.right) / 2, (bad.top + bad.bottom) / 2), 11 * s, 11 * s), c.brush);
             if (ID2D1Bitmap* b = BitmapFor(c.rt, srcImg_[m.sources[m.active].aumid], m.sources[m.active].icon))
                 c.rt->DrawBitmap(b, D2D1::RectF(bad.left + 2.5f * s, bad.top + 2.5f * s, bad.right - 2.5f * s, bad.bottom - 2.5f * s), c.alpha);
@@ -358,7 +358,7 @@ private:
             const float frac = (float)pos / (float)m.durMs;
             const auto tr = R(c, 72, 111.5f, 236, 5);
             const float cx = tr.left + frac * (tr.right - tr.left), half = (dragging_ ? 3.5f : 2.5f) * s;
-            SetCol(c, kFg, m.canSeek ? 0.18f : 0.1f);
+            SetCol(c, kTile, m.canSeek ? 1.0f : 0.5f);  // Track.
             c.rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(tr.left, (tr.top + tr.bottom) / 2 - half, tr.right, (tr.top + tr.bottom) / 2 + half), half, half), c.brush);
             SetCol(c, Accent(), m.canSeek ? 1.0f : 0.5f);
             c.rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(tr.left, (tr.top + tr.bottom) / 2 - half, cx, (tr.top + tr.bottom) / 2 + half), half, half), c.brush);
@@ -393,7 +393,8 @@ private:
             const float rad = b.r * s * (down ? 0.87f : 1.0f);
             const bool big = b.z == Z_play;
             if (down) SetCol(c, Accent(), 0.5f);
-            else SetCol(c, Rgb(255, 255, 255), (big ? (hot ? 0.16f : 0.08f) : (hot ? 0.09f : 0.04f)) * (b.enabled ? 1.0f : 0.5f));
+            else if (big) SetCol(c, hot ? kTileHover : kTile, b.enabled ? 1.0f : 0.5f);
+            else SetCol(c, kTile, (hot ? 1.0f : 0.5f) * (b.enabled ? 1.0f : 0.5f));  // Skip buttons: half a tile until hovered.
             c.rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cxm + b.dx * s, cyb), rad, rad), c.brush);
             SetCol(c, kFg, (big ? (hot ? 1.0f : 0.88f) : (hot ? 0.92f : 0.62f)) * (b.enabled ? 1.0f : 0.35f));
             if (big) DrawPlayPause(c, cxm, cyb, 18 * s * (down ? 0.87f : 1.0f), morph_);
@@ -404,7 +405,7 @@ private:
         const std::vector<int> dock = DockSlots();
         if (dock.size() >= 2 || (dock.size() == 1 && m.sources.size() >= 2)) {
             const auto pill = R(c, 20, 125, 2 + (float)dock.size() * 28, 30);
-            SetCol(c, Rgb(255, 255, 255), 0.06f);
+            SetCol(c, kTile);
             c.rt->FillRoundedRectangle(D2D1::RoundedRect(pill, 15 * s, 15 * s), c.brush);
             for (size_t i = 0; i < dock.size(); i++) {
                 const int si = dock[i];
@@ -433,7 +434,7 @@ private:
                     g_text.Draw(c.rt, src.name.substr(0, 1), sr.left, sr.top, c.brush, o);
                 }
                 if (src.playing) {
-                    SetCol(c, Rgb(0x10, 0x10, 0x10));
+                    SetCol(c, kSurfaceSolid);
                     c.rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(sr.right - 4 * s, sr.bottom - 4 * s), 4.5f * s, 4.5f * s), c.brush);
                     SetCol(c, Rgb(0x3a, 0xd0, 0x6c));
                     c.rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(sr.right - 4 * s, sr.bottom - 4 * s), 3.5f * s, 3.5f * s), c.brush);

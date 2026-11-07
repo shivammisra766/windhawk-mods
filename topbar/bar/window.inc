@@ -11,14 +11,14 @@ void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG object, LON
             const bool shellPanel = IsShellExperienceWindow(hwnd);
             if (shellPanel) {
                 g_notificationPanel = hwnd;
-                // Opened from the dock, Win+N or an alert: it stays at its native place above the dock.
-                if (!CalendarOpenWanted()) {
+                // Opened from the dock or Win+N (not the bar's bell): it stays at its native place above the dock.
+                if (!BarPanelOpenWanted()) {
                     g_panelMode = kPanelNative;
                     SaveNativePanelRect(hwnd);  // No-op if already saved; checks a place left by an older bar.
                     RestoreNativePanel(hwnd);
                 }
             }
-            if (!shellPanel || g_panelMode == kPanelCalendar) {
+            if (!shellPanel || g_panelMode != kPanelNative) {
                 if (GetTickCount64() - g_panelOpenTick > kPanelDropMs) {
                     g_panelOpenTick = GetTickCount64();  // Unless it was already started before opening.
                 }
@@ -26,9 +26,9 @@ void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG object, LON
                 FollowPanel();
             }
         }
-        else if (g_panelMoved && hwnd != g_hwnd && hwnd != g_isHwnd && g_panelMode == kPanelCalendar &&
-                 GetTickCount64() - g_calendarTick > 1500) {
-            // The calendar closed: put the window back now, so a native open from the dock is in place at once.
+        else if (g_panelMoved && hwnd != g_hwnd && hwnd != g_isHwnd && g_panelMode != kPanelNative &&
+                 GetTickCount64() - g_panelClaimTick > 1500) {
+            // The bell's or the calendar's part closed: put the window back now, so a native open from the dock is in place at once.
             RestoreNativePanel(g_notificationPanel);
         }
         if (!IsShellWindow(hwnd) && !ForegroundCoversMonitor()) {
@@ -169,6 +169,7 @@ void RunAction(Action action) {
         case Action::Bluetooth:
             OpenQuickPage(action);
             break;
+        case Action::Notifications: TogglePanel(kPanelNotifications); break;  // Under the bell.
         case Action::Profile:
             // Pressing the mouse can already have dismissed it: don't reopen it on release.
             if (!g_profileAtDown || g_profileOpen) {
