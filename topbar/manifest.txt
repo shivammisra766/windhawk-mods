@@ -22,5 +22,6 @@ bar/tray.inc
 bar/profile.inc
 bar/island.inc
 alerts/alerts.inc
+alerts/levels.inc
 bar/window.inc
 bar/tail.inc

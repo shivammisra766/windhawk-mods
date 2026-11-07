@@ -1,5 +1,6 @@
-# Installs the bar 4.2 and panel-split 1.12. Tray-bridge stays at 1.3: 1.4 or the popup styler edits crashed Explorer. Nothing else changes without restarting the Windhawk service, because that
-# restart has crashed Explorer. Run elevated, then restart the bar process unelevated with:
+# Installs bar 4.3 (own volume and brightness slider) and tray-bridge 1.7 (osdOverride=2 hides the native popup and
+# tells the bar). Both reload without restarting Explorer or the Windhawk service (that restart has crashed Explorer).
+# Run elevated, then restart the bar process unelevated with:
 #   windhawk.exe -tool-mod "local@top-bar"
 $s = $PSScriptRoot
 $out = "$s\install-bar-result.txt"
@@ -15,9 +16,9 @@ try {
     Set-ItemProperty "$base\$id" -Name SettingsChangeTime -Value $now -Type DWord
   }
   # windhawk.exe is 32-bit, so the bar needs both architectures.
-  # Order: the Explorer-side mods first, then the bar. Restarting their hosts is left to you (see topbarlerts\INSTALL.txt).
-  Install 'local@panel-split' '1.12' '400013' @('64')
-  Install 'local@top-bar' '4.2' '300042' @('32', '64')
-  'ShellExperienceHost', 'ShellHost' | ForEach-Object { Stop-Process -Name $_ -Force -ErrorAction SilentlyContinue }
+  New-Item "$base\local@tray-bridge\Settings" -Force | Out-Null
+  Set-ItemProperty "$base\local@tray-bridge\Settings" -Name osdOverride -Value 2 -Type DWord
+  Install 'local@tray-bridge' '1.7' '500008' @('64')
+  Install 'local@top-bar' '4.3' '300043' @('32', '64')
   "ok" | Out-File $out
 } catch { "ERROR: $($_.Exception.Message)" | Out-File $out }

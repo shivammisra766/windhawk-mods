@@ -1,5 +1,5 @@
-﻿$s = $PSScriptRoot
-$id = 'local@tray-bridge'; $ver = '1.5'; $serial = '500006'
+$s = $PSScriptRoot
+$id = 'local@tray-bridge'; $ver = '1.7'; $serial = '500008'
 $utf8 = New-Object Text.UTF8Encoding($false)
 $t = [IO.File]::ReadAllText("$s\$id.wh.cpp", $utf8)
 $comp = 'C:\Program Files\Windhawk\Compiler'

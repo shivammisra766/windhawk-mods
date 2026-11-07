@@ -1,8 +1,8 @@
-// ==WindhawkMod==
+﻿// ==WindhawkMod==
 // @id              tray-bridge
 // @name            Tray bridge
 // @description     Passes tray icon updates to the top bar, and places the volume and brightness popup over its centre bubble
-// @version         1.5
+// @version         1.7
 // @author          local
 // @include         explorer.exe
 // @architecture    x86-64
@@ -12,7 +12,7 @@
 /*
 - osdOverride: 1
   $name: Place the volume popup over the bar
-  $description: 1 moves the popup onto the bar's centre bubble. 0 only logs the rectangles it asks for.
+  $description: 1 moves the popup onto the bar's centre bubble. 2 hides it while the bar is up (the island shows its own slider). 0 only logs the rectangles it asks for.
 - osdUnits: 0
   $name: Popup rectangle units
   $description: 0 means device independent pixels (the logged rect divided by the bar's scale), 1 means physical pixels.
@@ -211,7 +211,19 @@ UINT g_osdMessage = 0;
 FRect* GetPositionRect_Hook(void* self, FRect* result, const FRect* input) {
     FRect* ret = g_originalGetPositionRect(self, result, input);
     FRect* out = ret ? ret : result;
-    const bool override_ = Wh_GetIntSetting(L"osdOverride") != 0;
+    const int mode = Wh_GetIntSetting(L"osdOverride");
+    if (out) Wh_Log(L"GetPositionRect in=%.0f,%.0f %.0fx%.0f mode=%d", out->x, out->y, out->w, out->h, mode);
+    // 2: the island draws its own slider; the native popup goes off-screen while the bar is up.
+    if (mode == 2 && out) {
+        HWND bar = FindWindowW(L"WindhawkTopBar", nullptr);
+        if (bar && IsWindowVisible(bar) && !IsHungAppWindow(bar)) {
+            out->x = -32000.0f;
+            out->y = -32000.0f;
+            if (HWND alerts = FindWindowW(L"WindhawkTopBarAlerts", nullptr)) PostMessageW(alerts, g_osdMessage, 1, 2);
+            return ret;
+        }
+    }
+    const bool override_ = mode == 1;
     const bool pixels = Wh_GetIntSetting(L"osdUnits") == 1;
     HWND bar = FindWindowW(L"WindhawkTopBar", nullptr);
     HWND alerts = FindWindowW(L"WindhawkTopBarAlerts", nullptr);

@@ -37,7 +37,11 @@ std::wstring AlFmt(const wchar_t* fmt, ...) {
     return buf;
 }
 
-enum class AK { Caps, Battery, Bluetooth, Device, Dnd, Notification, Clipboard };
+enum class AK { Caps, Battery, Bluetooth, Device, Dnd, Notification, Clipboard, Volume, Brightness };
+constexpr UINT WM_AL_LEVEL = WM_APP + 42;  // wParam: volume 0-100 (-1 unknown) | 0x10000 muted; lParam: brightness (-1 unknown).
+HANDLE g_alLevelRead = nullptr, g_alLevelSet = nullptr;  // Auto-reset: read both levels / apply the requested one.
+std::atomic<int> g_alSetVolume{-1}, g_alSetBright{-1};
+DWORD WINAPI AlLevelThread(void*);  // alerts/levels.inc
 
 struct AItem {
     AK kind = AK::Caps;
@@ -57,6 +61,8 @@ struct AItem {
 
 int AlPriority(AK k) {
     switch (k) {
+        case AK::Volume:
+        case AK::Brightness: return 95;  // Answers a key press: above everything.
         case AK::Caps: return 90;
         case AK::Notification: return 60;
         case AK::Clipboard: return 10;
@@ -228,6 +234,9 @@ private:
     void ReadPrivacy();
     void OsdShown(bool fromHook);
     void OsdHidden();
+    void OnLevels(WPARAM wp, LPARAM lp);
+    bool IsLevel() const { return hasCur_ && (cur_.kind == AK::Volume || cur_.kind == AK::Brightness); }
+    void SetLevelAt(float x);
     void Launch(const wchar_t* uri) { ShellExecuteW(nullptr, L"open", uri, nullptr, nullptr, SW_SHOWNORMAL); }
 
     Services* sv_ = nullptr;
@@ -241,6 +250,11 @@ private:
     int batPct_ = -1, batAc_ = -1, dndValue_ = 0;
     int clipTries_ = 0;
     bool osdSeen_ = false;
+    // Own volume and brightness slider: last readings, to tell which one a key press changed.
+    int lastVol_ = -1, lastBright_ = -1;
+    bool lastMute_ = false, levelsPrimed_ = false, dragging_ = false;
+    AK lastLevelKind_ = AK::Volume;
+    float trackL_ = 0, trackR_ = 0;  // Slider track, pixels from the card's left edge.
     bool mic_ = false, cam_ = false;
     std::wstring micApp_, camApp_;
     HPOWERNOTIFY powerA_ = nullptr, powerB_ = nullptr;
@@ -300,6 +314,20 @@ void AlertsModule::Enqueue(AItem it) {
     if (g_fullscreen || !sv_) return;  // The bar is hidden; toasts are back, nothing to show later.
     it.remaining = it.ms;
     switch (it.kind) {
+        case AK::Volume:
+        case AK::Brightness:
+            if (hasCur_ && cur_.kind == it.kind) {  // Same slider: new value, full time again, no re-present.
+                cur_.level = it.level;
+                cur_.on = it.on;
+                cur_.remaining = it.ms;
+                IslandRecompute();
+                return;
+            }
+            if (hasCur_ && cur_.kind != AK::Clipboard && !IsLevel()) pending_.push_front(cur_);
+            cur_ = it;
+            hasCur_ = true;
+            Present();
+            return;
         case AK::Caps:
             if (hasCur_ && cur_.kind == AK::Caps) { cur_ = it; Present(); return; }
             // The interrupted alert resumes with the time it had left. A clipboard alert is just dropped.
@@ -537,10 +565,47 @@ void AlertsModule::OsdHidden() {
     SetCovered(false);
 }
 
+void AlertsModule::OnLevels(WPARAM wp, LPARAM lp) {
+    const int vol = (int)(short)(wp & 0xFFFF);
+    const bool mute = (wp & 0x10000) != 0;
+    const int bright = (int)lp;
+    if (!levelsPrimed_) {  // The reading taken at start: a baseline, nothing to show.
+        levelsPrimed_ = true;
+        lastVol_ = vol; lastMute_ = mute; lastBright_ = bright;
+        return;
+    }
+    AK kind = lastLevelKind_;
+    if (vol >= 0 && (vol != lastVol_ || mute != lastMute_)) kind = AK::Volume;
+    else if (bright >= 0 && bright != lastBright_) kind = AK::Brightness;
+    lastVol_ = vol; lastMute_ = mute; lastBright_ = bright;
+    if (dragging_) return;  // The card already shows what the drag set.
+    lastLevelKind_ = kind;
+    AItem it;
+    it.kind = kind;
+    it.level = kind == AK::Volume ? vol : bright;
+    it.on = kind == AK::Volume && mute;
+    it.ms = 2000;
+    if (it.level < 0) return;
+    Enqueue(it);
+}
+
+void AlertsModule::SetLevelAt(float x) {
+    if (!IsLevel() || trackR_ <= trackL_) return;
+    const int v = (int)std::lround(std::clamp((x - trackL_) / (trackR_ - trackL_), 0.0f, 1.0f) * 100.0f);
+    if (v == cur_.level) return;
+    cur_.level = v;
+    cur_.remaining = cur_.ms;
+    if (cur_.kind == AK::Volume) { g_alSetVolume = v; lastVol_ = v; cur_.on = false; }
+    else { g_alSetBright = v; lastBright_ = v; }
+    if (g_alLevelSet) SetEvent(g_alLevelSet);
+    IslandRecompute();
+}
+
 // ---- Island-facing parts ----
 
 Size2 AlertsModule::Measure(View v) {
     if (v != View::Alert || !hasCur_) return {40.0f, kNotchH};
+    if (IsLevel()) return {280.0f + 2.0f * AlertsDotsReserve(), 44.0f};
     float w = 300.0f;
     switch (cur_.kind) {
         case AK::Caps: w = 210.0f; break;
@@ -554,6 +619,14 @@ Size2 AlertsModule::Measure(View v) {
 
 bool AlertsModule::OnPointer(const PointerEvent& e, View v) {
     if (v != View::Alert) return false;
+    if (IsLevel()) {  // Press or drag on the card sets the level; hovering holds it open.
+        if (e.kind == PointerEvent::Down && e.left) { dragging_ = true; SetLevelAt(e.pt.x); }
+        else if (e.kind == PointerEvent::Move && dragging_) SetLevelAt(e.pt.x);
+        else if (e.kind == PointerEvent::Up) dragging_ = false;
+        else if (e.kind == PointerEvent::Leave) { dragging_ = false; hovered_ = false; }
+        if (e.kind == PointerEvent::Move) hovered_ = true;
+        return true;
+    }
     if (e.kind == PointerEvent::Move && !hovered_) { hovered_ = true; IslandRecompute(); }
     else if (e.kind == PointerEvent::Leave && hovered_) { hovered_ = false; IslandRecompute(); }
     return false;
@@ -565,6 +638,45 @@ void AlertsModule::Draw(const DrawCtx& c) {
     const D2D1_RECT_F r = c.rect;
     const float badge = 28.0f * s, bx = r.left + 10.0f * s, by = r.top + 8.0f * s;
     auto col = [&](D2D1_COLOR_F k, float a = 1.0f) { k.a *= a * c.alpha; c.brush->SetColor(k); };
+
+    if (IsLevel()) {  // Glyph, track with fill, percent.
+        const bool vol = cur_.kind == AK::Volume;
+        const float cx = r.left + 24.0f * s, cy = (r.top + r.bottom) / 2.0f;
+        col(kFg);
+        if (vol) {
+            D2D1_POINT_2F p[] = {{cx - 8 * s, cy - 3 * s}, {cx - 4 * s, cy - 3 * s}, {cx + 1 * s, cy - 7 * s}, {cx + 1 * s, cy + 7 * s}, {cx - 4 * s, cy + 3 * s}, {cx - 8 * s, cy + 3 * s}};
+            for (int i = 0; i < 6; i++) c.rt->DrawLine(p[i], p[(i + 1) % 6], c.brush, 1.4f * s);
+            if (cur_.on) {  // Muted: a cross instead of waves.
+                c.rt->DrawLine(D2D1::Point2F(cx + 4 * s, cy - 3 * s), D2D1::Point2F(cx + 10 * s, cy + 3 * s), c.brush, 1.4f * s);
+                c.rt->DrawLine(D2D1::Point2F(cx + 10 * s, cy - 3 * s), D2D1::Point2F(cx + 4 * s, cy + 3 * s), c.brush, 1.4f * s);
+            } else if (cur_.level > 0) {
+                c.rt->DrawLine(D2D1::Point2F(cx + 5 * s, cy - 3 * s), D2D1::Point2F(cx + 5 * s, cy + 3 * s), c.brush, 1.4f * s);
+                if (cur_.level > 50) c.rt->DrawLine(D2D1::Point2F(cx + 9 * s, cy - 6 * s), D2D1::Point2F(cx + 9 * s, cy + 6 * s), c.brush, 1.4f * s);
+            }
+        } else {
+            c.rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 3.5f * s, 3.5f * s), c.brush, 1.4f * s);
+            for (int i = 0; i < 8; i++) {
+                const float a = i * 3.14159265f / 4.0f, ca = std::cos(a), sa = std::sin(a);
+                c.rt->DrawLine(D2D1::Point2F(cx + ca * 6.0f * s, cy + sa * 6.0f * s), D2D1::Point2F(cx + ca * 8.5f * s, cy + sa * 8.5f * s), c.brush, 1.4f * s);
+            }
+        }
+        const float tl = r.left + 46.0f * s, tr = r.right - (52.0f + 12.0f * Dots()) * s, th = 6.0f * s;
+        trackL_ = tl - r.left;
+        trackR_ = tr - r.left;
+        const float frac = std::clamp(cur_.level / 100.0f, 0.0f, 1.0f);
+        col(Rgb(255, 255, 255, 0x2e));
+        c.rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(tl, cy - th / 2, tr, cy + th / 2), th / 2, th / 2), c.brush);
+        if (frac > 0) {
+            col(kFg, cur_.on ? 0.4f : 1.0f);
+            c.rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(tl, cy - th / 2, tl + std::max(th, (tr - tl) * frac), cy + th / 2), th / 2, th / 2), c.brush);
+        }
+        TextOpts o;
+        o.maxW = 40.0f * s;
+        o.maxH = 18.0f * s;
+        col(kFg, 0.8f);
+        g_text.Draw(c.rt, std::to_wstring(cur_.level), tr + 10.0f * s, cy - 9.0f * s, c.brush, o);
+        return;
+    }
 
     // Badge: app icon, or a glyph for the kind.
     const D2D1_RECT_F br = D2D1::RectF(bx, by, bx + badge, by + badge);
@@ -624,7 +736,7 @@ void AlertsModule::Draw(const DrawCtx& c) {
 }
 
 void AlertsModule::OnClickAlert() {
-    if (!hasCur_) return;
+    if (!hasCur_ || IsLevel()) return;  // A slider is set by pressing on it, not dismissed.
     const AItem it = cur_;
     switch (it.kind) {
         case AK::Caps:
@@ -1054,6 +1166,11 @@ LRESULT CALLBACK AlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 LRESULT AlertsModule::Wnd(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == g_alMsgToast && g_alMsgToast) { g_alHookSeen = true; SetEvent(g_alWake); return 0; }
     if (msg == g_alMsgOsd && g_alMsgOsd) {  // lParam 1: the hook moved the popup onto the bubble, so the island yields.
+        if (lp == 2) {  // 2: the hook hid the popup; the island shows its own slider.
+            osdSeen_ = true;
+            if (g_alLevelRead) SetEvent(g_alLevelRead);
+            return 0;
+        }
         if (lp) OsdShown(true);
         else osdSeen_ = true;
         return 0;
@@ -1061,6 +1178,7 @@ LRESULT AlertsModule::Wnd(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_AL_CAPS: OnCaps(lp != 0); return 0;
         case WM_AL_PRIVACY: SetTimer(hwnd, kAlPrivacy, 250, nullptr); return 0;
+        case WM_AL_LEVEL: OnLevels(wp, lp); return 0;
         case WM_POWERBROADCAST: OnPower(); return TRUE;
         case WM_CLIPBOARDUPDATE: OnClipboard(); return 0;
         case WM_DEVICECHANGE: OnDevice(wp, lp); return TRUE;
@@ -1082,6 +1200,8 @@ void AlertsModule::Start(Services& s) {
     g_alMod = this;
     g_alStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_alWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_alLevelRead = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_alLevelSet = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_alMsgToast = RegisterWindowMessageW(L"Windhawk_TopBar_ToastShown");
     g_alMsgOsd = RegisterWindowMessageW(L"Windhawk_TopBar_Osd");
     HINSTANCE inst = GetModuleHandleW(nullptr);
@@ -1118,6 +1238,7 @@ void AlertsModule::Start(Services& s) {
     threads_.push_back(CreateThread(nullptr, 0, AlPrivacyThread, nullptr, 0, nullptr));
     threads_.push_back(CreateThread(nullptr, 0, AlBtThread, nullptr, 0, nullptr));
     threads_.push_back(CreateThread(nullptr, 0, AlNotifThread, nullptr, 0, nullptr));
+    threads_.push_back(CreateThread(nullptr, 0, AlLevelThread, nullptr, 0, nullptr));
     OnPower();
 }
 
@@ -1153,7 +1274,9 @@ void AlertsModule::Stop() {
     UnregisterClassW(kAlertsClass, GetModuleHandleW(nullptr));
     if (g_alStop) CloseHandle(g_alStop);
     if (g_alWake) CloseHandle(g_alWake);
-    g_alStop = g_alWake = nullptr;
+    if (g_alLevelRead) CloseHandle(g_alLevelRead);
+    if (g_alLevelSet) CloseHandle(g_alLevelSet);
+    g_alStop = g_alWake = g_alLevelRead = g_alLevelSet = nullptr;
 }
 
 IModule* AlertsModuleInstance() {

@@ -2,10 +2,10 @@
 // @id              top-bar
 // @name            Top bar
 // @description     Top bar with three bubbles in the Seelen toolbar style, drawn with Direct2D
-// @version         4.2
+// @version         4.3
 // @author          local
 // @include         windhawk.exe
-// @compilerOptions -lgdi32 -luser32 -lshell32 -ladvapi32 -lole32 -lversion -lwininet -liphlpapi -luuid -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -lruntimeobject -loleaut32 -lsetupapi -lpdh
+// @compilerOptions -lgdi32 -luser32 -lshell32 -ladvapi32 -lole32 -lversion -lwininet -liphlpapi -luuid -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -lruntimeobject -loleaut32 -lsetupapi -lpdh -lwbemuuid
 // ==/WindhawkMod==
 // ==WindhawkModSettings==
 /*
@@ -90,6 +90,8 @@
 #include <dwrite.h>
 #include <wincodec.h>
 #include <mmdeviceapi.h>
+#include <endpointvolume.h>
+#include <wbemidl.h>
 #include <unknwn.h>
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>
@@ -6368,7 +6370,11 @@ std::wstring AlFmt(const wchar_t* fmt, ...) {
     return buf;
 }
 
-enum class AK { Caps, Battery, Bluetooth, Device, Dnd, Notification, Clipboard };
+enum class AK { Caps, Battery, Bluetooth, Device, Dnd, Notification, Clipboard, Volume, Brightness };
+constexpr UINT WM_AL_LEVEL = WM_APP + 42;  // wParam: volume 0-100 (-1 unknown) | 0x10000 muted; lParam: brightness (-1 unknown).
+HANDLE g_alLevelRead = nullptr, g_alLevelSet = nullptr;  // Auto-reset: read both levels / apply the requested one.
+std::atomic<int> g_alSetVolume{-1}, g_alSetBright{-1};
+DWORD WINAPI AlLevelThread(void*);  // alerts/levels.inc
 
 struct AItem {
     AK kind = AK::Caps;
@@ -6388,6 +6394,8 @@ struct AItem {
 
 int AlPriority(AK k) {
     switch (k) {
+        case AK::Volume:
+        case AK::Brightness: return 95;  // Answers a key press: above everything.
         case AK::Caps: return 90;
         case AK::Notification: return 60;
         case AK::Clipboard: return 10;
@@ -6559,6 +6567,9 @@ private:
     void ReadPrivacy();
     void OsdShown(bool fromHook);
     void OsdHidden();
+    void OnLevels(WPARAM wp, LPARAM lp);
+    bool IsLevel() const { return hasCur_ && (cur_.kind == AK::Volume || cur_.kind == AK::Brightness); }
+    void SetLevelAt(float x);
     void Launch(const wchar_t* uri) { ShellExecuteW(nullptr, L"open", uri, nullptr, nullptr, SW_SHOWNORMAL); }
 
     Services* sv_ = nullptr;
@@ -6572,6 +6583,11 @@ private:
     int batPct_ = -1, batAc_ = -1, dndValue_ = 0;
     int clipTries_ = 0;
     bool osdSeen_ = false;
+    // Own volume and brightness slider: last readings, to tell which one a key press changed.
+    int lastVol_ = -1, lastBright_ = -1;
+    bool lastMute_ = false, levelsPrimed_ = false, dragging_ = false;
+    AK lastLevelKind_ = AK::Volume;
+    float trackL_ = 0, trackR_ = 0;  // Slider track, pixels from the card's left edge.
     bool mic_ = false, cam_ = false;
     std::wstring micApp_, camApp_;
     HPOWERNOTIFY powerA_ = nullptr, powerB_ = nullptr;
@@ -6631,6 +6647,20 @@ void AlertsModule::Enqueue(AItem it) {
     if (g_fullscreen || !sv_) return;  // The bar is hidden; toasts are back, nothing to show later.
     it.remaining = it.ms;
     switch (it.kind) {
+        case AK::Volume:
+        case AK::Brightness:
+            if (hasCur_ && cur_.kind == it.kind) {  // Same slider: new value, full time again, no re-present.
+                cur_.level = it.level;
+                cur_.on = it.on;
+                cur_.remaining = it.ms;
+                IslandRecompute();
+                return;
+            }
+            if (hasCur_ && cur_.kind != AK::Clipboard && !IsLevel()) pending_.push_front(cur_);
+            cur_ = it;
+            hasCur_ = true;
+            Present();
+            return;
         case AK::Caps:
             if (hasCur_ && cur_.kind == AK::Caps) { cur_ = it; Present(); return; }
             // The interrupted alert resumes with the time it had left. A clipboard alert is just dropped.
@@ -6868,10 +6898,47 @@ void AlertsModule::OsdHidden() {
     SetCovered(false);
 }
 
+void AlertsModule::OnLevels(WPARAM wp, LPARAM lp) {
+    const int vol = (int)(short)(wp & 0xFFFF);
+    const bool mute = (wp & 0x10000) != 0;
+    const int bright = (int)lp;
+    if (!levelsPrimed_) {  // The reading taken at start: a baseline, nothing to show.
+        levelsPrimed_ = true;
+        lastVol_ = vol; lastMute_ = mute; lastBright_ = bright;
+        return;
+    }
+    AK kind = lastLevelKind_;
+    if (vol >= 0 && (vol != lastVol_ || mute != lastMute_)) kind = AK::Volume;
+    else if (bright >= 0 && bright != lastBright_) kind = AK::Brightness;
+    lastVol_ = vol; lastMute_ = mute; lastBright_ = bright;
+    if (dragging_) return;  // The card already shows what the drag set.
+    lastLevelKind_ = kind;
+    AItem it;
+    it.kind = kind;
+    it.level = kind == AK::Volume ? vol : bright;
+    it.on = kind == AK::Volume && mute;
+    it.ms = 2000;
+    if (it.level < 0) return;
+    Enqueue(it);
+}
+
+void AlertsModule::SetLevelAt(float x) {
+    if (!IsLevel() || trackR_ <= trackL_) return;
+    const int v = (int)std::lround(std::clamp((x - trackL_) / (trackR_ - trackL_), 0.0f, 1.0f) * 100.0f);
+    if (v == cur_.level) return;
+    cur_.level = v;
+    cur_.remaining = cur_.ms;
+    if (cur_.kind == AK::Volume) { g_alSetVolume = v; lastVol_ = v; cur_.on = false; }
+    else { g_alSetBright = v; lastBright_ = v; }
+    if (g_alLevelSet) SetEvent(g_alLevelSet);
+    IslandRecompute();
+}
+
 // ---- Island-facing parts ----
 
 Size2 AlertsModule::Measure(View v) {
     if (v != View::Alert || !hasCur_) return {40.0f, kNotchH};
+    if (IsLevel()) return {280.0f + 2.0f * AlertsDotsReserve(), 44.0f};
     float w = 300.0f;
     switch (cur_.kind) {
         case AK::Caps: w = 210.0f; break;
@@ -6885,6 +6952,14 @@ Size2 AlertsModule::Measure(View v) {
 
 bool AlertsModule::OnPointer(const PointerEvent& e, View v) {
     if (v != View::Alert) return false;
+    if (IsLevel()) {  // Press or drag on the card sets the level; hovering holds it open.
+        if (e.kind == PointerEvent::Down && e.left) { dragging_ = true; SetLevelAt(e.pt.x); }
+        else if (e.kind == PointerEvent::Move && dragging_) SetLevelAt(e.pt.x);
+        else if (e.kind == PointerEvent::Up) dragging_ = false;
+        else if (e.kind == PointerEvent::Leave) { dragging_ = false; hovered_ = false; }
+        if (e.kind == PointerEvent::Move) hovered_ = true;
+        return true;
+    }
     if (e.kind == PointerEvent::Move && !hovered_) { hovered_ = true; IslandRecompute(); }
     else if (e.kind == PointerEvent::Leave && hovered_) { hovered_ = false; IslandRecompute(); }
     return false;
@@ -6896,6 +6971,45 @@ void AlertsModule::Draw(const DrawCtx& c) {
     const D2D1_RECT_F r = c.rect;
     const float badge = 28.0f * s, bx = r.left + 10.0f * s, by = r.top + 8.0f * s;
     auto col = [&](D2D1_COLOR_F k, float a = 1.0f) { k.a *= a * c.alpha; c.brush->SetColor(k); };
+
+    if (IsLevel()) {  // Glyph, track with fill, percent.
+        const bool vol = cur_.kind == AK::Volume;
+        const float cx = r.left + 24.0f * s, cy = (r.top + r.bottom) / 2.0f;
+        col(kFg);
+        if (vol) {
+            D2D1_POINT_2F p[] = {{cx - 8 * s, cy - 3 * s}, {cx - 4 * s, cy - 3 * s}, {cx + 1 * s, cy - 7 * s}, {cx + 1 * s, cy + 7 * s}, {cx - 4 * s, cy + 3 * s}, {cx - 8 * s, cy + 3 * s}};
+            for (int i = 0; i < 6; i++) c.rt->DrawLine(p[i], p[(i + 1) % 6], c.brush, 1.4f * s);
+            if (cur_.on) {  // Muted: a cross instead of waves.
+                c.rt->DrawLine(D2D1::Point2F(cx + 4 * s, cy - 3 * s), D2D1::Point2F(cx + 10 * s, cy + 3 * s), c.brush, 1.4f * s);
+                c.rt->DrawLine(D2D1::Point2F(cx + 10 * s, cy - 3 * s), D2D1::Point2F(cx + 4 * s, cy + 3 * s), c.brush, 1.4f * s);
+            } else if (cur_.level > 0) {
+                c.rt->DrawLine(D2D1::Point2F(cx + 5 * s, cy - 3 * s), D2D1::Point2F(cx + 5 * s, cy + 3 * s), c.brush, 1.4f * s);
+                if (cur_.level > 50) c.rt->DrawLine(D2D1::Point2F(cx + 9 * s, cy - 6 * s), D2D1::Point2F(cx + 9 * s, cy + 6 * s), c.brush, 1.4f * s);
+            }
+        } else {
+            c.rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 3.5f * s, 3.5f * s), c.brush, 1.4f * s);
+            for (int i = 0; i < 8; i++) {
+                const float a = i * 3.14159265f / 4.0f, ca = std::cos(a), sa = std::sin(a);
+                c.rt->DrawLine(D2D1::Point2F(cx + ca * 6.0f * s, cy + sa * 6.0f * s), D2D1::Point2F(cx + ca * 8.5f * s, cy + sa * 8.5f * s), c.brush, 1.4f * s);
+            }
+        }
+        const float tl = r.left + 46.0f * s, tr = r.right - (52.0f + 12.0f * Dots()) * s, th = 6.0f * s;
+        trackL_ = tl - r.left;
+        trackR_ = tr - r.left;
+        const float frac = std::clamp(cur_.level / 100.0f, 0.0f, 1.0f);
+        col(Rgb(255, 255, 255, 0x2e));
+        c.rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(tl, cy - th / 2, tr, cy + th / 2), th / 2, th / 2), c.brush);
+        if (frac > 0) {
+            col(kFg, cur_.on ? 0.4f : 1.0f);
+            c.rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(tl, cy - th / 2, tl + std::max(th, (tr - tl) * frac), cy + th / 2), th / 2, th / 2), c.brush);
+        }
+        TextOpts o;
+        o.maxW = 40.0f * s;
+        o.maxH = 18.0f * s;
+        col(kFg, 0.8f);
+        g_text.Draw(c.rt, std::to_wstring(cur_.level), tr + 10.0f * s, cy - 9.0f * s, c.brush, o);
+        return;
+    }
 
     // Badge: app icon, or a glyph for the kind.
     const D2D1_RECT_F br = D2D1::RectF(bx, by, bx + badge, by + badge);
@@ -6955,7 +7069,7 @@ void AlertsModule::Draw(const DrawCtx& c) {
 }
 
 void AlertsModule::OnClickAlert() {
-    if (!hasCur_) return;
+    if (!hasCur_ || IsLevel()) return;  // A slider is set by pressing on it, not dismissed.
     const AItem it = cur_;
     switch (it.kind) {
         case AK::Caps:
@@ -7385,6 +7499,11 @@ LRESULT CALLBACK AlWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 LRESULT AlertsModule::Wnd(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == g_alMsgToast && g_alMsgToast) { g_alHookSeen = true; SetEvent(g_alWake); return 0; }
     if (msg == g_alMsgOsd && g_alMsgOsd) {  // lParam 1: the hook moved the popup onto the bubble, so the island yields.
+        if (lp == 2) {  // 2: the hook hid the popup; the island shows its own slider.
+            osdSeen_ = true;
+            if (g_alLevelRead) SetEvent(g_alLevelRead);
+            return 0;
+        }
         if (lp) OsdShown(true);
         else osdSeen_ = true;
         return 0;
@@ -7392,6 +7511,7 @@ LRESULT AlertsModule::Wnd(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_AL_CAPS: OnCaps(lp != 0); return 0;
         case WM_AL_PRIVACY: SetTimer(hwnd, kAlPrivacy, 250, nullptr); return 0;
+        case WM_AL_LEVEL: OnLevels(wp, lp); return 0;
         case WM_POWERBROADCAST: OnPower(); return TRUE;
         case WM_CLIPBOARDUPDATE: OnClipboard(); return 0;
         case WM_DEVICECHANGE: OnDevice(wp, lp); return TRUE;
@@ -7413,6 +7533,8 @@ void AlertsModule::Start(Services& s) {
     g_alMod = this;
     g_alStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_alWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_alLevelRead = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_alLevelSet = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_alMsgToast = RegisterWindowMessageW(L"Windhawk_TopBar_ToastShown");
     g_alMsgOsd = RegisterWindowMessageW(L"Windhawk_TopBar_Osd");
     HINSTANCE inst = GetModuleHandleW(nullptr);
@@ -7449,6 +7571,7 @@ void AlertsModule::Start(Services& s) {
     threads_.push_back(CreateThread(nullptr, 0, AlPrivacyThread, nullptr, 0, nullptr));
     threads_.push_back(CreateThread(nullptr, 0, AlBtThread, nullptr, 0, nullptr));
     threads_.push_back(CreateThread(nullptr, 0, AlNotifThread, nullptr, 0, nullptr));
+    threads_.push_back(CreateThread(nullptr, 0, AlLevelThread, nullptr, 0, nullptr));
     OnPower();
 }
 
@@ -7484,7 +7607,9 @@ void AlertsModule::Stop() {
     UnregisterClassW(kAlertsClass, GetModuleHandleW(nullptr));
     if (g_alStop) CloseHandle(g_alStop);
     if (g_alWake) CloseHandle(g_alWake);
-    g_alStop = g_alWake = nullptr;
+    if (g_alLevelRead) CloseHandle(g_alLevelRead);
+    if (g_alLevelSet) CloseHandle(g_alLevelSet);
+    g_alStop = g_alWake = g_alLevelRead = g_alLevelSet = nullptr;
 }
 
 IModule* AlertsModuleInstance() {
@@ -7504,6 +7629,134 @@ void AlertsFullscreenChanged() {
 }
 float AlertsDotsReserve() {
     return g_alMod ? 12.0f * g_alMod->Dots() : 0.0f;
+}
+
+#line 1 "alerts/levels.inc"
+// ---- Volume and brightness for the island's own slider ----
+// Read on request (tray-bridge hid the native popup: a key was pressed), set on request (the slider).
+// Its own MTA thread, so Core Audio and WMI calls never run on the UI thread.
+
+struct AlLevels {
+    Com<IAudioEndpointVolume> ep;
+    Com<IWbemServices> wmi;
+
+    void Connect() {
+        ep.Reset();
+        Com<IMMDeviceEnumerator> en;
+        Com<IMMDevice> dev;
+        if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(en.Put()))) &&
+            SUCCEEDED(en->GetDefaultAudioEndpoint(eRender, eConsole, dev.Put())))
+            dev->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(ep.Put()));
+    }
+
+    int Volume(bool* mute) {
+        Connect();  // The default device may have changed since the last press; cheap enough per press.
+        float v = 0;
+        BOOL m = FALSE;
+        if (!ep || FAILED(ep->GetMasterVolumeLevelScalar(&v))) return -1;
+        ep->GetMute(&m);
+        *mute = m != FALSE;
+        return (int)std::lround(v * 100.0f);
+    }
+
+    bool Wmi() {
+        if (wmi) return true;
+        Com<IWbemLocator> loc;
+        if (FAILED(CoCreateInstance(CLSID_WbemLocator, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(loc.Put())))) return false;
+        BSTR ns = SysAllocString(L"ROOT\\WMI");
+        const HRESULT hr = loc->ConnectServer(ns, nullptr, nullptr, nullptr, 0, nullptr, nullptr, wmi.Put());
+        SysFreeString(ns);
+        if (FAILED(hr)) return false;
+        CoSetProxyBlanket(wmi.Get(), RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE);
+        return true;
+    }
+
+    // First instance of a class. Brightness exists on the internal panel only (a desktop gets -1).
+    bool First(const wchar_t* query, Com<IWbemClassObject>& out) {
+        if (!Wmi()) return false;
+        BSTR lang = SysAllocString(L"WQL"), q = SysAllocString(query);
+        Com<IEnumWbemClassObject> en;
+        const HRESULT hr = wmi->ExecQuery(lang, q, WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, nullptr, en.Put());
+        SysFreeString(lang);
+        SysFreeString(q);
+        ULONG n = 0;
+        return SUCCEEDED(hr) && en && SUCCEEDED(en->Next(2000, 1, out.Put(), &n)) && n == 1;
+    }
+
+    int Brightness() {
+        Com<IWbemClassObject> o;
+        if (!First(L"SELECT CurrentBrightness FROM WmiMonitorBrightness WHERE Active=TRUE", o)) return -1;
+        VARIANT v;
+        VariantInit(&v);
+        int r = -1;
+        if (SUCCEEDED(o->Get(L"CurrentBrightness", 0, &v, nullptr, nullptr))) r = v.vt == VT_UI1 ? v.bVal : v.vt == VT_I4 ? v.lVal : -1;
+        VariantClear(&v);
+        return r;
+    }
+
+    void SetBrightness(int pct) {
+        Com<IWbemClassObject> inst;
+        if (!First(L"SELECT * FROM WmiMonitorBrightnessMethods WHERE Active=TRUE", inst)) return;
+        VARIANT path;
+        VariantInit(&path);
+        if (FAILED(inst->Get(L"__PATH", 0, &path, nullptr, nullptr)) || path.vt != VT_BSTR) { VariantClear(&path); return; }
+        Com<IWbemClassObject> cls, def, args;
+        BSTR clsName = SysAllocString(L"WmiMonitorBrightnessMethods"), method = SysAllocString(L"WmiSetBrightness");
+        if (SUCCEEDED(wmi->GetObject(clsName, 0, nullptr, cls.Put(), nullptr)) &&
+            SUCCEEDED(cls->GetMethod(method, 0, def.Put(), nullptr)) && def && SUCCEEDED(def->SpawnInstance(0, args.Put()))) {
+            VARIANT t, b;
+            VariantInit(&t);
+            t.vt = VT_I4;
+            t.lVal = 0;
+            VariantInit(&b);
+            b.vt = VT_UI1;
+            b.bVal = (BYTE)std::clamp(pct, 0, 100);
+            args->Put(L"Timeout", 0, &t, 0);
+            args->Put(L"Brightness", 0, &b, 0);
+            wmi->ExecMethod(path.bstrVal, method, 0, nullptr, args.Get(), nullptr, nullptr);
+        }
+        SysFreeString(clsName);
+        SysFreeString(method);
+        VariantClear(&path);
+    }
+};
+
+DWORD WINAPI AlLevelThread(void*) {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    {
+        AlLevels lv;
+        HANDLE waits[] = {g_alStop, g_alLevelRead, g_alLevelSet};
+        auto post = [&] {
+            bool mute = false;
+            const int vol = lv.Volume(&mute);
+            const int bright = lv.Brightness();
+            if (HWND h = g_alHwnd.load()) PostMessageW(h, WM_AL_LEVEL, (WPARAM)(vol & 0xFFFF) | (mute ? 0x10000 : 0), (LPARAM)bright);
+        };
+        post();  // Baseline, so the first key press can be told apart.
+        for (;;) {
+            const DWORD w = WaitForMultipleObjects(3, waits, FALSE, INFINITE);
+            if (w == WAIT_OBJECT_0 + 1) {
+                post();
+                // The popup can show before the new brightness is readable: look once more.
+                if (WaitForSingleObject(g_alStop, 300) == WAIT_OBJECT_0) break;
+                post();
+            } else if (w == WAIT_OBJECT_0 + 2) {
+                const int v = g_alSetVolume.exchange(-1), b = g_alSetBright.exchange(-1);
+                if (v >= 0) {
+                    lv.Connect();
+                    if (lv.ep) {
+                        lv.ep->SetMute(FALSE, nullptr);
+                        lv.ep->SetMasterVolumeLevelScalar(v / 100.0f, nullptr);
+                    }
+                }
+                if (b >= 0) lv.SetBrightness(b);
+            } else {
+                break;
+            }
+        }
+    }
+    CoUninitialize();
+    return 0;
 }
 
 #line 1 "bar/window.inc"
