@@ -56,6 +56,8 @@ std::vector<ModuleTimer> g_moduleTimers;
 
 float Clamp01(float v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
 
+std::vector<IModule*> g_lastDashes;  // The page list as of the last IslandRecompute.
+
 std::vector<IModule*> Dashboards() {
     std::vector<IModule*> out;
     for (IModule* m : g_modules) if (m->HasDashboard()) out.push_back(m);
@@ -108,6 +110,12 @@ void IslandRecompute() {
     g_alerts.erase(std::remove_if(g_alerts.begin(), g_alerts.end(), [&](const AlertItem& a) { return a.expires && a.expires <= now; }),
                    g_alerts.end());
     const std::vector<IModule*> dashes = Dashboards();
+    // Pages come and go (media only has one while something plays): keep the tab on the same page, not the same index.
+    if (g_expanded && g_tab < (int)g_lastDashes.size()) {
+        const auto it = std::find(dashes.begin(), dashes.end(), g_lastDashes[g_tab]);
+        if (it != dashes.end()) g_tab = (int)(it - dashes.begin());
+    }
+    g_lastDashes = dashes;
     if (g_tab >= (int)dashes.size()) g_tab = std::max(0, (int)dashes.size() - 1);
 
     IState state = IState::Collapsed;
@@ -525,8 +533,9 @@ void Services::KillTimer(IModule* m) {
 void Services::Relayout() { IslandRecompute(); }
 
 void Services::Expand(IModule* m, int ms) {
-    if (!g_isHwnd || g_fullscreen || g_covered) return;
+    if (!g_isHwnd || g_fullscreen || g_covered || !g_alerts.empty()) return;  // An alert owns the island; do not cover it.
     const std::vector<IModule*> dashes = Dashboards();
+    g_lastDashes = dashes;
     int idx = -1;
     for (size_t i = 0; i < dashes.size(); i++) if (dashes[i] == m) idx = (int)i;
     if (idx < 0) return;

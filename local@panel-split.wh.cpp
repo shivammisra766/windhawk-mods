@@ -109,7 +109,6 @@ const wchar_t* const kToastTitles[] = {
 };
 constexpr DWORD kToastTickMaxMs = 45000;
 UINT g_toastMessage = 0;
-int g_toastLogs = 0;
 
 bool IsToastWindow(HWND hwnd) {
     wchar_t cls[64] = {};
@@ -154,7 +153,6 @@ BOOL WINAPI SetWindowPos_Hook(HWND hwnd, HWND after, int x, int y, int cx, int c
     if (!(flags & SWP_HIDEWINDOW) && IsToastWindow(hwnd)) {
         HWND bar = FindWindowW(L"WindhawkTopBar", nullptr);
         const bool hide = BarWantsToastsHidden(bar);
-        if (g_toastLogs++ < 20) Wh_Log(L"toast window %p pos (%d,%d) flags %x hide=%d", hwnd, x, y, flags, hide);
         if (hide) {
             x = -32000;
             y = -32000;
@@ -181,8 +179,7 @@ int WINAPI SetWindowRgn_Hook(HWND hwnd, HRGN region, BOOL redraw) {
     if (region && PanelHiddenByBar(hwnd)) {
         if (HRGN empty = CreateRectRgn(0, 0, 0, 0)) {
             DeleteObject(region);
-            region = empty;
-            Wh_Log(L"cold panel clip hidden");
+            region = empty;
             return g_originalSetWindowRgn(hwnd, region, redraw);
         }
     }

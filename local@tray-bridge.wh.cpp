@@ -169,7 +169,6 @@ struct FRect { float x, y, w, h; };
 using GetPositionRect_t = FRect* (*)(void* self, FRect* result, const FRect* input);
 GetPositionRect_t g_originalGetPositionRect = nullptr;
 UINT g_osdMessage = 0;
-int g_osdCalls = 0;
 
 FRect* GetPositionRect_Hook(void* self, FRect* result, const FRect* input) {
     FRect* ret = g_originalGetPositionRect(self, result, input);
@@ -197,10 +196,6 @@ FRect* GetPositionRect_Hook(void* self, FRect* result, const FRect* input) {
                 out->h = (b - t) / scale;
                 placed = true;
             }
-        }
-        if (g_osdCalls++ < 60) {
-            Wh_Log(L"GetPositionRect in=(%.1f,%.1f,%.1f,%.1f) orig=(%.1f,%.1f,%.1f,%.1f) out=(%.1f,%.1f,%.1f,%.1f) scale=%.2f placed=%d",
-                   in.x, in.y, in.w, in.h, before.x, before.y, before.w, before.h, out->x, out->y, out->w, out->h, scale, placed);
         }
     }
     if (alerts) PostMessageW(alerts, g_osdMessage, 1, placed ? 1 : 0);

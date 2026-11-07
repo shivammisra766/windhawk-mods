@@ -247,7 +247,6 @@ private:
     HWINEVENTHOOK osdHook_ = nullptr;
     std::vector<HANDLE> threads_;
     RECT lastGeo_{};
-    int osdLogs_ = 0;
     ULONGLONG lastCaps_ = 0;
     // Bluetooth worker state.
     std::mutex btLock_;
@@ -1043,10 +1042,6 @@ void CALLBACK AlOsdEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG object, LON
     GetWindowRect(hwnd, &r);
     if (r.right - r.left > 700 || r.bottom - r.top > 300 || r.right <= r.left) return;  // Not the fullscreen-sized host.
     AlertsModule& m = *g_alMod;
-    if (m.osdLogs_++ < 40) {
-        Wh_Log(L"alerts: XamlExplorerHostIslandWindow %s rect %ld,%ld-%ld,%ld (%ldx%ld) dpi %u", event == EVENT_OBJECT_SHOW ? L"SHOW" : L"HIDE",
-               r.left, r.top, r.right, r.bottom, r.right - r.left, r.bottom - r.top, GetDpiForWindow(hwnd));
-    }
     if (event == EVENT_OBJECT_SHOW) m.OsdShown(false);
     else m.OsdHidden();
 }
