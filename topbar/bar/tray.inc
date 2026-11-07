@@ -12,7 +12,7 @@ TrayIcon* FindTrayIcon(const BarTrayMessage& m, HWND hwnd) {
 void RemoveDeadTrayIcons() {
     for (size_t i = g_tray.size(); i-- > 0;) {
         if (!IsWindow(g_tray[i].hwnd)) {
-            delete g_tray[i].bitmap;
+            delete g_tray[i].pix;
             g_tray.erase(g_tray.begin() + i);
         }
     }
@@ -28,7 +28,7 @@ void OnTrayMessage(const BarTrayMessage& m) {
     TrayIcon* icon = FindTrayIcon(m, hwnd);
     if (m.message == NIM_DELETE) {
         if (icon) {
-            delete icon->bitmap;
+            delete icon->pix;
             g_tray.erase(g_tray.begin() + (icon - g_tray.data()));
         }
     } else if (m.message == NIM_ADD || m.message == NIM_MODIFY || m.message == NIM_SETVERSION) {
@@ -38,6 +38,7 @@ void OnTrayMessage(const BarTrayMessage& m) {
             }
             g_tray.emplace_back();
             icon = &g_tray.back();
+            icon->uid = ++g_trayUid;
         }
         if (hwnd) {
             icon->hwnd = hwnd;
@@ -58,16 +59,16 @@ void OnTrayMessage(const BarTrayMessage& m) {
             icon->hidden = (m.state & NIS_HIDDEN) != 0;
         }
         if ((m.flags & NIF_ICON) && m.icon) {
-            if (Bitmap* bitmap = BitmapFromIcon(reinterpret_cast<HICON>((UINT_PTR)m.icon))) {
-                delete icon->bitmap;
-                icon->bitmap = bitmap;
+            if (Pixmap* bitmap = PixmapFromIcon(reinterpret_cast<HICON>((UINT_PTR)m.icon))) {
+                delete icon->pix;
+                icon->pix = bitmap;
             }
         }
     } else {
         return;
     }
     RemoveDeadTrayIcons();
-    Paint();
+    InvalidateAll();
 }
 
 // Passes a click to the app in the form it asked for, as the taskbar would.
@@ -78,7 +79,7 @@ void ClickTrayIcon(int index, bool rightButton) {
     const TrayIcon icon = g_tray[index];
     if (!IsWindow(icon.hwnd) || !icon.callback) {
         RemoveDeadTrayIcons();
-        Paint();
+        InvalidateAll();
         return;
     }
     DWORD pid = 0;

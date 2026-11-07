@@ -4,13 +4,12 @@ core/anim.inc
 core/types.inc
 core/icons.inc
 core/geometry.inc
-core/layered.inc
+core/surface.inc
 core/text.inc
 core/settings.inc
 core/loc.inc
-bar/readers.inc
-core/surface.inc
-bar/bubbles.inc
+bar/state.inc
+bar/render.inc
 bar/placement.inc
 bar/panels.inc
 bar/tray.inc

@@ -42,9 +42,17 @@ void UpdateFullscreen() {
     g_fullscreen = fullscreen;
     if (fullscreen) {
         ShowWindow(g_hwnd, SW_HIDE);
+        // Forget the pointer and a half-open pill, so it does not come back expanded.
+        g_tracking = false;
+        g_hoverId = H_none;
+        g_pillTarget = false;
+        g_pillT = 0.0f;
+        g_pillSpring.Snap(0.0f);
+        g_clock.Sleep();
+        g_lastFrame = 0;
     } else {
         PlaceBar();
-        Paint();
+        InvalidateAll();
     }
 }
 

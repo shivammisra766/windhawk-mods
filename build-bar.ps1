@@ -1,10 +1,10 @@
 param([ValidateSet('both','32','64')][string]$Arch = 'both', [switch]$CheckOnly)
 $s = $PSScriptRoot
 # Version and serial live on this line only; the header, the DLL name and the defines take them from here.
-$id = 'local@top-bar'; $ver = '2.1'; $serial = '300021'
+$id = 'local@top-bar'; $ver = '3.0'; $serial = '300030'
 $utf8 = New-Object Text.UTF8Encoding($false)
 # One library list, used for the generated @compilerOptions and for the clang call.
-$libs = @('-lgdiplus','-lgdi32','-luser32','-lshell32','-ladvapi32','-lole32','-lversion','-lwininet','-liphlpapi','-luuid','-ld2d1','-ldwrite','-lwindowscodecs','-ldwmapi')
+$libs = @('-lgdi32','-luser32','-lshell32','-ladvapi32','-lole32','-lversion','-lwininet','-liphlpapi','-luuid','-ld2d1','-ldwrite','-lwindowscodecs','-ldwmapi')
 
 # Unity build: topbar\manifest.txt lists the files, each preceded by a #line so errors name the real file.
 $src = "$s\topbar"
@@ -102,9 +102,10 @@ foreach ($a in $archs) {
   if (-not $CheckOnly -and (Test-Path $dll)) { Remove-Item $dll }
   $cargs = @('-std=c++23','-O2','-DUNICODE','-D_UNICODE','-DWINVER=0x0A00','-D_WIN32_WINNT=0x0A00','-D_WIN32_IE=0x0A00','-DNTDDI_VERSION=0x0A000008','-D__USE_MINGW_ANSI_STDIO=0','-DWH_MOD',
     ('"-DWH_MOD_ID=L\"' + $id + '\""'), ('"-DWH_MOD_VERSION=L\"' + $ver + '\""'),
+    $(if ($CheckOnly) { '' } else { '-shared "' + $lib + '"' }),
     '-x','c++','-','-include','windhawk_api.h','-target',$a.target)
   if ($CheckOnly) { $cargs += '-fsyntax-only' }
-  else { $cargs += @('-shared', ('"' + $lib + '"'), '-Wl,--export-all-symbols', '-o', ('"' + $dll + '"')) + $libs }
+  else { $cargs += @('-Wl,--export-all-symbols', '-o', ('"' + $dll + '"')) + $libs }
   $psi = New-Object Diagnostics.ProcessStartInfo
   $psi.FileName = "$comp\bin\clang++.exe"; $psi.Arguments = ($cargs -join ' '); $psi.WorkingDirectory = $comp
   $psi.UseShellExecute = $false; $psi.RedirectStandardInput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardOutput = $true

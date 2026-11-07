@@ -7,7 +7,6 @@
 #include <shellapi.h>
 #include <sddl.h>
 #include <wininet.h>
-#include <gdiplus.h>
 #include <d2d1.h>
 #include <dwrite.h>
 #include <wincodec.h>
@@ -30,4 +29,3 @@ extern "C" DWORD WINAPI CancelMibChangeNotify2(HANDLE handle);
 
 namespace {
 
-using namespace Gdiplus;

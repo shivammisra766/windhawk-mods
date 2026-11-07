@@ -72,6 +72,32 @@ int HitIndexAt(POINT p) {
     return -1;
 }
 
+int HitIdAt(POINT p) {
+    const int index = HitIndexAt(p);
+    return index < 0 ? H_none : g_hits[index].id;
+}
+
+RECT HitRectById(int id) {
+    for (const Hit& h : g_hits) {
+        if (h.id == id && id != H_none) {
+            RECT r = h.rect;
+            InflateRect(&r, 2, 2);
+            return r;
+        }
+    }
+    return RECT{};
+}
+
+// Hover follows stable ids, and only the old and new highlight are redrawn.
+void SetHover(int id) {
+    if (id == g_hoverId) {
+        return;
+    }
+    Invalidate(HitRectById(g_hoverId));
+    g_hoverId = id;
+    Invalidate(HitRectById(id));
+}
+
 void SetPillTarget(bool expanded) {
     if (expanded == g_pillTarget) {
         return;
@@ -98,17 +124,14 @@ void StepPill() {
         g_clock.Sleep();
         g_lastFrame = 0;
     }
+    InvalidateLayout();  // Paint adds the pill and whatever it pushed aside.
     Paint();
     if (g_tracking) {
         // The hit list moved with the pill: resync hover against the new layout.
         POINT p;
         GetCursorPos(&p);
         ScreenToClient(g_hwnd, &p);
-        const int index = HitIndexAt(p);
-        if (index != g_hoverIndex) {
-            g_hoverIndex = index;
-            Paint();
-        }
+        SetHover(HitIdAt(p));
         SetPillTarget(PtInRect(&g_pillRect, p));
     }
 }
@@ -139,7 +162,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         g_registered = false;
         RegisterBar();
-        Paint();
+        InvalidateAll();
         return 0;
     }
     switch (msg) {
@@ -151,17 +174,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             POINT p{(short)LOWORD(lp), (short)HIWORD(lp)};
             SetPillTarget(PtInRect(&g_pillRect, p));
-            const int index = HitIndexAt(p);
-            if (index != g_hoverIndex) {
-                g_hoverIndex = index;
-                Paint();
-            }
+            SetHover(HitIdAt(p));
             return 0;
         }
         case WM_MOUSELEAVE:
             g_tracking = false;
-            g_hoverIndex = -1;
+            SetHover(H_none);
             SetPillTarget(false);
+            return 0;
+        case WM_APP_PAINT:
             Paint();
             return 0;
         case WM_MOUSEACTIVATE:
@@ -185,7 +206,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 } else {
                     RunAction(g_hits[index].action);
                 }
-                Paint();
+                InvalidateAll();
             }
             return 0;
         }
@@ -217,7 +238,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_APPBAR_CB:
             if (wp == ABN_POSCHANGED) {
                 PlaceBar();
-                Paint();
+                InvalidateAll();
             } else if (wp == ABN_FULLSCREENAPP) {
                 g_abnFullscreen = lp != 0;
                 UpdateFullscreen();
@@ -228,17 +249,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_POWERBROADCAST:
             ReadBattery();
             ArmClock();
-            Paint();
+            InvalidateAll();
             return TRUE;
         case WM_TIMER:
             if (wp == kClockTimer) {
                 ArmClock();
-                Paint();
+                InvalidateAll();
             } else if (wp == kTitleTimer) {
                 KillTimer(hwnd, kTitleTimer);
                 g_titlePending = false;
                 ReadForeground();
-                Paint();
+                InvalidateAll();
                 StepPill();
             } else if (wp == kPanelTimer) {
                 StepPanelFollow();
@@ -304,18 +325,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_TIMECHANGE:
             ArmClock();
-            Paint();
+            InvalidateAll();
             return 0;
         case WM_REFRESH_NET:
             ReadNetwork();
-            Paint();
+            InvalidateAll();
             return 0;
         case WM_APP_FRAME:
             StepPill();
             return 0;
         case WM_APP_SETTINGS:
             g_settings = LoadSettings();
-            Paint();
+            InvalidateAll();
             return 0;
         case WM_REFRESH_TITLE:
             if (!g_titlePending) {
@@ -326,17 +347,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_REFRESH_FOREGROUND:
             RehookTitle();
             ReadForeground();
-            Paint();
+            InvalidateAll();
             return 0;
         case WM_SETTINGCHANGE:
             ReadAccent();
             ReadForeground();
-            Paint();
+            InvalidateAll();
             return 0;
         case WM_DISPLAYCHANGE:
         case WM_DPICHANGED:
             PlaceBar();
-            Paint();
+            InvalidateAll();
             return 0;
         case WM_CLOSE:
             DestroyWindow(hwnd);
@@ -345,6 +366,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RemovePropW(hwnd, L"TopBarAnchorX");
             RemovePropW(hwnd, L"TopBarAnchorTick");
             UnregisterBar();
+            g_hwnd = nullptr;
             PostQuitMessage(0);
             return 0;
     }
@@ -354,8 +376,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 DWORD WINAPI BarThread(void*) {
     SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    GdiplusStartupInput gdiInput;
-    GdiplusStartup(&g_gdiplusToken, &gdiInput, nullptr);
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = WndProc;
@@ -394,7 +414,7 @@ DWORD WINAPI BarThread(void*) {
 
     RegisterBar();
     ArmClock();
-    Paint();
+    InvalidateAll();
 
     // Apps add their tray icons again when told the taskbar is new, and the bridge sees that.
     g_trayBroadcastTick = GetTickCount64();
@@ -417,14 +437,10 @@ DWORD WINAPI BarThread(void*) {
     delete g_appIcon;
     g_appIcon = nullptr;
     for (auto& icon : g_tray) {
-        delete icon.bitmap;
+        delete icon.pix;
     }
     g_tray.clear();
-    for (GraphicsPath* path : g_iconPaths) {
-        delete path;
-    }
-    g_iconPaths.clear();
-    GdiplusShutdown(g_gdiplusToken);
+    ReleaseGfx();
     CoUninitialize();
     return 0;
 }

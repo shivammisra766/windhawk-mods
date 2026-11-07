@@ -1,11 +1,11 @@
 // ==WindhawkMod==
 // @id              top-bar
 // @name            Top bar
-// @description     Top bar in the Seelen toolbar style with a built-in pill
-// @version         2.1
+// @description     Top bar with three bubbles in the Seelen toolbar style, drawn with Direct2D
+// @version         3.0
 // @author          local
 // @include         windhawk.exe
-// @compilerOptions -lgdiplus -lgdi32 -luser32 -lshell32 -ladvapi32 -lole32 -lversion -lwininet -liphlpapi -luuid -ld2d1 -ldwrite -lwindowscodecs -ldwmapi
+// @compilerOptions -lgdi32 -luser32 -lshell32 -ladvapi32 -lole32 -lversion -lwininet -liphlpapi -luuid -ld2d1 -ldwrite -lwindowscodecs -ldwmapi
 // ==/WindhawkMod==
 // ==WindhawkModSettings==
 /*
@@ -30,7 +30,6 @@
 #include <shellapi.h>
 #include <sddl.h>
 #include <wininet.h>
-#include <gdiplus.h>
 #include <d2d1.h>
 #include <dwrite.h>
 #include <wincodec.h>
@@ -53,7 +52,6 @@ extern "C" DWORD WINAPI CancelMibChangeNotify2(HANDLE handle);
 
 namespace {
 
-using namespace Gdiplus;
 
 #line 1 "core/com.inc"
 
@@ -173,7 +171,6 @@ private:
 
 #line 1 "core/types.inc"
 
-
 constexpr wchar_t kClassName[] = L"WindhawkTopBar";
 constexpr UINT WM_APPBAR_CB = WM_APP + 1;
 constexpr UINT WM_REFRESH_NET = WM_APP + 3;
@@ -182,6 +179,7 @@ constexpr UINT WM_PROFILE_DONE = WM_APP + 5;  // From start-menu-pop. wParam 1: 
 constexpr UINT WM_REFRESH_TITLE = WM_APP + 6;
 constexpr UINT WM_APP_FRAME = WM_APP + 10;     // From the frame clock thread: one per display frame while animating.
 constexpr UINT WM_APP_SETTINGS = WM_APP + 11;  // From the settings callback, which runs on another thread.
+constexpr UINT WM_APP_PAINT = WM_APP + 12;     // Coalesced repaint request.
 constexpr UINT_PTR kClockTimer = 1;
 constexpr UINT_PTR kTitleTimer = 2;  // Coalesces title changes.
 constexpr UINT_PTR kPanelTimer = 3;
@@ -214,32 +212,42 @@ constexpr WPARAM kPanelCalendar = 2;
 constexpr float kItem = 16.0f;
 constexpr float kItemPad = 4.0f;
 constexpr float kBarH = 32.0f;
-constexpr float kBarPadX = 16.0f;
 constexpr float kGap = 4.0f;
 constexpr float kItemRadius = 4.8f;
 constexpr float kFontSize = 12.8f;
-constexpr float kPillH = 24.0f;
+constexpr float kPillH = 24.0f;  // Height of all three bubbles.
 constexpr float kPillPadX = 12.0f;
 constexpr float kPillButton = 20.0f;
-constexpr int kPillAnimMs = 200;
+constexpr float kBubbleMargin = 8.0f;  // Between a side bubble and the screen edge.
+constexpr float kBubblePad = 8.0f;     // Inside a side bubble, before the first item.
+constexpr float kBubbleClear = 12.0f;  // Least gap between the left bubble and the centre one.
 constexpr float kPanelGap = 8.0f;  // Between the bar and a native panel.
 constexpr float kPanelEdge = 8.0f;  // Keeps a panel this far from the screen edge.
 constexpr float kPanelDrop = 10.0f;  // A panel drops this far into place as it opens.
 constexpr int kPanelDropMs = 140;
 constexpr int kPanelAnchorMs = 1500;  // A click anchors the panel it opens for this long.
 
-// Seelen's dark tokens: gray-50 at 90%, gray-900.
-const Color kBarBg(230, 24, 24, 24);
-const Color kFg(255, 228, 228, 228);
+D2D1_COLOR_F Rgb(int r, int g, int b, int a = 255) {
+    return D2D1::ColorF(r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
+}
+
+// Side bubbles are a little see-through, the centre one is solid. Text is Seelen's gray.
+const D2D1_COLOR_F kSideBg = Rgb(0x10, 0x10, 0x10, 0xDC);
+const D2D1_COLOR_F kCentreBg = Rgb(0x10, 0x10, 0x10);
+const D2D1_COLOR_F kFg = Rgb(228, 228, 228);
 
 const GUID kGuidBatteryPercent = {0xA7AD8041, 0xB45A, 0x4CAE, {0x87, 0xA3, 0xEE, 0xCB, 0xB4, 0x68, 0xA9, 0xE1}};
 const GUID kGuidAcDc = {0x5D3E9A59, 0xE9D5, 0x4B00, {0xA6, 0xBD, 0xFF, 0x34, 0xFF, 0x51, 0x65, 0x48}};
 
 enum class Action { None, QuickSettings, Wifi, Bluetooth, TrayIcon, Notifications, Calendar, Profile };
 
+// Stable ids for hover, so a list that changes under the pointer doesn't move the highlight.
+enum HitId { H_none = 0, H_profile = 1, H_settings, H_battery, H_wifi, H_bluetooth, H_bell, H_calendar, H_trayBase = 1000 };
+
 struct Hit {
     RECT rect;
     Action action;
+    int id = 0;
     int data = 0;
 };
 
@@ -251,13 +259,13 @@ struct TrayIcon {
     UINT callback = 0;
     UINT version = 0;
     bool hidden = false;
-    Bitmap* bitmap = nullptr;
+    int uid = 0;  // Stable for the life of the icon.
+    Pixmap* pix = nullptr;
 };
 
 HWND g_hwnd = nullptr;
 HANDLE g_thread = nullptr;
 DWORD g_threadId = 0;
-ULONG_PTR g_gdiplusToken = 0;
 UINT g_taskbarCreated = 0;
 bool g_registered = false;
 bool g_tracking = false;
@@ -273,14 +281,12 @@ ULONGLONG g_anchorTick = 0;
 ULONGLONG g_panelOpenTick = 0;
 HWND g_notificationPanel = nullptr;
 int g_regionTop[3] = {};  // Clip top last seen for each mode, to place the panel before it opens.
-int g_hoverIndex = -1;
+int g_hoverId = H_none;
 std::vector<Hit> g_hits;
 
-// Pill animation: g_pillT runs from 0 (clock only) to 1 (buttons shown).
+// Pill animation: g_pillT runs from 0 (clock only) to 1 (buttons shown), driven by a spring.
 float g_pillT = 0.0f;
-float g_pillFrom = 0.0f;
 bool g_pillTarget = false;
-ULONGLONG g_pillStart = 0;
 RECT g_pillRect{};
 
 HWINEVENTHOOK g_foregroundHook = nullptr;
@@ -293,14 +299,15 @@ double g_lastFrame = 0;
 HANDLE g_netNotify = nullptr;
 HPOWERNOTIFY g_powerA = nullptr;
 HPOWERNOTIFY g_powerB = nullptr;
-Bitmap* g_avatar = nullptr;
-Bitmap* g_appIcon = nullptr;
+Pixmap* g_avatar = nullptr;
+std::wstring g_avatarPath;
+int g_avatarPx = 0;  // Size the avatar was last scaled to; 0 when it was not tried yet.
+Pixmap* g_appIcon = nullptr;
 std::wstring g_appIconPath;
-std::vector<GraphicsPath*> g_iconPaths;
 
 std::wstring g_appName;
 std::wstring g_title;
-Color g_accentBase(255, 0, 120, 212);
+BYTE g_accent[3] = {0, 120, 212};
 int g_battery = -1;
 bool g_charging = false;
 bool g_connected = true;
@@ -318,6 +325,7 @@ int g_reopenTries = 0;
 int g_reopenStage = 0;
 int g_reopenOpens = 0;
 std::vector<TrayIcon> g_tray;
+int g_trayUid = 0;
 ULONGLONG g_trayBroadcastTick = 0;
 
 float Scale() {
@@ -342,210 +350,6 @@ const IconDef kIcons[] = {
     {256.0f, 256.0f, 1, {{true, 0.0f, "M256,96v64a8,8,0,0,1-16,0V96a8,8,0,0,1,16,0ZM224,80v96a24,24,0,0,1-24,24H32A24,24,0,0,1,8,176V80A24,24,0,0,1,32,56H200A24,24,0,0,1,224,80Zm-16,0a8,8,0,0,0-8-8H32a8,8,0,0,0-8,8v96a8,8,0,0,0,8,8H200a8,8,0,0,0,8-8Zm-92,52a8,8,0,0,0,8-8V96a8,8,0,0,0-16,0v28A8,8,0,0,0,116,132Zm0,12a12,12,0,1,0,12,12A12,12,0,0,0,116,144Z"}}},
     {16.0f, 16.0f, 1, {{true, 0.0f, "M11.251.068a.5.5 0 0 1 .227.58L9.677 6.5H13a.5.5 0 0 1 .364.843l-8 8.5a.5.5 0 0 1-.842-.49L6.323 9.5H3a.5.5 0 0 1-.364-.843l8-8.5a.5.5 0 0 1 .615-.09z"}}},
 };
-
-
-// ---- SVG path data to GDI+ ----
-
-struct PathReader {
-    const char* p;
-    void Skip() {
-        while (*p == ' ' || *p == ',' || *p == '\n' || *p == '\r' || *p == '\t') p++;
-    }
-    bool HasNumber() {
-        Skip();
-        return *p == '-' || *p == '+' || *p == '.' || (*p >= '0' && *p <= '9');
-    }
-    float Num() {
-        Skip();
-        char* end = nullptr;
-        float v = strtof(p, &end);
-        p = end;
-        return v;
-    }
-    float Flag() {
-        Skip();
-        return *p++ == '1' ? 1.0f : 0.0f;
-    }
-};
-
-void AddArc(GraphicsPath& out, float x0, float y0, float rx, float ry, float rot, bool large, bool sweep, float x1,
-            float y1) {
-    if (rx == 0 || ry == 0) {
-        out.AddLine(x0, y0, x1, y1);
-        return;
-    }
-    const double pi = 3.14159265358979323846;
-    double phi = rot * pi / 180.0, c = cos(phi), s = sin(phi);
-    double dx = (x0 - x1) / 2.0, dy = (y0 - y1) / 2.0;
-    double xp = c * dx + s * dy, yp = -s * dx + c * dy;
-    double a = fabs(rx), b = fabs(ry);
-    double l = xp * xp / (a * a) + yp * yp / (b * b);
-    if (l > 1) {
-        a *= sqrt(l);
-        b *= sqrt(l);
-    }
-    double num = a * a * b * b - a * a * yp * yp - b * b * xp * xp;
-    double den = a * a * yp * yp + b * b * xp * xp;
-    double k = den == 0 ? 0 : sqrt(fmax(0.0, num / den)) * (large == sweep ? -1 : 1);
-    double cxp = k * a * yp / b, cyp = -k * b * xp / a;
-    double cx = c * cxp - s * cyp + (x0 + x1) / 2.0, cy = s * cxp + c * cyp + (y0 + y1) / 2.0;
-    double t1 = atan2((yp - cyp) / b, (xp - cxp) / a);
-    double t2 = atan2((-yp - cyp) / b, (-xp - cxp) / a);
-    double delta = t2 - t1;
-    if (sweep && delta < 0) delta += 2 * pi;
-    if (!sweep && delta > 0) delta -= 2 * pi;
-    int segments = (int)ceil(fabs(delta) / (pi / 2.0) - 1e-6);
-    if (segments < 1) segments = 1;
-    double step = delta / segments, h = 4.0 / 3.0 * tan(step / 4.0);
-    double px = x0, py = y0;
-    for (int i = 0; i < segments; i++) {
-        double e1 = t1 + i * step, e2 = e1 + step;
-        double c1x = cos(e1) - h * sin(e1), c1y = sin(e1) + h * cos(e1);
-        double c2x = cos(e2) + h * sin(e2), c2y = sin(e2) - h * cos(e2);
-        auto mapX = [&](double u, double v) { return (float)(cx + c * a * u - s * b * v); };
-        auto mapY = [&](double u, double v) { return (float)(cy + s * a * u + c * b * v); };
-        float ex = mapX(cos(e2), sin(e2)), ey = mapY(cos(e2), sin(e2));
-        out.AddBezier((float)px, (float)py, mapX(c1x, c1y), mapY(c1x, c1y), mapX(c2x, c2y), mapY(c2x, c2y), ex, ey);
-        px = ex;
-        py = ey;
-    }
-}
-
-GraphicsPath* ParseSvgPath(const char* d) {
-    auto* out = new GraphicsPath(FillModeWinding);
-    PathReader r{d};
-    float x = 0, y = 0, sx = 0, sy = 0, cx = 0, cy = 0;
-    char cmd = 0, prev = 0;
-    for (;;) {
-        r.Skip();
-        if (!*r.p) break;
-        if ((*r.p >= 'a' && *r.p <= 'z') || (*r.p >= 'A' && *r.p <= 'Z')) {
-            cmd = *r.p++;
-        }
-        const bool rel = cmd >= 'a';
-        const float bx = rel ? x : 0, by = rel ? y : 0;
-        switch (cmd | 0x20) {
-            case 'm': {
-                x = bx + r.Num();
-                y = by + r.Num();
-                sx = x;
-                sy = y;
-                out->StartFigure();
-                cmd = rel ? 'l' : 'L';
-                prev = 'm';
-                continue;
-            }
-            case 'l': {
-                float nx = bx + r.Num(), ny = by + r.Num();
-                out->AddLine(x, y, nx, ny);
-                x = nx;
-                y = ny;
-                break;
-            }
-            case 'h': {
-                float nx = bx + r.Num();
-                out->AddLine(x, y, nx, y);
-                x = nx;
-                break;
-            }
-            case 'v': {
-                float ny = by + r.Num();
-                out->AddLine(x, y, x, ny);
-                y = ny;
-                break;
-            }
-            case 'c': {
-                float x1 = bx + r.Num(), y1 = by + r.Num();
-                float x2 = bx + r.Num(), y2 = by + r.Num();
-                float nx = bx + r.Num(), ny = by + r.Num();
-                out->AddBezier(x, y, x1, y1, x2, y2, nx, ny);
-                cx = x2;
-                cy = y2;
-                x = nx;
-                y = ny;
-                prev = 'c';
-                continue;
-            }
-            case 's': {
-                float x1 = prev == 'c' ? 2 * x - cx : x, y1 = prev == 'c' ? 2 * y - cy : y;
-                float x2 = bx + r.Num(), y2 = by + r.Num();
-                float nx = bx + r.Num(), ny = by + r.Num();
-                out->AddBezier(x, y, x1, y1, x2, y2, nx, ny);
-                cx = x2;
-                cy = y2;
-                x = nx;
-                y = ny;
-                prev = 'c';
-                continue;
-            }
-            case 'q': {
-                float qx = bx + r.Num(), qy = by + r.Num();
-                float nx = bx + r.Num(), ny = by + r.Num();
-                out->AddBezier(x, y, x + 2.0f / 3.0f * (qx - x), y + 2.0f / 3.0f * (qy - y),
-                               nx + 2.0f / 3.0f * (qx - nx), ny + 2.0f / 3.0f * (qy - ny), nx, ny);
-                x = nx;
-                y = ny;
-                break;
-            }
-            case 'a': {
-                float rx = r.Num(), ry = r.Num(), rot = r.Num();
-                bool large = r.Flag() != 0, sweep = r.Flag() != 0;
-                float nx = bx + r.Num(), ny = by + r.Num();
-                AddArc(*out, x, y, rx, ry, rot, large, sweep, nx, ny);
-                x = nx;
-                y = ny;
-                break;
-            }
-            case 'z': {
-                out->CloseFigure();
-                x = sx;
-                y = sy;
-                prev = 'z';
-                continue;
-            }
-            default:
-                return out;  // Unknown command: keep what was parsed.
-        }
-        prev = cmd | 0x20;
-    }
-    return out;
-}
-
-GraphicsPath* PartPath(int icon, int part) {
-    int index = 0;
-    for (int i = 0; i < icon; i++) index += kIcons[i].count;
-    index += part;
-    if ((int)g_iconPaths.size() <= index) g_iconPaths.resize(index + 1, nullptr);
-    if (!g_iconPaths[index]) g_iconPaths[index] = ParseSvgPath(kIcons[icon].parts[part].d);
-    return g_iconPaths[index];
-}
-
-float IconWidth(IconId id, float h) {
-    return kIcons[id].w / kIcons[id].h * h;
-}
-
-void DrawIcon(Graphics& g, IconId id, float cx, float cy, float h, const Color& color) {
-    const IconDef& def = kIcons[id];
-    const float k = h / def.h;
-    GraphicsState state = g.Save();
-    g.TranslateTransform(cx - def.w * k / 2.0f, cy - h / 2.0f);
-    g.ScaleTransform(k, k);
-    for (int i = 0; i < def.count; i++) {
-        GraphicsPath* path = PartPath(id, i);
-        if (def.parts[i].fill) {
-            SolidBrush brush(color);
-            g.FillPath(&brush, path);
-        }
-        if (def.parts[i].stroke > 0) {
-            Pen pen(color, def.parts[i].stroke);
-            pen.SetLineCap(LineCapRound, LineCapRound, DashCapRound);
-            pen.SetLineJoin(LineJoinRound);
-            g.DrawPath(&pen, path);
-        }
-    }
-    g.Restore(state);
-}
-
 
 #line 1 "core/geometry.inc"
 
@@ -799,7 +603,7 @@ private:
     std::vector<Com<ID2D1PathGeometry>> geos_;
 };
 
-#line 1 "core/layered.inc"
+#line 1 "core/surface.inc"
 
 // ---- LayeredSurface: a retained premultiplied DIB drawn with Direct2D and pushed to a layered window ----
 
@@ -1079,7 +883,7 @@ const wchar_t* Loc(const wchar_t* key) {
     return key;
 }
 
-#line 1 "bar/readers.inc"
+#line 1 "bar/state.inc"
 // ---- State readers ----
 
 void ReadAccent() {
@@ -1091,13 +895,16 @@ void ReadAccent() {
     BYTE palette[32];
     DWORD size = sizeof(palette);
     if (RegQueryValueExW(key, L"AccentPalette", nullptr, nullptr, palette, &size) == ERROR_SUCCESS && size >= 16) {
-        g_accentBase = Color(255, palette[12], palette[13], palette[14]);  // Base tone: Seelen's hover overlay.
+        // Base tone: Seelen's hover overlay.
+        g_accent[0] = palette[12];
+        g_accent[1] = palette[13];
+        g_accent[2] = palette[14];
     }
     RegCloseKey(key);
 }
 
-Color Overlay(BYTE alpha) {
-    return Color(alpha, g_accentBase.GetR(), g_accentBase.GetG(), g_accentBase.GetB());
+D2D1_COLOR_F Overlay(int alpha) {
+    return Rgb(g_accent[0], g_accent[1], g_accent[2], alpha);
 }
 
 void ReadBattery() {
@@ -1115,14 +922,15 @@ void ReadNetwork() {
     g_connected = InternetGetConnectedState(&flags, 0) != FALSE;
 }
 
-Bitmap* BitmapFromIcon(HICON icon) {
+// Copies an icon's pixels into a premultiplied BGRA pixmap. Runs while the icon handle is valid.
+Pixmap* PixmapFromIcon(HICON icon) {
     ICONINFO info{};
     if (!GetIconInfo(icon, &info)) {
         return nullptr;
     }
-    Bitmap* result = nullptr;
+    Pixmap* result = nullptr;
     BITMAP bm{};
-    if (info.hbmColor && GetObjectW(info.hbmColor, sizeof(bm), &bm)) {
+    if (info.hbmColor && GetObjectW(info.hbmColor, sizeof(bm), &bm) && bm.bmWidth > 0 && bm.bmHeight > 0) {
         BITMAPINFO bi{};
         bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
         bi.bmiHeader.biWidth = bm.bmWidth;
@@ -1130,7 +938,7 @@ Bitmap* BitmapFromIcon(HICON icon) {
         bi.bmiHeader.biPlanes = 1;
         bi.bmiHeader.biBitCount = 32;
         bi.bmiHeader.biCompression = BI_RGB;
-        std::vector<DWORD> pixels(bm.bmWidth * bm.bmHeight);
+        std::vector<DWORD> pixels((size_t)bm.bmWidth * bm.bmHeight);
         HDC dc = GetDC(nullptr);
         if (GetDIBits(dc, info.hbmColor, 0, bm.bmHeight, pixels.data(), &bi, DIB_RGB_COLORS)) {
             bool hasAlpha = false;
@@ -1140,26 +948,57 @@ Bitmap* BitmapFromIcon(HICON icon) {
                     break;
                 }
             }
-            if (!hasAlpha) {
-                for (DWORD& px : pixels) {
-                    if (px) px |= 0xFF000000;
+            for (DWORD& px : pixels) {
+                if (!hasAlpha) {
+                    if (px) px |= 0xFF000000;  // Old icons carry no alpha: any colour is opaque.
+                } else {
+                    const DWORD a = px >> 24;
+                    if (a != 255) {
+                        const DWORD r = ((px >> 16) & 0xFF) * a / 255, g = ((px >> 8) & 0xFF) * a / 255,
+                                    b = (px & 0xFF) * a / 255;
+                        px = (a << 24) | (r << 16) | (g << 8) | b;
+                    }
                 }
             }
-            result = new Bitmap(bm.bmWidth, bm.bmHeight, PixelFormat32bppARGB);
-            Rect rect(0, 0, bm.bmWidth, bm.bmHeight);
-            BitmapData data{};
-            if (result->LockBits(&rect, ImageLockModeWrite, PixelFormat32bppARGB, &data) == Ok) {
-                for (int y = 0; y < bm.bmHeight; y++) {
-                    memcpy(static_cast<BYTE*>(data.Scan0) + y * data.Stride, &pixels[y * bm.bmWidth], bm.bmWidth * 4);
-                }
-                result->UnlockBits(&data);
-            }
+            result = new Pixmap();
+            result->w = bm.bmWidth;
+            result->h = bm.bmHeight;
+            result->px = std::move(pixels);
         }
         ReleaseDC(nullptr, dc);
     }
     if (info.hbmColor) DeleteObject(info.hbmColor);
     if (info.hbmMask) DeleteObject(info.hbmMask);
     return result;
+}
+
+// Decodes an image file with WIC and scales it to px x px, premultiplied BGRA.
+Pixmap* LoadPixmapFile(const wchar_t* path, int px) {
+    Com<IWICImagingFactory> wic;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, __uuidof(IWICImagingFactory),
+                                reinterpret_cast<void**>(wic.Put())))) {
+        return nullptr;
+    }
+    Com<IWICBitmapDecoder> decoder;
+    Com<IWICBitmapFrameDecode> frame;
+    Com<IWICBitmapScaler> scaler;
+    Com<IWICFormatConverter> converter;
+    if (FAILED(wic->CreateDecoderFromFilename(path, nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, decoder.Put())) ||
+        FAILED(decoder->GetFrame(0, frame.Put())) || FAILED(wic->CreateBitmapScaler(scaler.Put())) ||
+        FAILED(scaler->Initialize(frame.Get(), px, px, WICBitmapInterpolationModeFant)) ||
+        FAILED(wic->CreateFormatConverter(converter.Put())) ||
+        FAILED(converter->Initialize(scaler.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0,
+                                     WICBitmapPaletteTypeCustom))) {
+        return nullptr;
+    }
+    auto* out = new Pixmap();
+    out->w = out->h = px;
+    out->px.resize((size_t)px * px);
+    if (FAILED(converter->CopyPixels(nullptr, px * 4, (UINT)(out->px.size() * 4), reinterpret_cast<BYTE*>(out->px.data())))) {
+        delete out;
+        return nullptr;
+    }
+    return out;
 }
 
 void LoadAppIcon(const std::wstring& path) {
@@ -1171,7 +1010,7 @@ void LoadAppIcon(const std::wstring& path) {
     g_appIcon = nullptr;
     SHFILEINFOW info{};
     if (!path.empty() && SHGetFileInfoW(path.c_str(), 0, &info, sizeof(info), SHGFI_ICON | SHGFI_LARGEICON) && info.hIcon) {
-        g_appIcon = BitmapFromIcon(info.hIcon);
+        g_appIcon = PixmapFromIcon(info.hIcon);
         DestroyIcon(info.hIcon);
     }
 }
@@ -1248,6 +1087,7 @@ void ReadForeground() {
     LoadAppIcon(path);
 }
 
+// Finds the account picture. The image itself is decoded at the size the bar needs, later, by EnsureAvatar.
 void LoadAvatar() {
     HANDLE token = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
@@ -1271,22 +1111,18 @@ void LoadAvatar() {
     // This process is 32-bit, and the value only exists in the 64-bit registry view.
     if (RegGetValueW(HKEY_LOCAL_MACHINE, key.c_str(), L"Image96", RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, nullptr, path,
                      &bytes) == ERROR_SUCCESS) {
-        auto* image = new Bitmap(path);
-        if (image->GetLastStatus() == Ok) {
-            g_avatar = image;
-        } else {
-            delete image;
-        }
+        g_avatarPath = path;
     }
 }
 
-void AddRounded(GraphicsPath& path, float x, float y, float w, float h, float r) {
-    float d = r * 2.0f;
-    path.AddArc(x, y, d, d, 180, 90);
-    path.AddArc(x + w - d, y, d, d, 270, 90);
-    path.AddArc(x + w - d, y + h - d, d, d, 0, 90);
-    path.AddArc(x, y + h - d, d, d, 90, 90);
-    path.CloseFigure();
+// Scales the avatar to the pixel size it is drawn at, again whenever that changes (DPI).
+void EnsureAvatar(int px) {
+    if (g_avatarPath.empty() || px <= 0 || g_avatarPx == px) {
+        return;
+    }
+    g_avatarPx = px;
+    delete g_avatar;
+    g_avatar = LoadPixmapFile(g_avatarPath.c_str(), px);
 }
 
 // Seelen's own thresholds for these icons.
@@ -1298,240 +1134,434 @@ IconId BatteryIcon() {
     return I_batwarn;
 }
 
+#line 1 "bar/render.inc"
 
-#line 1 "core/surface.inc"
-// Draws into a premultiplied DIB and pushes it to a layered window.
-template <typename Draw>
-void Present(HWND hwnd, Draw draw) {
+// ---- Drawing: layout builds a command list and the hit list, Direct2D draws it ----
+// The bar is one full-width layered window with three bubbles on it. Everything between and around
+// the bubbles stays fully transparent, so Windows lets clicks through to what is below.
+
+Com<ID2D1Factory> g_factory;
+LayeredSurface g_surface;
+TextService g_text;
+IconGeometries g_icons;
+Com<ID2D1SolidColorBrush> g_brush;
+unsigned g_brushGen = 0;
+std::wstring g_fontKey;
+
+// Dirty tracking. Callers say what changed; Paint also adds whatever bubble moved or resized.
+RECT g_dirty{};
+bool g_dirtyAny = false;
+bool g_dirtyWhole = false;
+bool g_paintPending = false;
+RECT g_bubbleRect[3]{};  // As last painted: left, centre, right.
+
+enum class CmdKind { Hover, Text, Icon, Avatar, Person, Pixmap, Tray };
+
+struct Cmd {
+    CmdKind kind = CmdKind::Text;
+    D2D1_RECT_F r{};
+    std::wstring text;
+    IconId icon = I_wifi;
+    float cx = 0, cy = 0, h = 0;  // Icon centre and height
+    float alpha = 1.0f;
+    float radius = 0;
+    bool ellipsis = false;
+    Pixmap* pix = nullptr;
+};
+
+std::vector<Cmd> g_cmds;
+D2D1_RECT_F g_bubbles[3]{};
+bool g_hasBubble[3]{};
+float g_bubbleRadius = 0;
+
+bool EmptyRect(const RECT& r) { return r.right <= r.left || r.bottom <= r.top; }
+
+void UnionInto(RECT& a, const RECT& b) {
+    if (EmptyRect(b)) return;
+    if (EmptyRect(a)) { a = b; return; }
+    a.left = std::min(a.left, b.left);
+    a.top = std::min(a.top, b.top);
+    a.right = std::max(a.right, b.right);
+    a.bottom = std::max(a.bottom, b.bottom);
+}
+
+void RequestPaint() {
+    if (g_hwnd && !g_paintPending) {
+        g_paintPending = true;
+        PostMessageW(g_hwnd, WM_APP_PAINT, 0, 0);
+    }
+}
+
+void Invalidate(const RECT& r) {
+    UnionInto(g_dirty, r);
+    g_dirtyAny = true;
+    RequestPaint();
+}
+
+void InvalidateAll() {
+    g_dirtyWhole = true;
+    g_dirtyAny = true;
+    RequestPaint();
+}
+
+// Only what the new layout says has moved (the pill during its animation).
+void InvalidateLayout() {
+    g_dirtyAny = true;
+    RequestPaint();
+}
+
+bool EnsureGfx() {
+    if (g_factory) return true;
+    if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, g_factory.Put()))) return false;
+    if (!g_text.Init()) {
+        g_factory.Reset();
+        return false;
+    }
+    g_icons.Init(g_factory.Get());
+    return true;
+}
+
+void Layout(int W, int H) {
+    const float s = Scale();
+    g_cmds.clear();
+    g_hits.clear();
+    g_hasBubble[0] = g_hasBubble[1] = g_hasBubble[2] = false;
+
+    const float bubbleH = roundf(kPillH * s);
+    const float by = floorf((H - bubbleH) / 2.0f);
+    const float itemH = bubbleH - 4.0f * s;
+    const float itemY = by + 2.0f * s;
+    const float cy = by + bubbleH / 2.0f;
+    const float icon = roundf(kItem * s);
+    const float pad = kItemPad * s;
+    const float gap = kGap * s;
+    const float margin = kBubbleMargin * s;
+    const float bpad = kBubblePad * s;
+    g_bubbleRadius = bubbleH / 2.0f;
+
+    auto addHit = [&](float x, float y, float w, float h, float radius, Action action, int id, int data = 0) {
+        g_hits.push_back({{(LONG)x, (LONG)y, (LONG)(x + w), (LONG)(y + h)}, action, id, data});
+        if (id == g_hoverId) {
+            Cmd c;
+            c.kind = CmdKind::Hover;
+            c.r = D2D1::RectF(x, y, x + w, y + h);
+            c.radius = radius;
+            g_cmds.push_back(c);
+        }
+    };
+    auto text = [&](const std::wstring& str, float x, float y, float w, float h, bool ellipsis = false) {
+        Cmd c;
+        c.kind = CmdKind::Text;
+        c.r = D2D1::RectF(x, y, x + w, y + h);
+        c.text = str;
+        c.ellipsis = ellipsis;
+        g_cmds.push_back(c);
+    };
+    auto iconCmd = [&](IconId id, float x, float y, float h, float alpha = 1.0f) {
+        Cmd c;
+        c.kind = CmdKind::Icon;
+        c.icon = id;
+        c.cx = x;
+        c.cy = y;
+        c.h = h;
+        c.alpha = alpha;
+        g_cmds.push_back(c);
+    };
+    auto image = [&](CmdKind kind, Pixmap* pix, float x, float y, float size, float radius = 0) {
+        Cmd c;
+        c.kind = kind;
+        c.pix = pix;
+        c.r = D2D1::RectF(x, y, x + size, y + size);
+        c.radius = radius;
+        g_cmds.push_back(c);
+    };
+
+    // Right bubble: tray icons, Bluetooth, Wi-Fi, battery, settings, laid out from the right edge.
+    float right = W - margin - bpad;
+    auto iconItem = [&](IconId id, Action action, int hitId) {
+        const float w = IconGeometries::Width(id, icon) + 2 * pad;
+        right -= w;
+        addHit(right, itemY, w, itemH, kItemRadius * s, action, hitId);
+        iconCmd(id, right + w / 2.0f, cy, icon);
+        right -= gap;
+    };
+    iconItem(I_settings, Action::QuickSettings, H_settings);
+    if (g_battery >= 0) {
+        wchar_t pct[8];
+        swprintf_s(pct, L"%d%%", g_battery);
+        const std::wstring label = pct;
+        const float space = g_text.Measure(L" ");
+        const float labelW = g_text.Measure(label);
+        const IconId battery = BatteryIcon();
+        const float batteryW = IconGeometries::Width(battery, icon);
+        const float boltW = g_charging ? IconGeometries::Width(I_bolt, icon) + space : 0.0f;
+        const float w = boltW + batteryW + space + labelW + 2 * pad;
+        right -= w;
+        addHit(right, itemY, w, itemH, kItemRadius * s, Action::QuickSettings, H_battery);
+        float x = right + pad;
+        if (g_charging) {
+            iconCmd(I_bolt, x + IconGeometries::Width(I_bolt, icon) / 2.0f, cy, icon);
+            x += boltW;
+        }
+        iconCmd(battery, x + batteryW / 2.0f, cy, icon);
+        x += batteryW + space;
+        text(label, x, itemY, labelW + 2, itemH);
+        right -= gap;
+    }
+    iconItem(g_connected ? I_wifi : I_offline, Action::Wifi, H_wifi);
+    iconItem(I_bluetooth, Action::Bluetooth, H_bluetooth);
+    for (int i = (int)g_tray.size() - 1; i >= 0; i--) {
+        if (g_tray[i].hidden || !g_tray[i].pix) {
+            continue;
+        }
+        const float w = icon + 2 * pad;
+        right -= w;
+        addHit(right, itemY, w, itemH, kItemRadius * s, Action::TrayIcon, H_trayBase + g_tray[i].uid, i);
+        image(CmdKind::Tray, g_tray[i].pix, right + pad, cy - icon / 2.0f, icon);
+        right -= gap;
+    }
+    g_bubbles[2] = D2D1::RectF(right + gap - bpad, by, W - margin, by + bubbleH);
+    g_hasBubble[2] = true;
+
+    // Centre bubble: the pill, clock fixed in the middle, growing outward on hover.
+    wchar_t timeText[32] = {};
+    wchar_t dateText[32] = {};
+    GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, L"hh':'mm tt", timeText, 32);
+    GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, L"ddd d MMM", dateText, 32, nullptr);
+    const std::wstring clock = std::wstring(dateText) + L", " + timeText;
+    const float clockW = g_text.Measure(clock);
+    const float t = g_pillT;
+    const float button = kPillButton * s;
+    const float grow = (button + gap) * t;
+    const float pillW = clockW + 2 * kPillPadX * s + 2 * grow;
+    const float pillX = floorf((W - pillW) / 2.0f);
+    g_pillRect = {(LONG)pillX, 0, (LONG)(pillX + pillW + 1), H};
+    g_bubbles[1] = D2D1::RectF(pillX, by, pillX + pillW, by + bubbleH);
+    g_hasBubble[1] = true;
+    text(clock, (W - clockW) / 2.0f, by, clockW + 2, bubbleH);
+    if (t > 0.01f) {
+        const float buttonY = by + (bubbleH - button) / 2.0f;
+        const float inset = (bubbleH - button) / 2.0f;
+        auto pillButton = [&](float x, IconId id, Action action, int hitId, float iconH) {
+            if (t > 0.5f) {
+                addHit(x, buttonY, button, button, button / 2.0f, action, hitId);
+            }
+            iconCmd(id, x + button / 2.0f, by + bubbleH / 2.0f, iconH, t);
+        };
+        pillButton(pillX + inset, I_bell, Action::Notifications, H_bell, 15.0f * s);
+        pillButton(pillX + pillW - inset - button, I_calendar, Action::Calendar, H_calendar, 13.0f * s);
+    }
+
+    // Left bubble: user, separator, app, separator, title. It gives way to the pill as it grows.
+    float left = margin + bpad;
+    const float slot = icon + 2 * pad;
+    addHit(left, itemY, slot, itemH, kItemRadius * s, Action::Profile, H_profile);
+    const float avatarY = cy - icon / 2.0f;
+    if (g_avatar) {
+        image(CmdKind::Avatar, g_avatar, left + pad, avatarY, icon, kItemRadius * s);
+    } else {
+        Cmd c;
+        c.kind = CmdKind::Person;
+        c.r = D2D1::RectF(left, itemY, left + slot, itemY + itemH);
+        g_cmds.push_back(c);
+    }
+    float drawnRight = left + slot;
+    left += slot + gap;
+
+    const float limit = pillX - kBubbleClear * s - bpad;
+    auto textItem = [&](const std::wstring& str) {
+        const float w = g_text.Measure(str);
+        if (left + pad + w < limit) {
+            text(str, left + pad, itemY, w + 2, itemH);
+            drawnRight = left + pad + w;
+        }
+        left += w + 2 * pad + gap;
+    };
+    textItem(L"|");
+    if (!g_appName.empty()) {
+        if (g_appIcon && left + pad + icon < limit) {
+            image(CmdKind::Pixmap, g_appIcon, left + pad, avatarY, icon);
+            drawnRight = std::max(drawnRight, left + pad + icon);
+        }
+        const float nameW = g_text.Measure(g_appName);
+        const float nameX = left + pad + icon + g_text.Measure(L"  ");
+        if (nameX + nameW < limit) {
+            text(g_appName, nameX, itemY, nameW + 2, itemH);
+            drawnRight = nameX + nameW;
+        }
+        left = nameX + nameW + pad + gap;
+    }
+    if (!g_title.empty()) {
+        textItem(L"-");
+        const float titleX = left + pad;
+        if (titleX < limit) {
+            text(g_title, titleX, itemY, limit - titleX, itemH, true);
+            drawnRight = titleX + std::min(g_text.Measure(g_title), limit - titleX);
+        }
+    }
+    g_bubbles[0] = D2D1::RectF(margin, by, drawnRight + bpad, by + bubbleH);
+    g_hasBubble[0] = true;
+}
+
+ID2D1Bitmap* BitmapOf(ID2D1RenderTarget* rt, Pixmap& p) {
+    if (p.bmp && p.gen == g_surface.Generation()) return p.bmp.Get();
+    p.bmp.Reset();
+    D2D1_BITMAP_PROPERTIES props =
+        D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    if (FAILED(rt->CreateBitmap(D2D1::SizeU(p.w, p.h), p.px.data(), p.w * 4, &props, p.bmp.Put()))) return nullptr;
+    p.gen = g_surface.Generation();
+    return p.bmp.Get();
+}
+
+void DrawFrame(ID2D1RenderTarget* rt) {
+    ID2D1SolidColorBrush* brush = g_brush.Get();
+    auto color = [&](D2D1_COLOR_F c, float alpha = 1.0f) {
+        c.a *= alpha;
+        brush->SetColor(c);
+    };
+
+    for (int i = 0; i < 3; i++) {
+        if (!g_hasBubble[i]) continue;
+        color(i == 1 ? kCentreBg : kSideBg);
+        rt->FillRoundedRectangle(D2D1::RoundedRect(g_bubbles[i], g_bubbleRadius, g_bubbleRadius), brush);
+    }
+
+    for (const Cmd& c : g_cmds) {
+        switch (c.kind) {
+            case CmdKind::Hover:
+                color(Overlay(51));
+                rt->FillRoundedRectangle(D2D1::RoundedRect(c.r, c.radius, c.radius), brush);
+                break;
+            case CmdKind::Text: {
+                color(kFg);
+                TextOpts o;
+                o.maxW = c.r.right - c.r.left;
+                o.maxH = c.r.bottom - c.r.top;
+                o.ellipsis = c.ellipsis;
+                g_text.Draw(rt, c.text, c.r.left, c.r.top, brush, o);
+                break;
+            }
+            case CmdKind::Icon:
+                color(kFg, c.alpha);
+                g_icons.Draw(rt, brush, c.icon, c.cx, c.cy, c.h);
+                break;
+            case CmdKind::Person: {
+                color(kFg);
+                TextOpts o;
+                o.family = L"Segoe Fluent Icons";
+                o.size = roundf(kItem * Scale());
+                o.maxW = c.r.right - c.r.left;
+                o.maxH = c.r.bottom - c.r.top;
+                o.center = true;
+                g_text.Draw(rt, std::wstring(1, (wchar_t)0xE77B), c.r.left, c.r.top, brush, o);
+                break;
+            }
+            case CmdKind::Avatar: {
+                // A bitmap brush fills the rounded square, which is cheaper than clipping to a geometry.
+                ID2D1Bitmap* bmp = BitmapOf(rt, *c.pix);
+                if (!bmp) break;
+                Com<ID2D1BitmapBrush> bb;
+                if (SUCCEEDED(rt->CreateBitmapBrush(bmp,
+                        D2D1::BitmapBrushProperties(D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP,
+                                                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR),
+                        bb.Put()))) {
+                    bb->SetTransform(D2D1::Matrix3x2F::Translation(c.r.left, c.r.top));
+                    rt->FillRoundedRectangle(D2D1::RoundedRect(c.r, c.radius, c.radius), bb.Get());
+                }
+                break;
+            }
+            case CmdKind::Pixmap:
+            case CmdKind::Tray:
+                if (ID2D1Bitmap* bmp = BitmapOf(rt, *c.pix)) {
+                    rt->DrawBitmap(bmp, c.r, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                }
+                break;
+        }
+    }
+}
+
+void Paint() {
+    g_paintPending = false;
+    if (!g_hwnd || g_fullscreen || !g_dirtyAny) {
+        return;
+    }
     RECT wr;
-    GetWindowRect(hwnd, &wr);
+    GetWindowRect(g_hwnd, &wr);
     const int W = wr.right - wr.left;
     const int H = wr.bottom - wr.top;
-    if (W <= 0 || H <= 0) {
+    if (W <= 0 || H <= 0 || !EnsureGfx()) {
         return;
     }
-    BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = W;
-    bi.bmiHeader.biHeight = -H;
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    void* bits = nullptr;
-    HDC screen = GetDC(nullptr);
-    HDC mem = CreateCompatibleDC(screen);
-    HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    HGDIOBJ old = SelectObject(mem, dib);
-    {
-        Bitmap target(W, H, W * 4, PixelFormat32bppPARGB, static_cast<BYTE*>(bits));
-        Graphics g(&target);
-        g.SetSmoothingMode(SmoothingModeAntiAlias);
-        g.SetPixelOffsetMode(PixelOffsetModeHalf);
-        g.SetTextRenderingHint(TextRenderingHintAntiAlias);
-        g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
-        draw(g, W, H);
-    }
-    POINT src{0, 0};
-    POINT dst{wr.left, wr.top};
-    SIZE size{W, H};
-    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    UpdateLayeredWindow(hwnd, screen, &dst, &size, mem, &src, 0, &blend, ULW_ALPHA);
-    SelectObject(mem, old);
-    DeleteObject(dib);
-    DeleteDC(mem);
-    ReleaseDC(nullptr, screen);
-}
-
-const FontFamily* TextFamily(FontFamily& preferred, FontFamily& fallback) {
-    return preferred.IsAvailable() ? &preferred : &fallback;
-}
-
-
-#line 1 "bar/bubbles.inc"
-void Paint() {
-    if (!g_hwnd || g_fullscreen) {
+    const unsigned before = g_surface.Generation();
+    if (!g_surface.Resize(g_factory.Get(), W, H)) {
         return;
     }
+    bool whole = g_dirtyWhole || g_surface.Generation() != before;
+
     const float s = Scale();
-    Present(g_hwnd, [&](Graphics& g, int W, int H) {
-        g.Clear(kBarBg);
+    wchar_t key[160];
+    swprintf_s(key, L"%ls|%.3f", g_settings.fontFamily.c_str(), kFontSize * s * g_settings.fontScale / 100.0f);
+    if (g_fontKey != key) {
+        g_fontKey = key;
+        g_text.SetFont(g_settings.fontFamily, kFontSize * s * g_settings.fontScale / 100.0f);
+        whole = true;
+    }
+    EnsureAvatar((int)roundf(kItem * s));
+    Layout(W, H);
 
-        SolidBrush fg(kFg);
-        SolidBrush hoverFill(Overlay(51));
-        FontFamily preferred(L"Segoe UI Variable Text");
-        FontFamily fallback(L"Segoe UI");
-        const FontFamily* family = TextFamily(preferred, fallback);
-        Font text(family, kFontSize * s, FontStyleRegular, UnitPixel);
+    ID2D1DCRenderTarget* rt = g_surface.Target();
+    if (!g_brush || g_brushGen != g_surface.Generation()) {
+        g_brush.Reset();
+        rt->CreateSolidColorBrush(kFg, g_brush.Put());
+        g_brushGen = g_surface.Generation();
+    }
+    if (!g_brush) {
+        return;
+    }
 
-        StringFormat tf(StringFormat::GenericTypographic());
-        tf.SetFormatFlags(tf.GetFormatFlags() | StringFormatFlagsNoWrap | StringFormatFlagsMeasureTrailingSpaces);
-        tf.SetLineAlignment(StringAlignmentCenter);
-        StringFormat tfEllipsis(&tf);
-        tfEllipsis.SetTrimming(StringTrimmingEllipsisCharacter);
-
-        auto measure = [&](const std::wstring& str) {
-            RectF box;
-            g.MeasureString(str.c_str(), -1, &text, PointF(0, 0), &tf, &box);
-            return box.Width;
-        };
-
-        const float pad = kItemPad * s;
-        const float itemY = (H - kPillH * s) / 2.0f;
-        const float itemH = kPillH * s;
-        const float cy = H / 2.0f;
-        const float icon = kItem * s;
-
-        g_hits.clear();
-        auto addHit = [&](float x, float y, float w, float h, Action action, float radius) {
-            g_hits.push_back({{(LONG)x, (LONG)y, (LONG)(x + w), (LONG)(y + h)}, action});
-            if ((int)g_hits.size() - 1 == g_hoverIndex) {
-                GraphicsPath p;
-                AddRounded(p, x, y, w, h, radius);
-                g.FillPath(&hoverFill, &p);
-            }
-        };
-
-        // Right group, in the order of the Seelen layout, laid out from the right edge.
-        float right = W - kBarPadX * s;
-        auto iconItem = [&](IconId id, Action action) {
-            const float w = IconWidth(id, icon) + 2 * pad;
-            right -= w;
-            addHit(right, itemY, w, itemH, action, kItemRadius * s);
-            DrawIcon(g, id, right + w / 2.0f, cy, icon, kFg);
-            right -= kGap * s;
-        };
-
-        iconItem(I_settings, Action::QuickSettings);
-        if (g_battery >= 0) {
-            wchar_t pct[8];
-            swprintf_s(pct, L"%d%%", g_battery);
-            const std::wstring label = pct;
-            const float space = measure(L" ");
-            const float labelW = measure(label);
-            const IconId battery = BatteryIcon();
-            const float batteryW = IconWidth(battery, icon);
-            const float boltW = g_charging ? IconWidth(I_bolt, icon) + space : 0.0f;
-            const float w = boltW + batteryW + space + labelW + 2 * pad;
-            right -= w;
-            addHit(right, itemY, w, itemH, Action::QuickSettings, kItemRadius * s);
-            float x = right + pad;
-            if (g_charging) {
-                DrawIcon(g, I_bolt, x + IconWidth(I_bolt, icon) / 2.0f, cy, icon, kFg);
-                x += boltW;
-            }
-            DrawIcon(g, battery, x + batteryW / 2.0f, cy, icon, kFg);
-            x += batteryW + space;
-            g.DrawString(label.c_str(), -1, &text, RectF(x, itemY, labelW + 1, itemH), &tf, &fg);
-            right -= kGap * s;
+    // Whatever moved or resized: old and new place both need drawing.
+    RECT dirty = whole ? RECT{0, 0, W, H} : g_dirty;
+    for (int i = 0; i < 3; i++) {
+        RECT now{};
+        if (g_hasBubble[i]) {
+            now = {(LONG)floorf(g_bubbles[i].left) - 1, (LONG)floorf(g_bubbles[i].top) - 1,
+                   (LONG)ceilf(g_bubbles[i].right) + 1, (LONG)ceilf(g_bubbles[i].bottom) + 1};
         }
-        iconItem(g_connected ? I_wifi : I_offline, Action::Wifi);
-        iconItem(I_bluetooth, Action::Bluetooth);
+        if (!EqualRect(&now, &g_bubbleRect[i])) {
+            UnionInto(dirty, now);
+            UnionInto(dirty, g_bubbleRect[i]);
+            g_bubbleRect[i] = now;
+        }
+    }
+    const RECT bounds{0, 0, W, H};
+    IntersectRect(&dirty, &dirty, &bounds);
+    g_dirty = RECT{};
+    g_dirtyAny = false;
+    g_dirtyWhole = false;
+    if (EmptyRect(dirty)) {
+        return;
+    }
 
-        // Tray icons of background apps, as in the Seelen toolbar.
-        for (int i = (int)g_tray.size() - 1; i >= 0; i--) {
-            if (g_tray[i].hidden || !g_tray[i].bitmap) {
-                continue;
-            }
-            const float w = icon + 2 * pad;
-            right -= w;
-            addHit(right, itemY, w, itemH, Action::TrayIcon, kItemRadius * s);
-            g_hits.back().data = i;
-            g.DrawImage(g_tray[i].bitmap, right + pad, cy - icon / 2.0f, icon, icon);
-            right -= kGap * s;
-        }
-
-        // Centre pill: part of the bar, clock fixed in the middle, grows outward.
-        wchar_t timeText[32] = {};
-        wchar_t dateText[32] = {};
-        GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, L"hh':'mm tt", timeText, 32);
-        GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, L"ddd d MMM", dateText, 32, nullptr);
-        const std::wstring clock = std::wstring(dateText) + L", " + timeText;
-        const float clockW = measure(clock);
-        const float t = g_pillT;
-        const float button = kPillButton * s;
-        const float grow = (button + kGap * s) * t;
-        const float pillW = clockW + 2 * kPillPadX * s + 2 * grow;
-        const float pillX = (W - pillW) / 2.0f;
-        const float pillH = kPillH * s;
-        const float pillY = (H - pillH) / 2.0f;
-        g_pillRect = {(LONG)pillX, 0, (LONG)(pillX + pillW + 1), H};
-        {
-            SolidBrush pillBrush(Color(255, 0, 0, 0));
-            GraphicsPath pill;
-            AddRounded(pill, pillX, pillY, pillW, pillH, pillH / 2.0f);
-            g.FillPath(&pillBrush, &pill);
-        }
-        g.DrawString(clock.c_str(), -1, &text, RectF((W - clockW) / 2.0f, pillY, clockW + 1, pillH), &tf, &fg);
-        if (t > 0.01f) {
-            const BYTE alpha = (BYTE)(255 * t);
-            const Color iconColor(alpha, kFg.GetR(), kFg.GetG(), kFg.GetB());
-            const float buttonY = pillY + (pillH - button) / 2.0f;
-            const float inset = (pillH - button) / 2.0f;
-            auto pillButton = [&](float x, IconId id, Action action, float iconH) {
-                if (t > 0.5f) {
-                    addHit(x, buttonY, button, button, action, button / 2.0f);
-                }
-                DrawIcon(g, id, x + button / 2.0f, pillY + pillH / 2.0f, iconH, iconColor);
-            };
-            pillButton(pillX + inset, I_bell, Action::Notifications, 15.0f * s);
-            pillButton(pillX + pillW - inset - button, I_calendar, Action::Calendar, 13.0f * s);
-        }
-
-        // Left group: user, separator, app, separator, title.
-        float left = kBarPadX * s;
-        const float slot = icon + 2 * pad;
-        addHit(left, itemY, slot, itemH, Action::Profile, kItemRadius * s);
-        const float avatarX = left + pad;
-        const float avatarY = cy - icon / 2.0f;
-        if (g_avatar) {
-            GraphicsPath clip;
-            AddRounded(clip, avatarX, avatarY, icon, icon, kItemRadius * s);
-            GraphicsState state = g.Save();
-            g.SetClip(&clip);
-            g.DrawImage(g_avatar, avatarX, avatarY, icon, icon);
-            g.Restore(state);
-        } else {
-            FontFamily iconFamily(L"Segoe Fluent Icons");
-            Font personFont(&iconFamily, icon, FontStyleRegular, UnitPixel);
-            StringFormat centered;
-            centered.SetAlignment(StringAlignmentCenter);
-            centered.SetLineAlignment(StringAlignmentCenter);
-            wchar_t person[2] = {0xE77B, 0};
-            g.DrawString(person, 1, &personFont, RectF(left, itemY, slot, itemH), &centered, &fg);
-        }
-        left += slot + kGap * s;
-
-        const float leftLimit = pillX - 12.0f * s;
-        auto textItem = [&](const std::wstring& str) {
-            const float w = measure(str);
-            if (left + pad + w < leftLimit) {
-                g.DrawString(str.c_str(), -1, &text, RectF(left + pad, itemY, w + 1, itemH), &tf, &fg);
-            }
-            left += w + 2 * pad + kGap * s;
-        };
-
-        textItem(L"|");
-        if (!g_appName.empty()) {
-            if (g_appIcon && left + pad + icon < leftLimit) {
-                g.DrawImage(g_appIcon, left + pad, avatarY, icon, icon);
-            }
-            const float nameW = measure(g_appName);
-            const float nameX = left + pad + icon + measure(L"  ");
-            if (nameX + nameW < leftLimit) {
-                g.DrawString(g_appName.c_str(), -1, &text, RectF(nameX, itemY, nameW + 1, itemH), &tf, &fg);
-            }
-            left = nameX + nameW + pad + kGap * s;
-        }
-        if (!g_title.empty()) {
-            textItem(L"-");
-            const float titleX = left + pad;
-            if (titleX < leftLimit) {
-                g.DrawString(g_title.c_str(), -1, &text, RectF(titleX, itemY, leftLimit - titleX, itemH), &tfEllipsis, &fg);
-            }
-        }
-    });
+    if (!g_surface.Begin(dirty)) {
+        InvalidateAll();
+        return;
+    }
+    DrawFrame(rt);
+    if (!g_surface.End()) {
+        g_brush.Reset();
+        InvalidateAll();  // The target was lost: the next paint builds a new one.
+        return;
+    }
+    g_surface.Present(g_hwnd, POINT{wr.left, wr.top}, dirty, EqualRect(&dirty, &bounds) != FALSE);
 }
 
+// What to release before the thread ends.
+void ReleaseGfx() {
+    g_brush.Reset();
+    g_icons.Release();
+    g_surface.Destroy();
+    g_factory.Reset();
+}
 
 #line 1 "bar/placement.inc"
 // ---- Bar placement and panels ----
@@ -1578,9 +1608,17 @@ void UpdateFullscreen() {
     g_fullscreen = fullscreen;
     if (fullscreen) {
         ShowWindow(g_hwnd, SW_HIDE);
+        // Forget the pointer and a half-open pill, so it does not come back expanded.
+        g_tracking = false;
+        g_hoverId = H_none;
+        g_pillTarget = false;
+        g_pillT = 0.0f;
+        g_pillSpring.Snap(0.0f);
+        g_clock.Sleep();
+        g_lastFrame = 0;
     } else {
         PlaceBar();
-        Paint();
+        InvalidateAll();
     }
 }
 
@@ -1705,7 +1743,7 @@ void SendPanelMode(WPARAM mode) {
     while ((hwnd = FindWindowExW(nullptr, hwnd, L"Windows.UI.Core.CoreWindow", nullptr))) {
         if (IsShellExperienceWindow(hwnd)) {
             DWORD_PTR result = 0;
-            SendMessageTimeoutW(hwnd, g_panelMessage, mode, 0, SMTO_ABORTIFHUNG, 200, &result);
+            SendMessageTimeoutW(hwnd, g_panelMessage, mode, 0, SMTO_ABORTIFHUNG, 50, &result);
         }
     }
 }
@@ -1901,7 +1939,7 @@ TrayIcon* FindTrayIcon(const BarTrayMessage& m, HWND hwnd) {
 void RemoveDeadTrayIcons() {
     for (size_t i = g_tray.size(); i-- > 0;) {
         if (!IsWindow(g_tray[i].hwnd)) {
-            delete g_tray[i].bitmap;
+            delete g_tray[i].pix;
             g_tray.erase(g_tray.begin() + i);
         }
     }
@@ -1917,7 +1955,7 @@ void OnTrayMessage(const BarTrayMessage& m) {
     TrayIcon* icon = FindTrayIcon(m, hwnd);
     if (m.message == NIM_DELETE) {
         if (icon) {
-            delete icon->bitmap;
+            delete icon->pix;
             g_tray.erase(g_tray.begin() + (icon - g_tray.data()));
         }
     } else if (m.message == NIM_ADD || m.message == NIM_MODIFY || m.message == NIM_SETVERSION) {
@@ -1927,6 +1965,7 @@ void OnTrayMessage(const BarTrayMessage& m) {
             }
             g_tray.emplace_back();
             icon = &g_tray.back();
+            icon->uid = ++g_trayUid;
         }
         if (hwnd) {
             icon->hwnd = hwnd;
@@ -1947,16 +1986,16 @@ void OnTrayMessage(const BarTrayMessage& m) {
             icon->hidden = (m.state & NIS_HIDDEN) != 0;
         }
         if ((m.flags & NIF_ICON) && m.icon) {
-            if (Bitmap* bitmap = BitmapFromIcon(reinterpret_cast<HICON>((UINT_PTR)m.icon))) {
-                delete icon->bitmap;
-                icon->bitmap = bitmap;
+            if (Pixmap* bitmap = PixmapFromIcon(reinterpret_cast<HICON>((UINT_PTR)m.icon))) {
+                delete icon->pix;
+                icon->pix = bitmap;
             }
         }
     } else {
         return;
     }
     RemoveDeadTrayIcons();
-    Paint();
+    InvalidateAll();
 }
 
 // Passes a click to the app in the form it asked for, as the taskbar would.
@@ -1967,7 +2006,7 @@ void ClickTrayIcon(int index, bool rightButton) {
     const TrayIcon icon = g_tray[index];
     if (!IsWindow(icon.hwnd) || !icon.callback) {
         RemoveDeadTrayIcons();
-        Paint();
+        InvalidateAll();
         return;
     }
     DWORD pid = 0;
@@ -2018,7 +2057,7 @@ void ToggleProfile() {
     while ((hwnd = FindWindowExW(nullptr, hwnd, L"Windows.UI.Core.CoreWindow", nullptr))) {
         if (IsStartWindow(hwnd)) {
             DWORD_PTR result = 0;
-            if (SendMessageTimeoutW(hwnd, g_profileMessage, 0, 0, SMTO_ABORTIFHUNG, 300, &result)) {
+            if (SendMessageTimeoutW(hwnd, g_profileMessage, 0, 0, SMTO_ABORTIFHUNG, 150, &result)) {
                 armed = true;
             }
         }
@@ -2106,6 +2145,32 @@ int HitIndexAt(POINT p) {
     return -1;
 }
 
+int HitIdAt(POINT p) {
+    const int index = HitIndexAt(p);
+    return index < 0 ? H_none : g_hits[index].id;
+}
+
+RECT HitRectById(int id) {
+    for (const Hit& h : g_hits) {
+        if (h.id == id && id != H_none) {
+            RECT r = h.rect;
+            InflateRect(&r, 2, 2);
+            return r;
+        }
+    }
+    return RECT{};
+}
+
+// Hover follows stable ids, and only the old and new highlight are redrawn.
+void SetHover(int id) {
+    if (id == g_hoverId) {
+        return;
+    }
+    Invalidate(HitRectById(g_hoverId));
+    g_hoverId = id;
+    Invalidate(HitRectById(id));
+}
+
 void SetPillTarget(bool expanded) {
     if (expanded == g_pillTarget) {
         return;
@@ -2132,17 +2197,14 @@ void StepPill() {
         g_clock.Sleep();
         g_lastFrame = 0;
     }
+    InvalidateLayout();  // Paint adds the pill and whatever it pushed aside.
     Paint();
     if (g_tracking) {
         // The hit list moved with the pill: resync hover against the new layout.
         POINT p;
         GetCursorPos(&p);
         ScreenToClient(g_hwnd, &p);
-        const int index = HitIndexAt(p);
-        if (index != g_hoverIndex) {
-            g_hoverIndex = index;
-            Paint();
-        }
+        SetHover(HitIdAt(p));
         SetPillTarget(PtInRect(&g_pillRect, p));
     }
 }
@@ -2173,7 +2235,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         g_registered = false;
         RegisterBar();
-        Paint();
+        InvalidateAll();
         return 0;
     }
     switch (msg) {
@@ -2185,17 +2247,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             POINT p{(short)LOWORD(lp), (short)HIWORD(lp)};
             SetPillTarget(PtInRect(&g_pillRect, p));
-            const int index = HitIndexAt(p);
-            if (index != g_hoverIndex) {
-                g_hoverIndex = index;
-                Paint();
-            }
+            SetHover(HitIdAt(p));
             return 0;
         }
         case WM_MOUSELEAVE:
             g_tracking = false;
-            g_hoverIndex = -1;
+            SetHover(H_none);
             SetPillTarget(false);
+            return 0;
+        case WM_APP_PAINT:
             Paint();
             return 0;
         case WM_MOUSEACTIVATE:
@@ -2219,7 +2279,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 } else {
                     RunAction(g_hits[index].action);
                 }
-                Paint();
+                InvalidateAll();
             }
             return 0;
         }
@@ -2251,7 +2311,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_APPBAR_CB:
             if (wp == ABN_POSCHANGED) {
                 PlaceBar();
-                Paint();
+                InvalidateAll();
             } else if (wp == ABN_FULLSCREENAPP) {
                 g_abnFullscreen = lp != 0;
                 UpdateFullscreen();
@@ -2262,17 +2322,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_POWERBROADCAST:
             ReadBattery();
             ArmClock();
-            Paint();
+            InvalidateAll();
             return TRUE;
         case WM_TIMER:
             if (wp == kClockTimer) {
                 ArmClock();
-                Paint();
+                InvalidateAll();
             } else if (wp == kTitleTimer) {
                 KillTimer(hwnd, kTitleTimer);
                 g_titlePending = false;
                 ReadForeground();
-                Paint();
+                InvalidateAll();
                 StepPill();
             } else if (wp == kPanelTimer) {
                 StepPanelFollow();
@@ -2338,18 +2398,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_TIMECHANGE:
             ArmClock();
-            Paint();
+            InvalidateAll();
             return 0;
         case WM_REFRESH_NET:
             ReadNetwork();
-            Paint();
+            InvalidateAll();
             return 0;
         case WM_APP_FRAME:
             StepPill();
             return 0;
         case WM_APP_SETTINGS:
             g_settings = LoadSettings();
-            Paint();
+            InvalidateAll();
             return 0;
         case WM_REFRESH_TITLE:
             if (!g_titlePending) {
@@ -2360,17 +2420,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_REFRESH_FOREGROUND:
             RehookTitle();
             ReadForeground();
-            Paint();
+            InvalidateAll();
             return 0;
         case WM_SETTINGCHANGE:
             ReadAccent();
             ReadForeground();
-            Paint();
+            InvalidateAll();
             return 0;
         case WM_DISPLAYCHANGE:
         case WM_DPICHANGED:
             PlaceBar();
-            Paint();
+            InvalidateAll();
             return 0;
         case WM_CLOSE:
             DestroyWindow(hwnd);
@@ -2379,6 +2439,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RemovePropW(hwnd, L"TopBarAnchorX");
             RemovePropW(hwnd, L"TopBarAnchorTick");
             UnregisterBar();
+            g_hwnd = nullptr;
             PostQuitMessage(0);
             return 0;
     }
@@ -2388,8 +2449,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 DWORD WINAPI BarThread(void*) {
     SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    GdiplusStartupInput gdiInput;
-    GdiplusStartup(&g_gdiplusToken, &gdiInput, nullptr);
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = WndProc;
@@ -2428,7 +2487,7 @@ DWORD WINAPI BarThread(void*) {
 
     RegisterBar();
     ArmClock();
-    Paint();
+    InvalidateAll();
 
     // Apps add their tray icons again when told the taskbar is new, and the bridge sees that.
     g_trayBroadcastTick = GetTickCount64();
@@ -2451,14 +2510,10 @@ DWORD WINAPI BarThread(void*) {
     delete g_appIcon;
     g_appIcon = nullptr;
     for (auto& icon : g_tray) {
-        delete icon.bitmap;
+        delete icon.pix;
     }
     g_tray.clear();
-    for (GraphicsPath* path : g_iconPaths) {
-        delete path;
-    }
-    g_iconPaths.clear();
-    GdiplusShutdown(g_gdiplusToken);
+    ReleaseGfx();
     CoUninitialize();
     return 0;
 }

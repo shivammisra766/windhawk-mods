@@ -25,7 +25,7 @@ void ToggleProfile() {
     while ((hwnd = FindWindowExW(nullptr, hwnd, L"Windows.UI.Core.CoreWindow", nullptr))) {
         if (IsStartWindow(hwnd)) {
             DWORD_PTR result = 0;
-            if (SendMessageTimeoutW(hwnd, g_profileMessage, 0, 0, SMTO_ABORTIFHUNG, 300, &result)) {
+            if (SendMessageTimeoutW(hwnd, g_profileMessage, 0, 0, SMTO_ABORTIFHUNG, 150, &result)) {
                 armed = true;
             }
         }

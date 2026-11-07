@@ -9,13 +9,16 @@ void ReadAccent() {
     BYTE palette[32];
     DWORD size = sizeof(palette);
     if (RegQueryValueExW(key, L"AccentPalette", nullptr, nullptr, palette, &size) == ERROR_SUCCESS && size >= 16) {
-        g_accentBase = Color(255, palette[12], palette[13], palette[14]);  // Base tone: Seelen's hover overlay.
+        // Base tone: Seelen's hover overlay.
+        g_accent[0] = palette[12];
+        g_accent[1] = palette[13];
+        g_accent[2] = palette[14];
     }
     RegCloseKey(key);
 }
 
-Color Overlay(BYTE alpha) {
-    return Color(alpha, g_accentBase.GetR(), g_accentBase.GetG(), g_accentBase.GetB());
+D2D1_COLOR_F Overlay(int alpha) {
+    return Rgb(g_accent[0], g_accent[1], g_accent[2], alpha);
 }
 
 void ReadBattery() {
@@ -33,14 +36,15 @@ void ReadNetwork() {
     g_connected = InternetGetConnectedState(&flags, 0) != FALSE;
 }
 
-Bitmap* BitmapFromIcon(HICON icon) {
+// Copies an icon's pixels into a premultiplied BGRA pixmap. Runs while the icon handle is valid.
+Pixmap* PixmapFromIcon(HICON icon) {
     ICONINFO info{};
     if (!GetIconInfo(icon, &info)) {
         return nullptr;
     }
-    Bitmap* result = nullptr;
+    Pixmap* result = nullptr;
     BITMAP bm{};
-    if (info.hbmColor && GetObjectW(info.hbmColor, sizeof(bm), &bm)) {
+    if (info.hbmColor && GetObjectW(info.hbmColor, sizeof(bm), &bm) && bm.bmWidth > 0 && bm.bmHeight > 0) {
         BITMAPINFO bi{};
         bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
         bi.bmiHeader.biWidth = bm.bmWidth;
@@ -48,7 +52,7 @@ Bitmap* BitmapFromIcon(HICON icon) {
         bi.bmiHeader.biPlanes = 1;
         bi.bmiHeader.biBitCount = 32;
         bi.bmiHeader.biCompression = BI_RGB;
-        std::vector<DWORD> pixels(bm.bmWidth * bm.bmHeight);
+        std::vector<DWORD> pixels((size_t)bm.bmWidth * bm.bmHeight);
         HDC dc = GetDC(nullptr);
         if (GetDIBits(dc, info.hbmColor, 0, bm.bmHeight, pixels.data(), &bi, DIB_RGB_COLORS)) {
             bool hasAlpha = false;
@@ -58,26 +62,57 @@ Bitmap* BitmapFromIcon(HICON icon) {
                     break;
                 }
             }
-            if (!hasAlpha) {
-                for (DWORD& px : pixels) {
-                    if (px) px |= 0xFF000000;
+            for (DWORD& px : pixels) {
+                if (!hasAlpha) {
+                    if (px) px |= 0xFF000000;  // Old icons carry no alpha: any colour is opaque.
+                } else {
+                    const DWORD a = px >> 24;
+                    if (a != 255) {
+                        const DWORD r = ((px >> 16) & 0xFF) * a / 255, g = ((px >> 8) & 0xFF) * a / 255,
+                                    b = (px & 0xFF) * a / 255;
+                        px = (a << 24) | (r << 16) | (g << 8) | b;
+                    }
                 }
             }
-            result = new Bitmap(bm.bmWidth, bm.bmHeight, PixelFormat32bppARGB);
-            Rect rect(0, 0, bm.bmWidth, bm.bmHeight);
-            BitmapData data{};
-            if (result->LockBits(&rect, ImageLockModeWrite, PixelFormat32bppARGB, &data) == Ok) {
-                for (int y = 0; y < bm.bmHeight; y++) {
-                    memcpy(static_cast<BYTE*>(data.Scan0) + y * data.Stride, &pixels[y * bm.bmWidth], bm.bmWidth * 4);
-                }
-                result->UnlockBits(&data);
-            }
+            result = new Pixmap();
+            result->w = bm.bmWidth;
+            result->h = bm.bmHeight;
+            result->px = std::move(pixels);
         }
         ReleaseDC(nullptr, dc);
     }
     if (info.hbmColor) DeleteObject(info.hbmColor);
     if (info.hbmMask) DeleteObject(info.hbmMask);
     return result;
+}
+
+// Decodes an image file with WIC and scales it to px x px, premultiplied BGRA.
+Pixmap* LoadPixmapFile(const wchar_t* path, int px) {
+    Com<IWICImagingFactory> wic;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, __uuidof(IWICImagingFactory),
+                                reinterpret_cast<void**>(wic.Put())))) {
+        return nullptr;
+    }
+    Com<IWICBitmapDecoder> decoder;
+    Com<IWICBitmapFrameDecode> frame;
+    Com<IWICBitmapScaler> scaler;
+    Com<IWICFormatConverter> converter;
+    if (FAILED(wic->CreateDecoderFromFilename(path, nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, decoder.Put())) ||
+        FAILED(decoder->GetFrame(0, frame.Put())) || FAILED(wic->CreateBitmapScaler(scaler.Put())) ||
+        FAILED(scaler->Initialize(frame.Get(), px, px, WICBitmapInterpolationModeFant)) ||
+        FAILED(wic->CreateFormatConverter(converter.Put())) ||
+        FAILED(converter->Initialize(scaler.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0,
+                                     WICBitmapPaletteTypeCustom))) {
+        return nullptr;
+    }
+    auto* out = new Pixmap();
+    out->w = out->h = px;
+    out->px.resize((size_t)px * px);
+    if (FAILED(converter->CopyPixels(nullptr, px * 4, (UINT)(out->px.size() * 4), reinterpret_cast<BYTE*>(out->px.data())))) {
+        delete out;
+        return nullptr;
+    }
+    return out;
 }
 
 void LoadAppIcon(const std::wstring& path) {
@@ -89,7 +124,7 @@ void LoadAppIcon(const std::wstring& path) {
     g_appIcon = nullptr;
     SHFILEINFOW info{};
     if (!path.empty() && SHGetFileInfoW(path.c_str(), 0, &info, sizeof(info), SHGFI_ICON | SHGFI_LARGEICON) && info.hIcon) {
-        g_appIcon = BitmapFromIcon(info.hIcon);
+        g_appIcon = PixmapFromIcon(info.hIcon);
         DestroyIcon(info.hIcon);
     }
 }
@@ -166,6 +201,7 @@ void ReadForeground() {
     LoadAppIcon(path);
 }
 
+// Finds the account picture. The image itself is decoded at the size the bar needs, later, by EnsureAvatar.
 void LoadAvatar() {
     HANDLE token = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
@@ -189,22 +225,18 @@ void LoadAvatar() {
     // This process is 32-bit, and the value only exists in the 64-bit registry view.
     if (RegGetValueW(HKEY_LOCAL_MACHINE, key.c_str(), L"Image96", RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, nullptr, path,
                      &bytes) == ERROR_SUCCESS) {
-        auto* image = new Bitmap(path);
-        if (image->GetLastStatus() == Ok) {
-            g_avatar = image;
-        } else {
-            delete image;
-        }
+        g_avatarPath = path;
     }
 }
 
-void AddRounded(GraphicsPath& path, float x, float y, float w, float h, float r) {
-    float d = r * 2.0f;
-    path.AddArc(x, y, d, d, 180, 90);
-    path.AddArc(x + w - d, y, d, d, 270, 90);
-    path.AddArc(x + w - d, y + h - d, d, d, 0, 90);
-    path.AddArc(x, y + h - d, d, d, 90, 90);
-    path.CloseFigure();
+// Scales the avatar to the pixel size it is drawn at, again whenever that changes (DPI).
+void EnsureAvatar(int px) {
+    if (g_avatarPath.empty() || px <= 0 || g_avatarPx == px) {
+        return;
+    }
+    g_avatarPx = px;
+    delete g_avatar;
+    g_avatar = LoadPixmapFile(g_avatarPath.c_str(), px);
 }
 
 // Seelen's own thresholds for these icons.
@@ -215,4 +247,3 @@ IconId BatteryIcon() {
     if (g_battery > 5) return I_batlow;
     return I_batwarn;
 }
-

@@ -98,7 +98,7 @@ void SendPanelMode(WPARAM mode) {
     while ((hwnd = FindWindowExW(nullptr, hwnd, L"Windows.UI.Core.CoreWindow", nullptr))) {
         if (IsShellExperienceWindow(hwnd)) {
             DWORD_PTR result = 0;
-            SendMessageTimeoutW(hwnd, g_panelMessage, mode, 0, SMTO_ABORTIFHUNG, 200, &result);
+            SendMessageTimeoutW(hwnd, g_panelMessage, mode, 0, SMTO_ABORTIFHUNG, 50, &result);
         }
     }
 }

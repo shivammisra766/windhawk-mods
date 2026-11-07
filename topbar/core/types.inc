@@ -1,5 +1,4 @@
 
-
 constexpr wchar_t kClassName[] = L"WindhawkTopBar";
 constexpr UINT WM_APPBAR_CB = WM_APP + 1;
 constexpr UINT WM_REFRESH_NET = WM_APP + 3;
@@ -8,6 +7,7 @@ constexpr UINT WM_PROFILE_DONE = WM_APP + 5;  // From start-menu-pop. wParam 1: 
 constexpr UINT WM_REFRESH_TITLE = WM_APP + 6;
 constexpr UINT WM_APP_FRAME = WM_APP + 10;     // From the frame clock thread: one per display frame while animating.
 constexpr UINT WM_APP_SETTINGS = WM_APP + 11;  // From the settings callback, which runs on another thread.
+constexpr UINT WM_APP_PAINT = WM_APP + 12;     // Coalesced repaint request.
 constexpr UINT_PTR kClockTimer = 1;
 constexpr UINT_PTR kTitleTimer = 2;  // Coalesces title changes.
 constexpr UINT_PTR kPanelTimer = 3;
@@ -40,32 +40,42 @@ constexpr WPARAM kPanelCalendar = 2;
 constexpr float kItem = 16.0f;
 constexpr float kItemPad = 4.0f;
 constexpr float kBarH = 32.0f;
-constexpr float kBarPadX = 16.0f;
 constexpr float kGap = 4.0f;
 constexpr float kItemRadius = 4.8f;
 constexpr float kFontSize = 12.8f;
-constexpr float kPillH = 24.0f;
+constexpr float kPillH = 24.0f;  // Height of all three bubbles.
 constexpr float kPillPadX = 12.0f;
 constexpr float kPillButton = 20.0f;
-constexpr int kPillAnimMs = 200;
+constexpr float kBubbleMargin = 8.0f;  // Between a side bubble and the screen edge.
+constexpr float kBubblePad = 8.0f;     // Inside a side bubble, before the first item.
+constexpr float kBubbleClear = 12.0f;  // Least gap between the left bubble and the centre one.
 constexpr float kPanelGap = 8.0f;  // Between the bar and a native panel.
 constexpr float kPanelEdge = 8.0f;  // Keeps a panel this far from the screen edge.
 constexpr float kPanelDrop = 10.0f;  // A panel drops this far into place as it opens.
 constexpr int kPanelDropMs = 140;
 constexpr int kPanelAnchorMs = 1500;  // A click anchors the panel it opens for this long.
 
-// Seelen's dark tokens: gray-50 at 90%, gray-900.
-const Color kBarBg(230, 24, 24, 24);
-const Color kFg(255, 228, 228, 228);
+D2D1_COLOR_F Rgb(int r, int g, int b, int a = 255) {
+    return D2D1::ColorF(r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
+}
+
+// Side bubbles are a little see-through, the centre one is solid. Text is Seelen's gray.
+const D2D1_COLOR_F kSideBg = Rgb(0x10, 0x10, 0x10, 0xDC);
+const D2D1_COLOR_F kCentreBg = Rgb(0x10, 0x10, 0x10);
+const D2D1_COLOR_F kFg = Rgb(228, 228, 228);
 
 const GUID kGuidBatteryPercent = {0xA7AD8041, 0xB45A, 0x4CAE, {0x87, 0xA3, 0xEE, 0xCB, 0xB4, 0x68, 0xA9, 0xE1}};
 const GUID kGuidAcDc = {0x5D3E9A59, 0xE9D5, 0x4B00, {0xA6, 0xBD, 0xFF, 0x34, 0xFF, 0x51, 0x65, 0x48}};
 
 enum class Action { None, QuickSettings, Wifi, Bluetooth, TrayIcon, Notifications, Calendar, Profile };
 
+// Stable ids for hover, so a list that changes under the pointer doesn't move the highlight.
+enum HitId { H_none = 0, H_profile = 1, H_settings, H_battery, H_wifi, H_bluetooth, H_bell, H_calendar, H_trayBase = 1000 };
+
 struct Hit {
     RECT rect;
     Action action;
+    int id = 0;
     int data = 0;
 };
 
@@ -77,13 +87,13 @@ struct TrayIcon {
     UINT callback = 0;
     UINT version = 0;
     bool hidden = false;
-    Bitmap* bitmap = nullptr;
+    int uid = 0;  // Stable for the life of the icon.
+    Pixmap* pix = nullptr;
 };
 
 HWND g_hwnd = nullptr;
 HANDLE g_thread = nullptr;
 DWORD g_threadId = 0;
-ULONG_PTR g_gdiplusToken = 0;
 UINT g_taskbarCreated = 0;
 bool g_registered = false;
 bool g_tracking = false;
@@ -99,14 +109,12 @@ ULONGLONG g_anchorTick = 0;
 ULONGLONG g_panelOpenTick = 0;
 HWND g_notificationPanel = nullptr;
 int g_regionTop[3] = {};  // Clip top last seen for each mode, to place the panel before it opens.
-int g_hoverIndex = -1;
+int g_hoverId = H_none;
 std::vector<Hit> g_hits;
 
-// Pill animation: g_pillT runs from 0 (clock only) to 1 (buttons shown).
+// Pill animation: g_pillT runs from 0 (clock only) to 1 (buttons shown), driven by a spring.
 float g_pillT = 0.0f;
-float g_pillFrom = 0.0f;
 bool g_pillTarget = false;
-ULONGLONG g_pillStart = 0;
 RECT g_pillRect{};
 
 HWINEVENTHOOK g_foregroundHook = nullptr;
@@ -119,14 +127,15 @@ double g_lastFrame = 0;
 HANDLE g_netNotify = nullptr;
 HPOWERNOTIFY g_powerA = nullptr;
 HPOWERNOTIFY g_powerB = nullptr;
-Bitmap* g_avatar = nullptr;
-Bitmap* g_appIcon = nullptr;
+Pixmap* g_avatar = nullptr;
+std::wstring g_avatarPath;
+int g_avatarPx = 0;  // Size the avatar was last scaled to; 0 when it was not tried yet.
+Pixmap* g_appIcon = nullptr;
 std::wstring g_appIconPath;
-std::vector<GraphicsPath*> g_iconPaths;
 
 std::wstring g_appName;
 std::wstring g_title;
-Color g_accentBase(255, 0, 120, 212);
+BYTE g_accent[3] = {0, 120, 212};
 int g_battery = -1;
 bool g_charging = false;
 bool g_connected = true;
@@ -144,6 +153,7 @@ int g_reopenTries = 0;
 int g_reopenStage = 0;
 int g_reopenOpens = 0;
 std::vector<TrayIcon> g_tray;
+int g_trayUid = 0;
 ULONGLONG g_trayBroadcastTick = 0;
 
 float Scale() {
