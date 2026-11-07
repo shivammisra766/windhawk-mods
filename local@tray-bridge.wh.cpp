@@ -2,7 +2,7 @@
 // @id              tray-bridge
 // @name            Tray bridge
 // @description     Passes tray icon updates to the top bar, and places the volume and brightness popup over its centre bubble
-// @version         1.9
+// @version         1.11
 // @author          local
 // @include         explorer.exe
 // @architecture    x86-64
@@ -448,6 +448,42 @@ DWORD WINAPI OsdThread(void*) {
 }
 HANDLE g_osdThread = nullptr;
 
+// ---- Menus: plain see-through, no blur ----
+// Windows gives the XAML context menu's popup window a blurred system backdrop and a border; the user's theme is
+// Terminal's plain see-through tint (the styler draws it). Turn both off as each popup appears in this Explorer.
+using DwmSetWindowAttribute_t = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+DwmSetWindowAttribute_t g_dwmSet = nullptr;
+
+void CALLBACK PopupShown(HWINEVENTHOOK, DWORD, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
+    if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF || !hwnd || !g_dwmSet) return;
+    wchar_t cls[64];
+    if (!GetClassNameW(hwnd, cls, 64)) return;
+    // Build 26300's shell menus are WinAppSDK popups; older ones used system XAML's windowed popup class.
+    if (wcscmp(cls, L"Microsoft.UI.Content.PopupWindowSiteBridge") != 0 && wcsncmp(cls, L"Xaml_WindowedPopupClass", 23) != 0) return;
+    const DWORD noBackdrop = 1;          // DWMSBT_NONE
+    const DWORD noBorder = 0xFFFFFFFE;   // DWMWA_COLOR_NONE
+    g_dwmSet(hwnd, 38, &noBackdrop, sizeof(noBackdrop));  // DWMWA_SYSTEMBACKDROP_TYPE
+    g_dwmSet(hwnd, 34, &noBorder, sizeof(noBorder));      // DWMWA_BORDER_COLOR
+    Wh_Log(L"Popup %p: backdrop and border off", hwnd);
+}
+
+DWORD WINAPI PopupThread(void*) {
+    HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+    g_dwmSet = dwm ? reinterpret_cast<DwmSetWindowAttribute_t>(GetProcAddress(dwm, "DwmSetWindowAttribute")) : nullptr;
+    HWINEVENTHOOK hook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, nullptr, PopupShown, GetCurrentProcessId(), 0,
+                                         WINEVENT_OUTOFCONTEXT);
+    for (;;) {  // Out-of-context events arrive through this thread's message queue.
+        const DWORD w = MsgWaitForMultipleObjects(1, &g_stopEvent, FALSE, INFINITE, QS_ALLINPUT);
+        if (w != WAIT_OBJECT_0 + 1) break;
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+    }
+    if (hook) UnhookWinEvent(hook);
+    if (dwm) FreeLibrary(dwm);
+    return 0;
+}
+HANDLE g_popupThread = nullptr;
+
 }  // namespace
 
 BOOL Wh_ModInit() {
@@ -459,6 +495,7 @@ BOOL Wh_ModInit() {
     g_setupThread = CreateThread(nullptr, 0, SetupThread, nullptr, 0, nullptr);
     g_osdMessage = RegisterWindowMessageW(L"Windhawk_TopBar_Osd");
     g_osdThread = CreateThread(nullptr, 0, OsdThread, nullptr, 0, nullptr);
+    g_popupThread = CreateThread(nullptr, 0, PopupThread, nullptr, 0, nullptr);
     return TRUE;
 }
 
@@ -475,6 +512,11 @@ void Wh_ModUninit() {
         WaitForSingleObject(g_osdThread, 5000);
         CloseHandle(g_osdThread);
         g_osdThread = nullptr;
+    }
+    if (g_popupThread) {
+        WaitForSingleObject(g_popupThread, 5000);
+        CloseHandle(g_popupThread);
+        g_popupThread = nullptr;
     }
     // The hook is gone, so nothing queues any more; the sender may be mid-send (up to 200 ms).
     if (g_senderThread) {
