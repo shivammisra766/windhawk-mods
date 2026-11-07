@@ -43,6 +43,7 @@ public:
     virtual Size2 Measure(View) = 0;  // Called when state changes, not per frame.
     virtual void Draw(const DrawCtx&) = 0;
     virtual bool OnPointer(const PointerEvent&, View) { return false; }  // true: handled
+    virtual bool OnWheel(int steps) { return false; }  // Dashboard only; steps > 0 is wheel up. true: consumed, the page does not change.
     virtual void OnClickAlert() {}                                        // The alert was tapped.
 
     virtual bool Animating(View) const { return false; }  // True keeps the frame clock running.
@@ -57,6 +58,7 @@ public:
     void ClearAlert(IModule*);
 
     void Invalidate();       // Redraw the island once.
+    void Refresh();          // Measure() or PillPriority() changed: recompute the island's state.
     void WakeAnimation();    // Re-check Animating() and run the frame clock.
     void Post(std::function<void()>);  // From any thread to the UI thread.
     void SetTimer(IModule*, UINT ms, std::function<void()>);  // One timer per module; repeats until KillTimer.
@@ -128,25 +130,5 @@ public:
     }
 };
 
-// Stub dashboard page. Replaced by the real dashboards (P6c).
-class PlaceholderPage : public IModule {
-public:
-    PlaceholderPage(int index, int count) : index_(index), count_(count) {}
-    const wchar_t* Id() const override { return index_ == 1 ? L"page-1" : L"page-2"; }
-    bool HasDashboard() const override { return true; }
-    int DashboardOrder() const override { return index_ * 10; }
-    Size2 Measure(View) override { return {475.0f, 140.0f}; }
-    void Draw(const DrawCtx& c) override {
-        wchar_t line[64];
-        swprintf_s(line, L"Placeholder page %d of %d", index_, count_);
-        const float h = c.rect.bottom - c.rect.top;
-        DrawCentredText(c, line, D2D1::RectF(c.rect.left, c.rect.top + h * 0.22f, c.rect.right, c.rect.top + h * 0.5f), g_text.DefaultSize() * 1.4f);
-        DrawCentredText(c, L"Scroll to switch pages", D2D1::RectF(c.rect.left, c.rect.top + h * 0.5f, c.rect.right, c.rect.top + h * 0.7f));
-    }
-private:
-    int index_, count_;
-};
-
 ClockModule g_clockModule;
-PlaceholderPage g_page1(1, 2), g_page2(2, 2);
-// g_modules lives in bar/modules.inc, after the feature modules.
+DemoAlertModule g_demoAlert;

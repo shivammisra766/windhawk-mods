@@ -13,6 +13,8 @@ bar/render.inc
 bar/module.inc
 media/engine.inc
 media/media.inc
+bar/dash.inc
+bar/shelf.inc
 bar/modules.inc
 bar/placement.inc
 bar/panels.inc

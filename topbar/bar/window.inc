@@ -302,6 +302,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     InvalidateAll();
                     ResyncHover();
                 }
+            } else if (wp == kDropTimer) {
+                ShelfDropDwell();
             } else if (wp == kDwellTimer) {
                 IslandDwellTick();
             } else if (wp == kZoneTimer) {
@@ -421,6 +423,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_DESTROY:
             UnregisterHotKey(hwnd, kHotkeyId);
+            ShelfDropRevoke(hwnd);
             RemovePropW(hwnd, L"TopBarAnchorX");
             RemovePropW(hwnd, L"TopBarAnchorTick");
             UnregisterBar();
@@ -433,7 +436,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 DWORD WINAPI BarThread(void*) {
     SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    OleInitialize(nullptr);  // Drag and drop needs OLE, not only COM.
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = WndProc;
@@ -474,9 +477,12 @@ DWORD WINAPI BarThread(void*) {
                                        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     RehookTitle();
 
+    g_surface.SetBaseAlpha(1.0f / 255.0f);  // Gaps between bubbles stay drop targets.
     RegisterBar();
     IslandInit();
     ApplyMonitor();
+    ShelfDropRegister(g_hwnd);
+    ShelfDropRegister(g_isHwnd);
     ArmClock();
     InvalidateAll();
 
@@ -506,7 +512,7 @@ DWORD WINAPI BarThread(void*) {
     g_tray.clear();
     IslandShutdown();
     ReleaseGfx();
-    CoUninitialize();
+    OleUninitialize();
     return 0;
 }
 

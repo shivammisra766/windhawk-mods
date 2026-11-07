@@ -63,5 +63,11 @@
 - mediaExpandBlocklist: ""
   $name: Media - no auto-open for
   $description: Comma separated words. A match in the app name, app id or title keeps the player closed.
+- weatherCity: ""
+  $name: Weather city
+  $description: Leave empty to let wttr.in guess from your address.
+- fahrenheit: true
+  $name: Fahrenheit
+  $description: Off for Celsius and km/h.
 */
 // ==/WindhawkModSettings==

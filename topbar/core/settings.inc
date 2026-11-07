@@ -14,6 +14,8 @@ struct Settings {
     int monitor = 0;          // 0 primary, -1 follow the pointer (island only), n: the nth monitor
     bool mediaAutoExpand = true;
     std::wstring mediaBlocklist;  // comma separated, lowercased and trimmed by the media module
+    std::wstring weatherCity; // empty: wttr.in guesses from the address
+    bool fahrenheit = true;
 };
 
 Settings g_settings;
@@ -37,6 +39,8 @@ Settings LoadSettings() {
     s.dateAbove = Wh_GetIntSetting(L"dateAbove") != 0;
     s.mediaAutoExpand = Wh_GetIntSetting(L"mediaAutoExpand") != 0;
     if (PCWSTR v = Wh_GetStringSetting(L"mediaExpandBlocklist")) { s.mediaBlocklist = v; Wh_FreeStringSetting(v); }
+    if (PCWSTR v = Wh_GetStringSetting(L"weatherCity")) { s.weatherCity = v; Wh_FreeStringSetting(v); }
+    s.fahrenheit = Wh_GetIntSetting(L"fahrenheit") != 0;
     const int scale = Wh_GetIntSetting(L"fontScale");
     s.fontScale = scale >= 50 && scale <= 200 ? scale : 100;
     g_uiLang.clear();

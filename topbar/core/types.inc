@@ -24,6 +24,7 @@ constexpr UINT_PTR kAlertTimer = 11;   // Next alert deadline.
 constexpr UINT_PTR kWingTimer = 12;    // End of the hold that keeps bell and calendar out while a panel opens.
 constexpr UINT_PTR kFollowTimer = 13;  // Follow-mouse: which monitor the island is on. Exists only in that mode.
 constexpr int kHotkeyId = 1;  // Ctrl+Alt+D
+constexpr UINT_PTR kDropTimer = 14;     // Dwell before a drag over the bar opens the shelf.
 constexpr UINT_PTR kModuleTimerBase = 100;  // Module timers: base + slot.
 
 // From the tray-bridge mod in Explorer, which declares the same layout.
