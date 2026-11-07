@@ -2,7 +2,7 @@
 // @id              panel-split
 // @name            Panel split
 // @description     Lets the top bar open the native notifications or calendar on their own, hides toasts for the bar's island, and hides a cold first panel open
-// @version         1.10
+// @version         1.12
 // @author          local
 // @include         ShellExperienceHost.exe
 // @include         ShellHost.exe
@@ -179,7 +179,7 @@ int WINAPI SetWindowRgn_Hook(HWND hwnd, HRGN region, BOOL redraw) {
     if (region && PanelHiddenByBar(hwnd)) {
         if (HRGN empty = CreateRectRgn(0, 0, 0, 0)) {
             DeleteObject(region);
-            region = empty;
+            region = empty;
             return g_originalSetWindowRgn(hwnd, region, redraw);
         }
     }
@@ -225,6 +225,21 @@ FrameworkElement FindNamed(FrameworkElement const& root, PCWSTR name) {
     return nullptr;
 }
 
+// The room between the bar and the bottom of the screen, in XAML's units.
+double NotificationsMaxHeight(FrameworkElement const& root) {
+    HWND bar = FindWindowW(L"WindhawkTopBar", nullptr);
+    if (!bar || !root) return 0;
+    RECT r;
+    GetWindowRect(bar, &r);
+    MONITORINFO mi{sizeof(mi)};
+    GetMonitorInfoW(MonitorFromWindow(bar, MONITOR_DEFAULTTOPRIMARY), &mi);
+    const double s = GetDpiForWindow(bar) / 96.0;
+    const double room = (mi.rcMonitor.bottom - r.bottom) / s - kPanelGap - kPanelEdge;
+    // Its top and the lift must stay inside the window, or they get cut off.
+    const double inWindow = root.ActualHeight() + 2.0 * kNotificationsLift;
+    return inWindow > 0 && inWindow < room ? inWindow : room;
+}
+
 // Runs on the XAML thread that owns the current window.
 void ApplyMode(WPARAM mode) {
     auto window = Window::Current();
@@ -236,8 +251,18 @@ void ApplyMode(WPARAM mode) {
     auto calendar = FindNamed(root, L"CalendarCenterGrid");
     if (notifications) {
         notifications.Visibility(mode == kModeCalendar ? Visibility::Collapsed : Visibility::Visible);
-        // Alone, the card sits at the bottom of its clip with a constant empty strip above it,
-        // leaving a gap under the bar. Sliding it up through that strip stays inside the clip.
+        // Alone, the card would stretch over the calendar's room and past the screen's bottom.
+        // Windows works out the clip from the window's bottom up, so the card stays at the bottom,
+        // where it fits its content and scrolls once it fills the room under the bar.
+        // Alone, it also has a constant empty strip above it, leaving a gap under the bar.
+        // Sliding it up through that strip stays inside the clip.
+        if (mode == kModeNotifications) {
+            notifications.VerticalAlignment(VerticalAlignment::Bottom);
+            if (const double height = NotificationsMaxHeight(root); height > 0) notifications.MaxHeight(height);
+        } else {
+            notifications.ClearValue(FrameworkElement::VerticalAlignmentProperty());
+            notifications.ClearValue(FrameworkElement::MaxHeightProperty());
+        }
         notifications.Translation({0.0f, mode == kModeNotifications ? kNotificationsLift : 0.0f, 0.0f});
     }
     if (calendar) {

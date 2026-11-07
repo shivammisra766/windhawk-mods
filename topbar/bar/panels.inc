@@ -41,6 +41,18 @@ bool IsQuickSettingsWindow(HWND hwnd) {
     return !wcscmp(cls, L"ControlCenterWindow");
 }
 
+// Centred under the clicked icon, except the notifications: the bell stands beside the island, so
+// that panel ends at the bell's right side and hangs away from the island.
+int AnchoredPanelX(HWND hwnd, const RECT& box, const MONITORINFO& mi, float s) {
+    constexpr float kBellHalf = 16.0f;
+    const int edge = (int)(kPanelEdge * s + 0.5f);
+    int x = g_anchorX - (box.left + box.right) / 2;
+    if (g_panelMode == kPanelNotifications && !IsQuickSettingsWindow(hwnd)) x = g_anchorX + (int)(kBellHalf * s) - box.right;
+    if (x + box.right > mi.rcMonitor.right - edge) x = mi.rcMonitor.right - edge - box.right;
+    if (x + box.left < mi.rcMonitor.left + edge) x = mi.rcMonitor.left + edge - box.left;
+    return x;
+}
+
 // These panels are tall windows clipped to a region around their content, and they
 // only paint inside it. Moving the window is what puts the content under the bar;
 // moving the content inside the window would push it out of the region.
@@ -63,10 +75,7 @@ void PlacePanel(HWND hwnd) {
     GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &mi);
     int x = r.left;
     if (anchored) {
-        const int edge = (int)(kPanelEdge * s + 0.5f);
-        x = g_anchorX - (box.left + box.right) / 2;
-        if (x + box.right > mi.rcMonitor.right - edge) x = mi.rcMonitor.right - edge - box.right;
-        if (x + box.left < mi.rcMonitor.left + edge) x = mi.rcMonitor.left + edge - box.left;
+        x = AnchoredPanelX(hwnd, box, mi, s);
     } else if (!IsQuickSettingsWindow(hwnd)) {
         x = mi.rcMonitor.right - box.right;
     }
@@ -122,8 +131,7 @@ void StepPanelFollow() {
         // so reopen once, now that it can be set beforehand.
         g_panelCold = false;
         g_panelResend = 0;
-        RemovePropW(g_hwnd, L"TopBarPanelHideTick");  // The reopen is the one to show.
-        SendWinKey('N');
+        SendWinKey('N');  // The clip comes just after the focus, so hiding lasts until the reopen below.
         g_reopenStage = 0;
         g_reopenTries = 15;
         SetTimer(g_hwnd, kReopenTimer, 100, nullptr);
@@ -164,6 +172,7 @@ void TogglePanel(WPARAM mode) {
     g_panelCold = !g_notificationPanel || !IsWindow(g_notificationPanel);
     // P7: the cold first cycle is not shown (panel-split replaces the clip with an empty one until the reopen).
     if (g_panelCold) SetPropW(g_hwnd, L"TopBarPanelHideTick", reinterpret_cast<HANDLE>((UINT_PTR)GetTickCount()));
+    else RemovePropW(g_hwnd, L"TopBarPanelHideTick");  // The reopen, or any warm open, is the one to show.
     g_panelResend = 6;
     SendPanelMode(mode);
     // This panel opens wherever it was left, so put it in place first. The clip only updates
@@ -177,10 +186,7 @@ void TogglePanel(WPARAM mode) {
             const float s = Scale();
             MONITORINFO mi{sizeof(mi)};
             GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &mi);
-            const int edge = (int)(kPanelEdge * s + 0.5f);
-            int x = g_anchorX - (box.left + box.right) / 2;
-            if (x + box.right > mi.rcMonitor.right - edge) x = mi.rcMonitor.right - edge - box.right;
-            if (x + box.left < mi.rcMonitor.left + edge) x = mi.rcMonitor.left + edge - box.left;
+            const int x = AnchoredPanelX(g_notificationPanel, box, mi, s);
             const int y = bar.bottom + (int)(kPanelGap * s + 0.5f) - g_regionTop[mode] - (int)(kPanelDrop * s);
             SetWindowPos(g_notificationPanel, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
             g_panelOpenTick = GetTickCount64();
