@@ -29,6 +29,10 @@ constexpr UINT_PTR kModuleTimerBase = 100;  // Module timers: base + slot.
 
 // From the tray-bridge mod in Explorer, which declares the same layout.
 constexpr ULONG_PTR kTrayCopyData = 0x7472;
+// Set by the bar at start; the bridge then sends its whole table of current icons.
+constexpr wchar_t kTrayReplayEventName[] = L"Local\\WindhawkTopBarTrayReplay";
+// wParam of the bridge's own TaskbarCreated broadcast (only when it loads into a running Explorer).
+constexpr WPARAM kTrayBridgeBroadcast = 0x7472;
 struct BarTrayMessage {
     DWORD message;
     DWORD hwnd;
