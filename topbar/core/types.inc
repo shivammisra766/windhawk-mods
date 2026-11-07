@@ -21,7 +21,6 @@ constexpr UINT_PTR kQuickReopenTimer = 8;
 constexpr UINT_PTR kDwellTimer = 9;    // Hover dwell before the island expands.
 constexpr UINT_PTR kZoneTimer = 10;    // Polls the pointer against the hover zone, only while expanded.
 constexpr UINT_PTR kAlertTimer = 11;   // Next alert deadline.
-constexpr UINT_PTR kWingTimer = 12;    // End of the hold that keeps bell and calendar out while a panel opens.
 constexpr UINT_PTR kFollowTimer = 13;  // Follow-mouse: which monitor the island is on. Exists only in that mode.
 constexpr int kHotkeyId = 1;  // Ctrl+Alt+D
 constexpr UINT_PTR kDropTimer = 14;     // Dwell before a drag over the bar opens the shelf.
@@ -46,9 +45,11 @@ struct BarTrayMessage {
     GUID guid;
     WCHAR tip[128];
 };
-// Modes understood by the panel-split mod inside ShellExperienceHost.
-constexpr WPARAM kPanelNotifications = 1;
+// Modes understood by the panel-split mod inside ShellExperienceHost. Native: notifications alone at
+// their usual place above the dock (panel-split's default while the bar is up). Calendar: alone, under the island.
+constexpr WPARAM kPanelNative = 0;
 constexpr WPARAM kPanelCalendar = 2;
+constexpr int kCalendarClaimMs = 4000;  // A panel host focused this soon after the bar opened the calendar is the calendar.
 
 // Seelen fancy-toolbar, in CSS px scaled by DPI: item size 16, padding 8, margin 0.
 constexpr float kItem = 16.0f;
@@ -59,7 +60,6 @@ constexpr float kItemRadius = 4.8f;
 constexpr float kFontSize = 12.8f;
 constexpr float kPillH = 24.0f;  // Height of all three bubbles.
 constexpr float kPillPadX = 12.0f;
-constexpr float kWingSize = 28.0f;     // Bell and calendar buttons.
 // Island (notch). DIP.
 constexpr float kNotchH = 30.0f;       // Collapsed height; the bar strip is 32.
 constexpr float kNotchShoulder = 6.0f; // Concave fillet where the notch meets the screen edge.
@@ -70,7 +70,6 @@ constexpr float kIslandMaxH = 184.0f;
 constexpr UINT kDwellMs = 120;
 constexpr UINT kLeaveGraceMs = 250;
 constexpr UINT kZonePollMs = 50;
-constexpr int kWingHoldMs = 1500;
 constexpr float kBubbleMargin = 8.0f;  // Between a side bubble and the screen edge.
 constexpr float kBubblePad = 8.0f;     // Inside a side bubble, before the first item.
 constexpr float kBubbleClear = 12.0f;  // Least gap between the left bubble and the centre one.
@@ -92,10 +91,10 @@ const D2D1_COLOR_F kFg = Rgb(228, 228, 228);
 const GUID kGuidBatteryPercent = {0xA7AD8041, 0xB45A, 0x4CAE, {0x87, 0xA3, 0xEE, 0xCB, 0xB4, 0x68, 0xA9, 0xE1}};
 const GUID kGuidAcDc = {0x5D3E9A59, 0xE9D5, 0x4B00, {0xA6, 0xBD, 0xFF, 0x34, 0xFF, 0x51, 0x65, 0x48}};
 
-enum class Action { None, QuickSettings, Wifi, Bluetooth, TrayIcon, Notifications, Calendar, Profile };
+enum class Action { None, QuickSettings, Wifi, Bluetooth, TrayIcon, Profile };
 
 // Stable ids for hover, so a list that changes under the pointer doesn't move the highlight.
-enum HitId { H_none = 0, H_profile = 1, H_settings, H_battery, H_wifi, H_bluetooth, H_bell, H_calendar, H_trayBase = 1000 };
+enum HitId { H_none = 0, H_profile = 1, H_settings, H_battery, H_wifi, H_bluetooth, H_trayBase = 1000 };
 
 struct Hit {
     RECT rect;
@@ -133,6 +132,9 @@ Action g_quickPage = Action::None;
 int g_anchorX = 0;
 ULONGLONG g_anchorTick = 0;
 ULONGLONG g_panelOpenTick = 0;
+ULONGLONG g_calendarTick = 0;  // Last time the bar opened (or reopened) the calendar.
+RECT g_nativePanelRect{};      // The panel host's window where Windows keeps it, saved before the bar first moves it.
+bool g_panelMoved = false;     // The bar moved that window for the calendar and has not put it back yet.
 HWND g_notificationPanel = nullptr;
 int g_regionTop[3] = {};  // Clip top last seen for each mode, to place the panel before it opens.
 int g_hoverId = H_none;

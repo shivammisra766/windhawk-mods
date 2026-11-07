@@ -227,6 +227,8 @@ public:
     int DashboardOrder() const override { return 10; }
     void Draw(const DrawCtx& c) override {
         Pg p(c);
+        hits_.clear();
+        Hit(0, 0, kPageW, kPageH, 1);  // The whole page: a click opens the calendar.
         wchar_t tm[40] = {}, dt[64] = {};
         GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, nullptr, nullptr, tm, 40);
         GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, L"dddd, MMMM d", dt, 64, nullptr);
@@ -249,6 +251,7 @@ public:
         }
     }
 protected:
+    void Click(int) override { IslandOpenCalendar(); }
     void Shown() override {
         SYSTEM_POWER_STATUS st{};
         life_ = GetSystemPowerStatus(&st) ? st.BatteryLifeTime : 0xFFFFFFFFu;
@@ -257,7 +260,7 @@ private:
     DWORD life_ = 0xFFFFFFFFu;
 };
 
-// ---- Calendar (read-only; the bell-side button still opens the native calendar) ----
+// ---- Calendar (read-only; a click on the clock or the idle page opens the native calendar) ----
 int DaysInMonth(int y, int m) {
     static const int d[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
     const bool leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;

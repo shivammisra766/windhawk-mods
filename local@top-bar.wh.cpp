@@ -2,7 +2,7 @@
 // @id              top-bar
 // @name            Top bar
 // @description     Top bar with three bubbles in the Seelen toolbar style, drawn with Direct2D
-// @version         4.3
+// @version         4.4
 // @author          local
 // @include         windhawk.exe
 // @compilerOptions -lgdi32 -luser32 -lshell32 -ladvapi32 -lole32 -lversion -lwininet -liphlpapi -luuid -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -lruntimeobject -loleaut32 -lsetupapi -lpdh -lwbemuuid
@@ -283,7 +283,6 @@ constexpr UINT_PTR kQuickReopenTimer = 8;
 constexpr UINT_PTR kDwellTimer = 9;    // Hover dwell before the island expands.
 constexpr UINT_PTR kZoneTimer = 10;    // Polls the pointer against the hover zone, only while expanded.
 constexpr UINT_PTR kAlertTimer = 11;   // Next alert deadline.
-constexpr UINT_PTR kWingTimer = 12;    // End of the hold that keeps bell and calendar out while a panel opens.
 constexpr UINT_PTR kFollowTimer = 13;  // Follow-mouse: which monitor the island is on. Exists only in that mode.
 constexpr int kHotkeyId = 1;  // Ctrl+Alt+D
 constexpr UINT_PTR kDropTimer = 14;     // Dwell before a drag over the bar opens the shelf.
@@ -308,9 +307,11 @@ struct BarTrayMessage {
     GUID guid;
     WCHAR tip[128];
 };
-// Modes understood by the panel-split mod inside ShellExperienceHost.
-constexpr WPARAM kPanelNotifications = 1;
+// Modes understood by the panel-split mod inside ShellExperienceHost. Native: notifications alone at
+// their usual place above the dock (panel-split's default while the bar is up). Calendar: alone, under the island.
+constexpr WPARAM kPanelNative = 0;
 constexpr WPARAM kPanelCalendar = 2;
+constexpr int kCalendarClaimMs = 4000;  // A panel host focused this soon after the bar opened the calendar is the calendar.
 
 // Seelen fancy-toolbar, in CSS px scaled by DPI: item size 16, padding 8, margin 0.
 constexpr float kItem = 16.0f;
@@ -321,7 +322,6 @@ constexpr float kItemRadius = 4.8f;
 constexpr float kFontSize = 12.8f;
 constexpr float kPillH = 24.0f;  // Height of all three bubbles.
 constexpr float kPillPadX = 12.0f;
-constexpr float kWingSize = 28.0f;     // Bell and calendar buttons.
 // Island (notch). DIP.
 constexpr float kNotchH = 30.0f;       // Collapsed height; the bar strip is 32.
 constexpr float kNotchShoulder = 6.0f; // Concave fillet where the notch meets the screen edge.
@@ -332,7 +332,6 @@ constexpr float kIslandMaxH = 184.0f;
 constexpr UINT kDwellMs = 120;
 constexpr UINT kLeaveGraceMs = 250;
 constexpr UINT kZonePollMs = 50;
-constexpr int kWingHoldMs = 1500;
 constexpr float kBubbleMargin = 8.0f;  // Between a side bubble and the screen edge.
 constexpr float kBubblePad = 8.0f;     // Inside a side bubble, before the first item.
 constexpr float kBubbleClear = 12.0f;  // Least gap between the left bubble and the centre one.
@@ -354,10 +353,10 @@ const D2D1_COLOR_F kFg = Rgb(228, 228, 228);
 const GUID kGuidBatteryPercent = {0xA7AD8041, 0xB45A, 0x4CAE, {0x87, 0xA3, 0xEE, 0xCB, 0xB4, 0x68, 0xA9, 0xE1}};
 const GUID kGuidAcDc = {0x5D3E9A59, 0xE9D5, 0x4B00, {0xA6, 0xBD, 0xFF, 0x34, 0xFF, 0x51, 0x65, 0x48}};
 
-enum class Action { None, QuickSettings, Wifi, Bluetooth, TrayIcon, Notifications, Calendar, Profile };
+enum class Action { None, QuickSettings, Wifi, Bluetooth, TrayIcon, Profile };
 
 // Stable ids for hover, so a list that changes under the pointer doesn't move the highlight.
-enum HitId { H_none = 0, H_profile = 1, H_settings, H_battery, H_wifi, H_bluetooth, H_bell, H_calendar, H_trayBase = 1000 };
+enum HitId { H_none = 0, H_profile = 1, H_settings, H_battery, H_wifi, H_bluetooth, H_trayBase = 1000 };
 
 struct Hit {
     RECT rect;
@@ -395,6 +394,9 @@ Action g_quickPage = Action::None;
 int g_anchorX = 0;
 ULONGLONG g_anchorTick = 0;
 ULONGLONG g_panelOpenTick = 0;
+ULONGLONG g_calendarTick = 0;  // Last time the bar opened (or reopened) the calendar.
+RECT g_nativePanelRect{};      // The panel host's window where Windows keeps it, saved before the bar first moves it.
+bool g_panelMoved = false;     // The bar moved that window for the calendar and has not put it back yet.
 HWND g_notificationPanel = nullptr;
 int g_regionTop[3] = {};  // Clip top last seen for each mode, to place the panel before it opens.
 int g_hoverId = H_none;
@@ -1374,12 +1376,9 @@ RECT g_dirty{};
 bool g_dirtyAny = false;
 bool g_dirtyWhole = false;
 bool g_paintPending = false;
-RECT g_bubbleRect[5]{};  // As last painted: left, (centre: the island's own window), right, bell, calendar.
+constexpr int kBubbles = 3;
+RECT g_bubbleRect[kBubbles]{};  // As last painted: left, (centre: the island's own window), right.
 bool g_isDirty = false;  // The island needs drawing (see island.inc).
-float g_wingT = 0.0f;    // Bell and calendar travel: 0 parked under the notch, 1 at their place.
-float g_wingX[2]{};      // Their place (bar pixels, left edge), valid when g_wingOk.
-bool g_wingOk[2]{};      // False when the title or tray leave no room for the button.
-float g_wingSize = 0;
 float IslandMaxExpandedW();  // DIP, island.inc
 
 enum class CmdKind { Hover, Text, Icon, Avatar, Person, Pixmap, Tray };
@@ -1397,8 +1396,8 @@ struct Cmd {
 };
 
 std::vector<Cmd> g_cmds;
-D2D1_RECT_F g_bubbles[5]{};  // 0 left, 1 unused, 2 right, 3 bell, 4 calendar
-bool g_hasBubble[5]{};
+D2D1_RECT_F g_bubbles[kBubbles]{};  // 0 left, 1 unused, 2 right
+bool g_hasBubble[kBubbles]{};
 float g_bubbleRadius = 0;
 
 bool EmptyRect(const RECT& r) { return r.right <= r.left || r.bottom <= r.top; }
@@ -1579,10 +1578,9 @@ void Layout(int W, int H) {
     float drawnRight = left + slot;
     left += slot + gap;
 
-    // The left bubble stops where the bell will stand when the island is fully open, so nothing reflows.
-    const float btn = roundf(kWingSize * s);
+    // The left bubble stops short of the island at its widest, so nothing reflows when it opens.
     const float expHalf = IslandMaxExpandedW() * s / 2.0f + kNotchShoulder * s;
-    const float limit = (W / 2.0f - expHalf) - margin - gap - btn - gap - bpad;
+    const float limit = (W / 2.0f - expHalf) - kBubbleClear * s - bpad;
     auto textItem = [&](const std::wstring& str) {
         const float w = g_text.Measure(str);
         if (left + pad + w < limit) {
@@ -1615,36 +1613,6 @@ void Layout(int W, int H) {
     }
     g_bubbles[0] = D2D1::RectF(margin, by, drawnRight + bpad, by + bubbleH);
     g_hasBubble[0] = true;
-
-    // Bell and calendar run out from under the notch to stand beside the side bubbles.
-    g_wingSize = btn;
-    const float parked = W / 2.0f - btn / 2.0f;
-    const float wy = floorf((H - btn) / 2.0f);
-    g_wingX[0] = roundf(g_bubbles[0].right + gap);
-    g_wingX[1] = roundf(g_bubbles[2].left - gap - btn);
-    g_wingOk[0] = g_wingX[0] + btn + gap <= W / 2.0f - expHalf;
-    g_wingOk[1] = g_wingX[1] >= W / 2.0f + expHalf + gap;
-    static bool logged[2];
-    for (int i = 0; i < 2; i++) {
-        if (g_wingOk[i] == logged[i]) {
-            logged[i] = !g_wingOk[i];
-            if (!g_wingOk[i]) Wh_Log(L"No room for the %ls button beside the island", i ? L"calendar" : L"bell");
-        }
-    }
-    if (g_wingT > 0.01f) {
-        const float t = g_wingT;
-        for (int i = 0; i < 2; i++) {
-            if (!g_wingOk[i]) continue;
-            const float x = parked + (g_wingX[i] - parked) * t;
-            const int slot = 3 + i;
-            g_bubbles[slot] = D2D1::RectF(x, wy, x + btn, wy + btn);
-            g_hasBubble[slot] = true;
-            if (t > 0.6f) {
-                addHit(x, wy, btn, btn, btn / 2.0f, i ? Action::Calendar : Action::Notifications, i ? H_calendar : H_bell);
-            }
-            iconCmd(i ? I_calendar : I_bell, x + btn / 2.0f, wy + btn / 2.0f, (i ? 14.0f : 16.0f) * s);
-        }
-    }
 }
 
 ID2D1Bitmap* BitmapOf(ID2D1RenderTarget* rt, Pixmap& p) {
@@ -1664,11 +1632,10 @@ void DrawFrame(ID2D1RenderTarget* rt) {
         brush->SetColor(c);
     };
 
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < kBubbles; i++) {
         if (!g_hasBubble[i]) continue;
-        const float radius = i < 3 ? g_bubbleRadius : g_wingSize / 2.0f;
         color(kSideBg);
-        rt->FillRoundedRectangle(D2D1::RoundedRect(g_bubbles[i], radius, radius), brush);
+        rt->FillRoundedRectangle(D2D1::RoundedRect(g_bubbles[i], g_bubbleRadius, g_bubbleRadius), brush);
     }
 
     for (const Cmd& c : g_cmds) {
@@ -1760,7 +1727,7 @@ void Paint() {
 
     // Whatever moved or resized: old and new place both need drawing.
     RECT dirty = whole ? RECT{0, 0, W, H} : g_dirty;
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < kBubbles; i++) {
         RECT now{};
         if (g_hasBubble[i]) {
             now = {(LONG)floorf(g_bubbles[i].left) - 1, (LONG)floorf(g_bubbles[i].top) - 1,
@@ -1925,10 +1892,23 @@ void DrawCentredText(const DrawCtx& c, const std::wstring& text, D2D1_RECT_F r, 
 void AlertsFullscreenChanged();  // topbar/alerts/alerts.inc
 float AlertsDotsReserve();  // Extra pill width (DIP, both sides) while a privacy dot is shown.
 
-// The collapsed content: date and time.
+void IslandOpenCalendar();  // island.inc: the native calendar, under the island.
+
+// The collapsed content: date and time. A click opens the calendar.
 class ClockModule : public IModule {
 public:
     const wchar_t* Id() const override { return L"clock"; }
+    bool OnPointer(const PointerEvent& e, View v) override {
+        if (v != View::Pill) return false;
+        if (e.kind == PointerEvent::Leave) down_ = false;
+        if (!e.left) return false;
+        if (e.kind == PointerEvent::Down) down_ = true;
+        if (e.kind == PointerEvent::Up && down_) {
+            down_ = false;
+            IslandOpenCalendar();
+        }
+        return true;
+    }
     Size2 Measure(View) override {
         const float size = g_settings.dateAbove ? g_text.DefaultSize() * 0.85f : 0.0f;  // Two lines need to be smaller.
         return {ToDip(StableWidth(ClockText(), size)) + 2 * kPillPadX + AlertsDotsReserve(), kNotchH};
@@ -1936,6 +1916,8 @@ public:
     void Draw(const DrawCtx& c) override {
         DrawCentredText(c, ClockText(), c.rect, g_settings.dateAbove ? g_text.DefaultSize() * 0.85f : 0.0f);
     }
+private:
+    bool down_ = false;
 };
 
 ClockModule g_clockModule;
@@ -3527,6 +3509,8 @@ public:
     int DashboardOrder() const override { return 10; }
     void Draw(const DrawCtx& c) override {
         Pg p(c);
+        hits_.clear();
+        Hit(0, 0, kPageW, kPageH, 1);  // The whole page: a click opens the calendar.
         wchar_t tm[40] = {}, dt[64] = {};
         GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, nullptr, nullptr, tm, 40);
         GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, L"dddd, MMMM d", dt, 64, nullptr);
@@ -3549,6 +3533,7 @@ public:
         }
     }
 protected:
+    void Click(int) override { IslandOpenCalendar(); }
     void Shown() override {
         SYSTEM_POWER_STATUS st{};
         life_ = GetSystemPowerStatus(&st) ? st.BatteryLifeTime : 0xFFFFFFFFu;
@@ -3557,7 +3542,7 @@ private:
     DWORD life_ = 0xFFFFFFFFu;
 };
 
-// ---- Calendar (read-only; the bell-side button still opens the native calendar) ----
+// ---- Calendar (read-only; a click on the clock or the idle page opens the native calendar) ----
 int DaysInMonth(int y, int m) {
     static const int d[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
     const bool leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
@@ -5724,13 +5709,52 @@ bool IsQuickSettingsWindow(HWND hwnd) {
     return !wcscmp(cls, L"ControlCenterWindow");
 }
 
-// Centred under the clicked icon, except the notifications: the bell stands beside the island, so
-// that panel ends at the bell's right side and hangs away from the island.
-int AnchoredPanelX(HWND hwnd, const RECT& box, const MONITORINFO& mi, float s) {
-    constexpr float kBellHalf = 16.0f;
+// The bar opened the calendar a moment ago, so the panel host now taking focus is that calendar.
+bool CalendarOpenWanted() {
+    return g_panelMode == kPanelCalendar && GetTickCount64() - g_calendarTick < (ULONGLONG)kCalendarClaimMs;
+}
+
+// The notification panel opens wherever its window was left, so before the bar moves it for the
+// calendar, remember the native place, and put it back before a native open. A place that does not
+// end near the bottom of the work area was left by an older bar: use the native corner instead.
+void SaveNativePanelRect(HWND hwnd) {
+    if (g_panelMoved || IsQuickSettingsWindow(hwnd)) {
+        return;
+    }
+    RECT r;
+    if (!GetWindowRect(hwnd, &r)) {
+        return;
+    }
+    MONITORINFO mi{sizeof(mi)};
+    GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &mi);
+    const int slack = (int)(64.0f * Scale());
+    if (r.bottom < mi.rcWork.bottom - slack || r.bottom > mi.rcMonitor.bottom + slack) {
+        const int w = r.right - r.left, h = r.bottom - r.top;
+        r.right = mi.rcMonitor.right;
+        r.left = r.right - w;
+        r.bottom = mi.rcWork.bottom;
+        r.top = r.bottom - h;
+    }
+    g_nativePanelRect = r;
+    g_panelMoved = true;
+}
+
+void RestoreNativePanel(HWND hwnd) {
+    if (!g_panelMoved || !hwnd || !IsWindow(hwnd)) {
+        return;
+    }
+    g_panelMoved = false;
+    RECT r;
+    if (GetWindowRect(hwnd, &r) && (r.left != g_nativePanelRect.left || r.top != g_nativePanelRect.top)) {
+        SetWindowPos(hwnd, nullptr, g_nativePanelRect.left, g_nativePanelRect.top, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+    }
+}
+
+// Centred under the clicked icon (the calendar: under the island).
+int AnchoredPanelX(HWND, const RECT& box, const MONITORINFO& mi, float s) {
     const int edge = (int)(kPanelEdge * s + 0.5f);
     int x = g_anchorX - (box.left + box.right) / 2;
-    if (g_panelMode == kPanelNotifications && !IsQuickSettingsWindow(hwnd)) x = g_anchorX + (int)(kBellHalf * s) - box.right;
     if (x + box.right > mi.rcMonitor.right - edge) x = mi.rcMonitor.right - edge - box.right;
     if (x + box.left < mi.rcMonitor.left + edge) x = mi.rcMonitor.left + edge - box.left;
     return x;
@@ -5740,6 +5764,10 @@ int AnchoredPanelX(HWND hwnd, const RECT& box, const MONITORINFO& mi, float s) {
 // only paint inside it. Moving the window is what puts the content under the bar;
 // moving the content inside the window would push it out of the region.
 void PlacePanel(HWND hwnd) {
+    // Only Quick Settings and the bar's calendar hang from the bar; the notifications stay native.
+    if (!IsQuickSettingsWindow(hwnd) && g_panelMode != kPanelCalendar) {
+        return;
+    }
     RECT box;
     const int kind = GetWindowRgnBox(hwnd, &box);
     if (kind == ERROR || kind == NULLREGION) {
@@ -5773,6 +5801,7 @@ void PlacePanel(HWND hwnd) {
         y -= (int)(kPanelDrop * s * t * t * t);
     }
     if (x != r.left || y != r.top) {
+        SaveNativePanelRect(hwnd);
         SetWindowPos(hwnd, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
     }
 }
@@ -5835,7 +5864,8 @@ void StepPanelFollow() {
     }
 }
 
-// Shows one half of the native notification and calendar panel.
+// Shows one half of the native notification and calendar panel: the calendar under the island, or
+// the notifications at their native place (kPanelNative).
 void TogglePanel(WPARAM mode) {
     HWND fg = GetForegroundWindow();
     const bool open = fg && IsShellExperienceWindow(fg);
@@ -5844,6 +5874,7 @@ void TogglePanel(WPARAM mode) {
         return;
     }
     g_panelMode = mode;
+    if (mode == kPanelCalendar) g_calendarTick = GetTickCount64();
     if (open) {
         // Windows sizes the panel's clip region as it opens, so changing parts means reopening.
         SendWinKey('N');
@@ -5860,7 +5891,7 @@ void TogglePanel(WPARAM mode) {
     SendPanelMode(mode);
     // This panel opens wherever it was left, so put it in place first. The clip only updates
     // once it opens, so use its top from the last time this mode was shown.
-    if (g_notificationPanel && IsWindow(g_notificationPanel) && g_regionTop[mode]) {
+    if (mode == kPanelCalendar && g_notificationPanel && IsWindow(g_notificationPanel) && g_regionTop[mode]) {
         RECT box, bar, r;
         const int kind = GetWindowRgnBox(g_notificationPanel, &box);
         if (kind != ERROR && kind != NULLREGION) {
@@ -5871,6 +5902,7 @@ void TogglePanel(WPARAM mode) {
             GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &mi);
             const int x = AnchoredPanelX(g_notificationPanel, box, mi, s);
             const int y = bar.bottom + (int)(kPanelGap * s + 0.5f) - g_regionTop[mode] - (int)(kPanelDrop * s);
+            SaveNativePanelRect(g_notificationPanel);
             SetWindowPos(g_notificationPanel, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
             g_panelOpenTick = GetTickCount64();
         }
@@ -6158,7 +6190,6 @@ bool AlertsHoldsHover();  // The alert on show is a slider: hovering it must not
 IState g_isState = IState::Collapsed;
 Spring g_cover;         // 0 island shown, 1 faded out under the native volume popup (P5b).
 Spring g_isW, g_isH;    // Body size, pixels.
-Spring g_wing;          // 0 bell and calendar parked, 1 out.
 Spring g_mix;           // Cross-fade between g_viewPrev and g_viewCur.
 ViewSel g_viewCur, g_viewPrev;
 Size2 g_curSize{}, g_prevSize{};  // Measure() of each, taken when state changes.
@@ -6172,7 +6203,6 @@ int g_tab = 0;
 int g_tabDir = 1;  // Direction of the last page change, for the slide.
 int g_wheelAcc = 0;
 ULONGLONG g_leaveSince = 0;
-ULONGLONG g_wingHold = 0;
 ULONGLONG g_autoUntil = 0;  // Services::Expand: stays open until then even without the pointer.
 ULONGLONG g_alertSeq = 0;
 std::vector<AlertItem> g_alerts;
@@ -6219,17 +6249,12 @@ float IslandMaxExpandedW() {
     return w > 0 ? std::min(w, kIslandMaxW) : 475.0f;
 }
 
-bool PanelWingsWanted() {
-    HWND fg = GetForegroundWindow();
-    return fg && IsShellExperienceWindow(fg) && (g_panelMode == kPanelNotifications || g_panelMode == kPanelCalendar);
-}
-
 void AimIfChanged(Spring& sp, float target, float k, float c) {
     if (fabsf(sp.target - target) > 0.01f) sp.Aim(target, k, c);
 }
 
 bool IslandSettled() {
-    return g_isW.Settled() && g_isH.Settled() && g_wing.Settled() && g_mix.Settled() && g_cover.Settled();
+    return g_isW.Settled() && g_isH.Settled() && g_mix.Settled() && g_cover.Settled();
 }
 
 // Derives everything from the inputs: alerts, hover, tab, panel. Called when an input changes, never per frame.
@@ -6261,15 +6286,12 @@ void IslandRecompute() {
     const float tw = std::min(std::max(size.w, 40.0f), kIslandMaxW) * s;
     const float th = std::min(std::max(size.h, 20.0f), kIslandMaxH) * s;
 
-    const bool wings = IslandOnBar() && (state == IState::Expanded || PanelWingsWanted() || now < g_wingHold);  // The buttons belong to the bar's monitor.
     if (!g_isInit) {
         g_isInit = true;
         g_isW.eps = g_isH.eps = 0.25f;  // Pixels.
         g_isW.epsV = g_isH.epsV = 5.0f;
         g_isW.Snap(tw);
         g_isH.Snap(th);
-        g_wing.Snap(wings ? 1.0f : 0.0f);
-        g_wingT = g_wing.x;
         g_mix.Snap(1.0f);
         g_viewCur = want;
         g_curSize = size;
@@ -6277,7 +6299,6 @@ void IslandRecompute() {
     } else {
         AimIfChanged(g_isW, tw, tw > g_isW.x ? kSpringExpandK : kSpringCollapseK, tw > g_isW.x ? kSpringExpandC : kSpringCollapseC);
         AimIfChanged(g_isH, th, th > g_isH.x ? kSpringExpandK : kSpringCollapseK, th > g_isH.x ? kSpringExpandC : kSpringCollapseC);
-        AimIfChanged(g_wing, wings ? 1.0f : 0.0f, 320.0f, 34.0f);
         if (want != g_viewCur) {
             if (g_viewCur.m) g_viewCur.m->OnVisibility(g_viewCur.v, false);
             g_viewPrev = g_viewCur;
@@ -6304,8 +6325,6 @@ void IslandRecompute() {
     for (const AlertItem& a : g_alerts) if (a.expires && (!next || a.expires < next)) next = a.expires;
     if (next) SetTimer(g_hwnd, kAlertTimer, (UINT)std::max<ULONGLONG>(next - now, 10) + 5, nullptr);
     else KillTimer(g_hwnd, kAlertTimer);
-    if (now < g_wingHold) SetTimer(g_hwnd, kWingTimer, (UINT)(g_wingHold - now) + 30, nullptr);
-    else KillTimer(g_hwnd, kWingTimer);
 
     g_isDirty = true;
     if (!IslandSettled()) {
@@ -6353,20 +6372,16 @@ void IslandReset() {
     g_dwelling = false;
     g_isTracking = false;
     g_leaveSince = 0;
-    g_wingHold = 0;
     g_autoUntil = 0;
     if (g_hwnd) {
         KillTimer(g_hwnd, kDwellTimer);
         KillTimer(g_hwnd, kZoneTimer);
-        KillTimer(g_hwnd, kWingTimer);
     }
     g_isInit = false;
-    g_wing.Snap(0.0f);
-    g_wingT = 0.0f;
     if (g_isHwnd) ShowWindow(g_isHwnd, SW_HIDE);
 }
 
-// Every 50 ms while expanded: is the pointer in the island, or in the strip band the buttons run along?
+// Every 50 ms while expanded: is the pointer still in the island (shoulders included)?
 void IslandZoneTick() {
     if (g_isState != IState::Expanded) return;
     POINT p;
@@ -6375,12 +6390,6 @@ void IslandZoneTick() {
     RECT zone = g_isTarget;
     InflateRect(&zone, (int)ceilf(kNotchShoulder * s), 0);
     bool in = PtInRect(&zone, p) != FALSE;
-    // The strip band from the left edge of the bell to the right edge of the calendar keeps hover alive across the gaps.
-    int lo = zone.left, hi = zone.right;
-    if (IslandOnBar() && g_wingOk[0]) lo = std::min<int>(lo, g_monitor.left + (int)g_wingX[0]);
-    if (IslandOnBar() && g_wingOk[1]) hi = std::max<int>(hi, g_monitor.left + (int)(g_wingX[1] + g_wingSize));
-    const RECT band{lo, g_isMon.top, hi, g_isMon.top + (LONG)(kBarH * s + 0.5f)};
-    if (PtInRect(&band, p)) in = true;
     // Over the settled body, a window that covers it (a panel, a popup) counts as leaving.
     if (in && IslandSettled() && PtInRect(&g_isTarget, p)) {
         HWND at = WindowFromPoint(p);
@@ -6401,6 +6410,9 @@ void IslandDwellTick() {
     POINT p;
     GetCursorPos(&p);
     if (g_isState == IState::Alert && AlertsHoldsHover()) return;  // A slider came up during the dwell.
+    // The calendar hangs under the island: opening over it would cover the panel.
+    HWND fg = GetForegroundWindow();
+    if (g_panelMode == kPanelCalendar && fg && IsShellExperienceWindow(fg)) return;
     if (!g_covered && !g_fullscreen && PtInRect(&g_isBody, p)) SetExpanded(true);
 }
 
@@ -6679,12 +6691,22 @@ void Services::Expand(IModule* m, int ms) {
     IslandRecompute();
 }
 
+// The calendar hangs under the island; the notifications open natively above the dock (anchor unused).
 void Services::OpenPanel(PanelKind kind, int anchorX) {
+    if (kind == PanelKind::Calendar && !g_pinned) SetExpanded(false);  // The calendar takes the island's place.
     g_anchorX = anchorX;
     g_anchorTick = GetTickCount64();
     SetPropW(g_hwnd, L"TopBarAnchorX", reinterpret_cast<HANDLE>((INT_PTR)anchorX));
     SetPropW(g_hwnd, L"TopBarAnchorTick", reinterpret_cast<HANDLE>((UINT_PTR)GetTickCount()));
-    TogglePanel(kind == PanelKind::Notifications ? kPanelNotifications : kPanelCalendar);
+    TogglePanel(kind == PanelKind::Notifications ? kPanelNative : kPanelCalendar);
+}
+
+void IslandOpenCalendar() {
+    if (g_dwelling) {  // The click wins over a hover that was about to expand.
+        g_dwelling = false;
+        KillTimer(g_hwnd, kDwellTimer);
+    }
+    g_services.OpenPanel(PanelKind::Calendar, (g_isBody.left + g_isBody.right) / 2);
 }
 
 const Settings& Services::GetSettings() const { return g_settings; }
@@ -8245,14 +8267,28 @@ void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG object, LON
             if (GetTickCount64() - g_anchorTick >= kPanelAnchorMs) {
                 g_quickPage = Action::None;  // Opened from the keyboard, not from an icon.
             }
-            if (IsShellExperienceWindow(hwnd)) {
+            const bool shellPanel = IsShellExperienceWindow(hwnd);
+            if (shellPanel) {
                 g_notificationPanel = hwnd;
+                // Opened from the dock, Win+N or an alert: it stays at its native place above the dock.
+                if (!CalendarOpenWanted()) {
+                    g_panelMode = kPanelNative;
+                    SaveNativePanelRect(hwnd);  // No-op if already saved; checks a place left by an older bar.
+                    RestoreNativePanel(hwnd);
+                }
             }
-            if (GetTickCount64() - g_panelOpenTick > kPanelDropMs) {
-                g_panelOpenTick = GetTickCount64();  // Unless it was already started before opening.
+            if (!shellPanel || g_panelMode == kPanelCalendar) {
+                if (GetTickCount64() - g_panelOpenTick > kPanelDropMs) {
+                    g_panelOpenTick = GetTickCount64();  // Unless it was already started before opening.
+                }
+                PlacePanel(hwnd);
+                FollowPanel();
             }
-            PlacePanel(hwnd);
-            FollowPanel();
+        }
+        else if (g_panelMoved && hwnd != g_hwnd && hwnd != g_isHwnd && g_panelMode == kPanelCalendar &&
+                 GetTickCount64() - g_calendarTick > 1500) {
+            // The calendar closed: put the window back now, so a native open from the dock is in place at once.
+            RestoreNativePanel(g_notificationPanel);
         }
         if (!IsShellWindow(hwnd) && !ForegroundCoversMonitor()) {
             g_abnFullscreen = false;  // Windows can miss telling us a fullscreen app has gone.
@@ -8374,21 +8410,15 @@ void StepFrame() {
     g_frameDt = dt;
     g_isW.Step(dt);
     g_isH.Step(dt);
-    g_wing.Step(dt);
     g_mix.Step(dt);
     g_cover.Step(dt);
-    const float wingT = fmaxf(g_wing.x, 0.0f);
-    const bool wingMoved = wingT != g_wingT;
-    g_wingT = wingT;
     if (IslandSettled() && !ModulesAnimating()) {
         g_clock.Sleep();
         g_lastFrame = 0;
     }
     g_isDirty = true;
-    if (wingMoved) InvalidateLayout();  // Paint adds the old and new place of both buttons.
     Paint();
     IslandPaint();
-    if (wingMoved) ResyncHover();
 }
 
 void RunAction(Action action) {
@@ -8398,8 +8428,6 @@ void RunAction(Action action) {
         case Action::Bluetooth:
             OpenQuickPage(action);
             break;
-        case Action::Notifications: TogglePanel(kPanelNotifications); break;
-        case Action::Calendar: TogglePanel(kPanelCalendar); break;
         case Action::Profile:
             // Pressing the mouse can already have dismissed it: don't reopen it on release.
             if (!g_profileAtDown || g_profileOpen) {
@@ -8467,11 +8495,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     ClickTrayIcon(g_hits[index].data, false);
                 } else {
                     RunAction(g_hits[index].action);
-                    if (g_hits[index].action == Action::Notifications || g_hits[index].action == Action::Calendar) {
-                        // Keep the buttons out while the panel opens, even if the pointer has left the island.
-                        g_wingHold = GetTickCount64() + kWingHoldMs;
-                        IslandRecompute();
-                    }
                 }
                 InvalidateAll();
             }
@@ -8542,7 +8565,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 IslandDwellTick();
             } else if (wp == kZoneTimer) {
                 IslandZoneTick();
-            } else if (wp == kAlertTimer || wp == kWingTimer) {
+            } else if (wp == kAlertTimer) {
                 KillTimer(hwnd, wp);
                 IslandRecompute();
             } else if (wp >= kModuleTimerBase) {

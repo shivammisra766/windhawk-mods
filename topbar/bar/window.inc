@@ -12,14 +12,28 @@ void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG object, LON
             if (GetTickCount64() - g_anchorTick >= kPanelAnchorMs) {
                 g_quickPage = Action::None;  // Opened from the keyboard, not from an icon.
             }
-            if (IsShellExperienceWindow(hwnd)) {
+            const bool shellPanel = IsShellExperienceWindow(hwnd);
+            if (shellPanel) {
                 g_notificationPanel = hwnd;
+                // Opened from the dock, Win+N or an alert: it stays at its native place above the dock.
+                if (!CalendarOpenWanted()) {
+                    g_panelMode = kPanelNative;
+                    SaveNativePanelRect(hwnd);  // No-op if already saved; checks a place left by an older bar.
+                    RestoreNativePanel(hwnd);
+                }
             }
-            if (GetTickCount64() - g_panelOpenTick > kPanelDropMs) {
-                g_panelOpenTick = GetTickCount64();  // Unless it was already started before opening.
+            if (!shellPanel || g_panelMode == kPanelCalendar) {
+                if (GetTickCount64() - g_panelOpenTick > kPanelDropMs) {
+                    g_panelOpenTick = GetTickCount64();  // Unless it was already started before opening.
+                }
+                PlacePanel(hwnd);
+                FollowPanel();
             }
-            PlacePanel(hwnd);
-            FollowPanel();
+        }
+        else if (g_panelMoved && hwnd != g_hwnd && hwnd != g_isHwnd && g_panelMode == kPanelCalendar &&
+                 GetTickCount64() - g_calendarTick > 1500) {
+            // The calendar closed: put the window back now, so a native open from the dock is in place at once.
+            RestoreNativePanel(g_notificationPanel);
         }
         if (!IsShellWindow(hwnd) && !ForegroundCoversMonitor()) {
             g_abnFullscreen = false;  // Windows can miss telling us a fullscreen app has gone.
@@ -141,21 +155,15 @@ void StepFrame() {
     g_frameDt = dt;
     g_isW.Step(dt);
     g_isH.Step(dt);
-    g_wing.Step(dt);
     g_mix.Step(dt);
     g_cover.Step(dt);
-    const float wingT = fmaxf(g_wing.x, 0.0f);
-    const bool wingMoved = wingT != g_wingT;
-    g_wingT = wingT;
     if (IslandSettled() && !ModulesAnimating()) {
         g_clock.Sleep();
         g_lastFrame = 0;
     }
     g_isDirty = true;
-    if (wingMoved) InvalidateLayout();  // Paint adds the old and new place of both buttons.
     Paint();
     IslandPaint();
-    if (wingMoved) ResyncHover();
 }
 
 void RunAction(Action action) {
@@ -165,8 +173,6 @@ void RunAction(Action action) {
         case Action::Bluetooth:
             OpenQuickPage(action);
             break;
-        case Action::Notifications: TogglePanel(kPanelNotifications); break;
-        case Action::Calendar: TogglePanel(kPanelCalendar); break;
         case Action::Profile:
             // Pressing the mouse can already have dismissed it: don't reopen it on release.
             if (!g_profileAtDown || g_profileOpen) {
@@ -234,11 +240,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     ClickTrayIcon(g_hits[index].data, false);
                 } else {
                     RunAction(g_hits[index].action);
-                    if (g_hits[index].action == Action::Notifications || g_hits[index].action == Action::Calendar) {
-                        // Keep the buttons out while the panel opens, even if the pointer has left the island.
-                        g_wingHold = GetTickCount64() + kWingHoldMs;
-                        IslandRecompute();
-                    }
                 }
                 InvalidateAll();
             }
@@ -309,7 +310,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 IslandDwellTick();
             } else if (wp == kZoneTimer) {
                 IslandZoneTick();
-            } else if (wp == kAlertTimer || wp == kWingTimer) {
+            } else if (wp == kAlertTimer) {
                 KillTimer(hwnd, wp);
                 IslandRecompute();
             } else if (wp >= kModuleTimerBase) {

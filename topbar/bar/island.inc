@@ -29,7 +29,6 @@ bool AlertsHoldsHover();  // The alert on show is a slider: hovering it must not
 IState g_isState = IState::Collapsed;
 Spring g_cover;         // 0 island shown, 1 faded out under the native volume popup (P5b).
 Spring g_isW, g_isH;    // Body size, pixels.
-Spring g_wing;          // 0 bell and calendar parked, 1 out.
 Spring g_mix;           // Cross-fade between g_viewPrev and g_viewCur.
 ViewSel g_viewCur, g_viewPrev;
 Size2 g_curSize{}, g_prevSize{};  // Measure() of each, taken when state changes.
@@ -43,7 +42,6 @@ int g_tab = 0;
 int g_tabDir = 1;  // Direction of the last page change, for the slide.
 int g_wheelAcc = 0;
 ULONGLONG g_leaveSince = 0;
-ULONGLONG g_wingHold = 0;
 ULONGLONG g_autoUntil = 0;  // Services::Expand: stays open until then even without the pointer.
 ULONGLONG g_alertSeq = 0;
 std::vector<AlertItem> g_alerts;
@@ -90,17 +88,12 @@ float IslandMaxExpandedW() {
     return w > 0 ? std::min(w, kIslandMaxW) : 475.0f;
 }
 
-bool PanelWingsWanted() {
-    HWND fg = GetForegroundWindow();
-    return fg && IsShellExperienceWindow(fg) && (g_panelMode == kPanelNotifications || g_panelMode == kPanelCalendar);
-}
-
 void AimIfChanged(Spring& sp, float target, float k, float c) {
     if (fabsf(sp.target - target) > 0.01f) sp.Aim(target, k, c);
 }
 
 bool IslandSettled() {
-    return g_isW.Settled() && g_isH.Settled() && g_wing.Settled() && g_mix.Settled() && g_cover.Settled();
+    return g_isW.Settled() && g_isH.Settled() && g_mix.Settled() && g_cover.Settled();
 }
 
 // Derives everything from the inputs: alerts, hover, tab, panel. Called when an input changes, never per frame.
@@ -132,15 +125,12 @@ void IslandRecompute() {
     const float tw = std::min(std::max(size.w, 40.0f), kIslandMaxW) * s;
     const float th = std::min(std::max(size.h, 20.0f), kIslandMaxH) * s;
 
-    const bool wings = IslandOnBar() && (state == IState::Expanded || PanelWingsWanted() || now < g_wingHold);  // The buttons belong to the bar's monitor.
     if (!g_isInit) {
         g_isInit = true;
         g_isW.eps = g_isH.eps = 0.25f;  // Pixels.
         g_isW.epsV = g_isH.epsV = 5.0f;
         g_isW.Snap(tw);
         g_isH.Snap(th);
-        g_wing.Snap(wings ? 1.0f : 0.0f);
-        g_wingT = g_wing.x;
         g_mix.Snap(1.0f);
         g_viewCur = want;
         g_curSize = size;
@@ -148,7 +138,6 @@ void IslandRecompute() {
     } else {
         AimIfChanged(g_isW, tw, tw > g_isW.x ? kSpringExpandK : kSpringCollapseK, tw > g_isW.x ? kSpringExpandC : kSpringCollapseC);
         AimIfChanged(g_isH, th, th > g_isH.x ? kSpringExpandK : kSpringCollapseK, th > g_isH.x ? kSpringExpandC : kSpringCollapseC);
-        AimIfChanged(g_wing, wings ? 1.0f : 0.0f, 320.0f, 34.0f);
         if (want != g_viewCur) {
             if (g_viewCur.m) g_viewCur.m->OnVisibility(g_viewCur.v, false);
             g_viewPrev = g_viewCur;
@@ -175,8 +164,6 @@ void IslandRecompute() {
     for (const AlertItem& a : g_alerts) if (a.expires && (!next || a.expires < next)) next = a.expires;
     if (next) SetTimer(g_hwnd, kAlertTimer, (UINT)std::max<ULONGLONG>(next - now, 10) + 5, nullptr);
     else KillTimer(g_hwnd, kAlertTimer);
-    if (now < g_wingHold) SetTimer(g_hwnd, kWingTimer, (UINT)(g_wingHold - now) + 30, nullptr);
-    else KillTimer(g_hwnd, kWingTimer);
 
     g_isDirty = true;
     if (!IslandSettled()) {
@@ -224,20 +211,16 @@ void IslandReset() {
     g_dwelling = false;
     g_isTracking = false;
     g_leaveSince = 0;
-    g_wingHold = 0;
     g_autoUntil = 0;
     if (g_hwnd) {
         KillTimer(g_hwnd, kDwellTimer);
         KillTimer(g_hwnd, kZoneTimer);
-        KillTimer(g_hwnd, kWingTimer);
     }
     g_isInit = false;
-    g_wing.Snap(0.0f);
-    g_wingT = 0.0f;
     if (g_isHwnd) ShowWindow(g_isHwnd, SW_HIDE);
 }
 
-// Every 50 ms while expanded: is the pointer in the island, or in the strip band the buttons run along?
+// Every 50 ms while expanded: is the pointer still in the island (shoulders included)?
 void IslandZoneTick() {
     if (g_isState != IState::Expanded) return;
     POINT p;
@@ -246,12 +229,6 @@ void IslandZoneTick() {
     RECT zone = g_isTarget;
     InflateRect(&zone, (int)ceilf(kNotchShoulder * s), 0);
     bool in = PtInRect(&zone, p) != FALSE;
-    // The strip band from the left edge of the bell to the right edge of the calendar keeps hover alive across the gaps.
-    int lo = zone.left, hi = zone.right;
-    if (IslandOnBar() && g_wingOk[0]) lo = std::min<int>(lo, g_monitor.left + (int)g_wingX[0]);
-    if (IslandOnBar() && g_wingOk[1]) hi = std::max<int>(hi, g_monitor.left + (int)(g_wingX[1] + g_wingSize));
-    const RECT band{lo, g_isMon.top, hi, g_isMon.top + (LONG)(kBarH * s + 0.5f)};
-    if (PtInRect(&band, p)) in = true;
     // Over the settled body, a window that covers it (a panel, a popup) counts as leaving.
     if (in && IslandSettled() && PtInRect(&g_isTarget, p)) {
         HWND at = WindowFromPoint(p);
@@ -272,6 +249,9 @@ void IslandDwellTick() {
     POINT p;
     GetCursorPos(&p);
     if (g_isState == IState::Alert && AlertsHoldsHover()) return;  // A slider came up during the dwell.
+    // The calendar hangs under the island: opening over it would cover the panel.
+    HWND fg = GetForegroundWindow();
+    if (g_panelMode == kPanelCalendar && fg && IsShellExperienceWindow(fg)) return;
     if (!g_covered && !g_fullscreen && PtInRect(&g_isBody, p)) SetExpanded(true);
 }
 
@@ -550,12 +530,22 @@ void Services::Expand(IModule* m, int ms) {
     IslandRecompute();
 }
 
+// The calendar hangs under the island; the notifications open natively above the dock (anchor unused).
 void Services::OpenPanel(PanelKind kind, int anchorX) {
+    if (kind == PanelKind::Calendar && !g_pinned) SetExpanded(false);  // The calendar takes the island's place.
     g_anchorX = anchorX;
     g_anchorTick = GetTickCount64();
     SetPropW(g_hwnd, L"TopBarAnchorX", reinterpret_cast<HANDLE>((INT_PTR)anchorX));
     SetPropW(g_hwnd, L"TopBarAnchorTick", reinterpret_cast<HANDLE>((UINT_PTR)GetTickCount()));
-    TogglePanel(kind == PanelKind::Notifications ? kPanelNotifications : kPanelCalendar);
+    TogglePanel(kind == PanelKind::Notifications ? kPanelNative : kPanelCalendar);
+}
+
+void IslandOpenCalendar() {
+    if (g_dwelling) {  // The click wins over a hover that was about to expand.
+        g_dwelling = false;
+        KillTimer(g_hwnd, kDwellTimer);
+    }
+    g_services.OpenPanel(PanelKind::Calendar, (g_isBody.left + g_isBody.right) / 2);
 }
 
 const Settings& Services::GetSettings() const { return g_settings; }
