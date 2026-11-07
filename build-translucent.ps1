@@ -1,9 +1,9 @@
-﻿# Local build of the repo mod translucent-windows (1.8.2) as local@translucent-windows, with an added
+# Local build of the repo mod translucent-windows (1.8.2) as local@translucent-windows, with an added
 # no-blur "Plain tint" background effect (ACCENT_ENABLE_TRANSPARENTGRADIENT, AccentFlags 2) for the
 # user's Terminal look (#C4000000). Upstream source kept as translucent-windows.orig.wh.cpp for diffs.
 # Builds both archs (the mod's @include is *); install-translucent.ps1 restricts it to 64-bit hosts first.
 $s = $PSScriptRoot
-$id = 'local@translucent-windows'; $ver = '1.8.2.1'; $serial = '600001'
+$id = 'local@translucent-windows'; $ver = '1.8.2.2'; $serial = '600002'
 $comp = 'C:\Program Files\Windhawk\Compiler'
 $utf8 = New-Object Text.UTF8Encoding($false)
 $t = [IO.File]::ReadAllText("$s\$id.wh.cpp", $utf8)

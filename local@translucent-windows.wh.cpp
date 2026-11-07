@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              local@translucent-windows
 // @name            Translucent Windows (plain tint, local)
-// @description     Translucent Windows 1.8.2 plus a no-blur "Plain tint" effect (ACCENT_ENABLE_TRANSPARENTGRADIENT)
-// @version         1.8.2.1
+// @description     Translucent Windows 1.8.2 plus a no-blur "Plain tint" effect (ACCENT_ENABLE_TRANSPARENTGRADIENT); in explorer.exe confined to File Explorer folder windows
+// @version         1.8.2.2
 // @author          Undisputed00x
 // @github          https://github.com/Undisputed00x
 // @include         *
@@ -177,6 +177,10 @@ This is caused by default by the AccentBlur API.❕
 #include <cmath>
 #include <string>
 #include <array>
+#include <atomic>
+#include <vector>
+#include <algorithm>
+#include <unordered_map>
 #include <d2d1.h>
 #include <wrl.h>
 #include <ShellScalingApi.h>
@@ -491,8 +495,145 @@ BOOL isWindowFlyout(HWND hWnd)
            || IsWindowClass(hWnd, MENUPOPUP_CLASS) || IsWindowClass(hWnd, L"MicrosoftWindowsTooltip") ||IsWindowClass(hWnd, L"BaseBar"); // Support m417z Folder Hover Menu mod
 }
 
-BOOL IsWindowEligible(HWND hWnd) 
-{       
+// ---------------------------------------------------------------------------------------------
+// Folder-window gate (local 1.8.2.2).
+// explorer.exe also hosts the taskbar, the desktop, tray flyouts and XAML islands, and every hook in
+// this mod is process-wide. In explorer.exe each hook therefore first checks that it runs on a thread
+// that owns a File Explorer folder window (top-level CabinetWClass) and, when it is given a DC that
+// belongs to a window, that the window's root is a CabinetWClass. Anything else (Shell_TrayWnd,
+// Shell_SecondaryTrayWnd, Progman/WorkerW, XAML islands, popups, menus, tooltips) gets the original
+// function untouched. Per-window effects (accent, blur-behind region, frame extension) are applied
+// only to top-level CabinetWClass windows, and the attributes Explorer itself asked for are recorded
+// so unloading the mod can put them back.
+// ---------------------------------------------------------------------------------------------
+BOOL g_GateToFolderWindows = FALSE;      // TRUE in explorer.exe, set in Wh_ModInit
+std::atomic<bool> g_unloading{false};    // set in Wh_ModBeforeUninit: every hook passes through
+SRWLOCK g_folderLock = SRWLOCK_INIT;
+std::vector<DWORD> g_folderThreads;      // threads that created a CabinetWClass (guarded by g_folderLock)
+std::atomic<LONG> g_folderThreadsGen{0}; // bumped on every registration, invalidates per-thread caches
+static thread_local LONG t_folderGen = -1;
+static thread_local BOOL t_folderThread = FALSE;
+static thread_local HWND t_lastRoot = nullptr;
+static thread_local BOOL t_lastRootOk = FALSE;
+static thread_local LONG t_lastRootGen = -1;
+
+struct FolderWndState {
+    BOOL touched = FALSE;     // the mod applied its effects to this window
+    BOOL hasBackdrop = FALSE; // last DWMWA_SYSTEMBACKDROP_TYPE Explorer asked for
+    DWORD backdrop = 0;
+    BOOL hasHostBd = FALSE;   // last DWMWA_USE_HOSTBACKDROPBRUSH Explorer asked for
+    BOOL hostBd = FALSE;
+    BOOL hasMargins = FALSE;  // last DwmExtendFrameIntoClientArea margins Explorer asked for
+    MARGINS margins = {0, 0, 0, 0};
+};
+std::unordered_map<HWND, FolderWndState> g_folderWnds; // guarded by g_folderLock
+
+BOOL IsFolderTopWindow(HWND hWnd)
+{
+    if (!hWnd)
+        return FALSE;
+    HWND hParentWnd = GetAncestor(hWnd, GA_PARENT);
+    if (hParentWnd && hParentWnd != GetDesktopWindow())
+        return FALSE;
+    return IsWindowClass(hWnd, L"CabinetWClass");
+}
+
+static BOOL CALLBACK FindFolderWindowProc(HWND hWnd, LPARAM lParam)
+{
+    if (IsFolderTopWindow(hWnd)) {
+        *reinterpret_cast<BOOL*>(lParam) = TRUE;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+VOID RegisterFolderThread(DWORD tid)
+{
+    if (!tid)
+        return;
+    AcquireSRWLockExclusive(&g_folderLock);
+    if (std::find(g_folderThreads.begin(), g_folderThreads.end(), tid) == g_folderThreads.end())
+        g_folderThreads.push_back(tid);
+    for (auto it = g_folderWnds.begin(); it != g_folderWnds.end();) {
+        if (!IsWindow(it->first))
+            it = g_folderWnds.erase(it);
+        else
+            ++it;
+    }
+    ReleaseSRWLockExclusive(&g_folderLock);
+    // Always bump: a reused thread id may have cached "not a folder thread" before its window existed.
+    g_folderThreadsGen.fetch_add(1, std::memory_order_acq_rel);
+}
+
+// TRUE when the calling thread may be customized. Outside explorer.exe: always (upstream behaviour).
+BOOL ThreadAllowed()
+{
+    if (g_unloading.load(std::memory_order_relaxed))
+        return FALSE;
+    if (!g_GateToFolderWindows)
+        return TRUE;
+    LONG gen = g_folderThreadsGen.load(std::memory_order_acquire);
+    if (t_folderGen != gen) {
+        DWORD tid = GetCurrentThreadId();
+        BOOL listed = FALSE;
+        AcquireSRWLockShared(&g_folderLock);
+        listed = std::find(g_folderThreads.begin(), g_folderThreads.end(), tid) != g_folderThreads.end();
+        ReleaseSRWLockShared(&g_folderLock);
+        BOOL owns = FALSE;
+        if (listed)
+            EnumThreadWindows(tid, FindFolderWindowProc, reinterpret_cast<LPARAM>(&owns));
+        t_folderThread = owns;
+        t_folderGen = gen;
+    }
+    return t_folderThread;
+}
+
+// ThreadAllowed() plus: a DC that belongs to a window must belong to a CabinetWClass root.
+// DCs without a window (DirectUI / buffered-paint memory DCs) are allowed on folder threads.
+BOOL DCAllowed(HDC hdc)
+{
+    if (!ThreadAllowed())
+        return FALSE;
+    if (!g_GateToFolderWindows)
+        return TRUE;
+    HWND hWnd = hdc ? WindowFromDC(hdc) : nullptr;
+    if (!hWnd)
+        return TRUE;
+    HWND hRoot = GetAncestor(hWnd, GA_ROOT);
+    if (hRoot != t_lastRoot || t_lastRootGen != t_folderGen) {
+        t_lastRoot = hRoot;
+        t_lastRootOk = IsFolderTopWindow(hRoot);
+        t_lastRootGen = t_folderGen;
+    }
+    return t_lastRootOk;
+}
+
+// Theme classes that belong to flyouts (menus, tooltips). In explorer.exe they stay with
+// win32-ui-modernizer even on folder threads, where they may be painted into memory DCs.
+BOOL IsGatedFlyoutThemeClass(const std::wstring& themeClass)
+{
+    return g_GateToFolderWindows && !g_settings.FlyoutsEffects
+        && (themeClass == L"Menu" || themeClass == L"Tooltip");
+}
+
+HRESULT CallDwmSetWindowAttribute(HWND hWnd, DWORD dwAttribute, LPCVOID pvAttribute, DWORD cbAttribute)
+{
+    return DwmSetWindowAttribute_orig ? DwmSetWindowAttribute_orig(hWnd, dwAttribute, pvAttribute, cbAttribute)
+                                      : DwmSetWindowAttribute(hWnd, dwAttribute, pvAttribute, cbAttribute);
+}
+
+HRESULT CallDwmExtendFrameIntoClientArea(HWND hWnd, const MARGINS* pMarInset)
+{
+    return DwmExtendFrameIntoClientArea_orig ? DwmExtendFrameIntoClientArea_orig(hWnd, pMarInset)
+                                             : DwmExtendFrameIntoClientArea(hWnd, pMarInset);
+}
+
+BOOL IsWindowEligible(HWND hWnd)
+{
+    // explorer.exe: top-level File Explorer folder windows only, nothing else in the shell process.
+    if (g_GateToFolderWindows)
+        return !g_unloading.load(std::memory_order_relaxed) && IsFolderTopWindow(hWnd);
+
     if (isWindowFlyout(hWnd) && g_settings.FlyoutsEffects)
         return TRUE;
     
@@ -758,10 +899,26 @@ D2D1_COLOR_F IsAccentColorPossibleD2D(BYTE R, BYTE G, BYTE B, AccentColorShade A
 }
 
 HRESULT WINAPI HookedDwmSetWindowAttribute(HWND hWnd, DWORD dwAttribute, LPCVOID pvAttribute, DWORD cbAttribute)
-{    
+{
     if(!IsWindowEligible(hWnd))
         return DwmSetWindowAttribute_orig(hWnd, dwAttribute, pvAttribute, cbAttribute);
-    
+
+    // Remember what Explorer asked for, so unloading can restore it.
+    if (g_GateToFolderWindows && pvAttribute && cbAttribute >= sizeof(DWORD)
+        && (dwAttribute == DWMWA_SYSTEMBACKDROP_TYPE || dwAttribute == DWMWA_USE_HOSTBACKDROPBRUSH))
+    {
+        AcquireSRWLockExclusive(&g_folderLock);
+        FolderWndState& st = g_folderWnds[hWnd];
+        if (dwAttribute == DWMWA_SYSTEMBACKDROP_TYPE) {
+            st.hasBackdrop = TRUE;
+            st.backdrop = *static_cast<const DWORD*>(pvAttribute);
+        } else {
+            st.hasHostBd = TRUE;
+            st.hostBd = *static_cast<const BOOL*>(pvAttribute);
+        }
+        ReleaseSRWLockExclusive(&g_folderLock);
+    }
+
     // Popup menus (#32768) pass here by default to paint 
     // handle by the internal uxtheme function CThemeMenuPopup::EnableRoundedCorners()
     if (IsWindowClass(hWnd, MENUPOPUP_CLASS) && g_settings.FlyoutsEffects && dwAttribute == DWMWA_WINDOW_CORNER_PREFERENCE) {
@@ -788,7 +945,15 @@ HRESULT WINAPI HookedDwmExtendFrameIntoClientArea(HWND hWnd, const MARGINS* pMar
 {
     if(!IsWindowEligible(hWnd))
         [[clang::musttail]]return DwmExtendFrameIntoClientArea_orig(hWnd, pMarInset);
-    
+
+    if (g_GateToFolderWindows && pMarInset) {
+        AcquireSRWLockExclusive(&g_folderLock);
+        FolderWndState& st = g_folderWnds[hWnd];
+        st.hasMargins = TRUE;
+        st.margins = *pMarInset;
+        ReleaseSRWLockExclusive(&g_folderLock);
+    }
+
     if(!IsWindowClass(hWnd, L"CASCADIA_HOSTING_WINDOW_CLASS")) {
         static const MARGINS margins = {-1, -1, -1, -1};
         [[clang::musttail]]return DwmExtendFrameIntoClientArea_orig(hWnd, &margins);
@@ -819,9 +984,21 @@ HWND WINAPI HookedNtUserCreateWindowEx(DWORD dwExStyle,
         dwExStyle, UnsafeClassName, VersionedClass, UnsafeWindowName, dwStyle,
         x, y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam,
         dwShowMode, dwUnknown1, dwUnknown2, qwUnknown3);
-    
-    if(hWnd)
-        NewWindowShown(hWnd);
+
+    if (!hWnd || g_unloading.load(std::memory_order_relaxed))
+        return hWnd;
+
+    if (g_GateToFolderWindows) {
+        // explorer.exe: only a new File Explorer folder window is of interest. Its thread becomes a
+        // folder thread; every other window (taskbar, desktop, XAML islands, popups) is left alone.
+        if (IsFolderTopWindow(hWnd)) {
+            RegisterFolderThread(GetCurrentThreadId());
+            NewWindowShown(hWnd);
+        }
+        return hWnd;
+    }
+
+    NewWindowShown(hWnd);
 
     return hWnd;
 }
@@ -1027,8 +1204,8 @@ BOOL WINAPI HookedExtTextOutW(
     LPCWSTR lpString,
     UINT c,
     const INT* lpDx)
-{   
-    if (ExtTextOutShouldSkip(hdc, options, lprect, lpString, c))
+{
+    if (!DCAllowed(hdc) || ExtTextOutShouldSkip(hdc, options, lprect, lpString, c))
         return ExtTextOutW_orig(hdc, x, y, options, lprect, lpString, c, lpDx);
 
     RECT textRect {0};
@@ -1077,7 +1254,10 @@ HRESULT WINAPI HookedDrawTextWithGlow(HDC hdcMem, LPWSTR pszText, UINT cch, RECT
                                       COLORREF crGlow, UINT nGlowRadius, UINT nGlowIntensity, BOOL fPreMultiply,
                                       DTT_CALLBACK_PROC pfnDrawTextCallback, LPARAM lParam)
 {
-    if (pRect->right == pRect->left || pRect->bottom == pRect->top) { 
+    if (!DCAllowed(hdcMem))
+        return DrawTextWithGlow(hdcMem, pszText, cch, pRect, dwFlags, crText, crGlow, nGlowRadius, nGlowIntensity, fPreMultiply, pfnDrawTextCallback, lParam);
+
+    if (pRect->right == pRect->left || pRect->bottom == pRect->top) {
         if ((dwFlags & DT_CALCRECT) == 0)
             return DrawTextWithGlow(hdcMem, pszText, cch, pRect, dwFlags, crText, crGlow, nGlowRadius, nGlowIntensity, fPreMultiply, pfnDrawTextCallback, lParam);
     }
@@ -1100,7 +1280,10 @@ HRESULT WINAPI HookedDrawTextWithGlow(HDC hdcMem, LPWSTR pszText, UINT cch, RECT
 }
 
 INT WINAPI HookedDrawTextW(HDC hdc, LPCWSTR lpchText, INT cchText, LPRECT lprc, UINT format)
-{   
+{
+    if (!DCAllowed(hdc))
+        return DrawTextW_orig(hdc, lpchText, cchText, lprc, format);
+
     // Windows 11 context menus use Fluent icons as glyphs
     // Handled internally in the shell32 routine s_DrawGlyph()
     auto ContextMenuGlyphs = [&hdc, &lpchText]() {
@@ -1132,7 +1315,12 @@ INT WINAPI HookedDrawTextW(HDC hdc, LPCWSTR lpchText, INT cchText, LPRECT lprc, 
 HRESULT WINAPI HookedDrawThemeTextEx(HTHEME hTheme, HDC hdc, INT iPartId, INT iStateId, LPCWSTR pszText,
     INT cchText, DWORD dwTextFlags, LPRECT pRect, const DTTOPTS* pOptions)
 {
+    if (!DCAllowed(hdc))
+        return DrawThemeTextEx_orig(hTheme, hdc, iPartId, iStateId, pszText, cchText, dwTextFlags, pRect, pOptions);
+
     std::wstring ThemeClassName = GetThemeClass(hTheme);
+    if (IsGatedFlyoutThemeClass(ThemeClassName))
+        return DrawThemeTextEx_orig(hTheme, hdc, iPartId, iStateId, pszText, cchText, dwTextFlags, pRect, pOptions);
     if (pOptions == nullptr) {
         DTTOPTS Options = { sizeof(DTTOPTS) };
         GetThemeColor(hTheme, iPartId, iStateId, TMT_TEXTCOLOR, &Options.crText);
@@ -1152,8 +1340,11 @@ HRESULT WINAPI HookedDrawThemeTextEx(HTHEME hTheme, HDC hdc, INT iPartId, INT iS
 }
 
 HRESULT WINAPI HookedDrawThemeText(HTHEME hTheme, HDC hdc, INT iPartId, INT iStateId, LPCTSTR pszText,
-    INT cchText, DWORD dwTextFlags, DWORD dwTextFlags2, LPCRECT pRect) 
+    INT cchText, DWORD dwTextFlags, DWORD dwTextFlags2, LPCRECT pRect)
 {
+    if (!DCAllowed(hdc) || IsGatedFlyoutThemeClass(GetThemeClass(hTheme)))
+        return DrawThemeText_orig(hTheme, hdc, iPartId, iStateId, pszText, cchText, dwTextFlags, dwTextFlags2, pRect);
+
     DTTOPTS Options = { sizeof(DTTOPTS) };
     RECT Rect = *pRect;
 
@@ -1169,6 +1360,8 @@ Element_PaintBgT Element_PaintBg;
 VOID CALLBACK Element_PaintBgHook(class Element* This, HDC hdc, class Value* value, LPRECT pRect, LPRECT pClipRect, LPRECT pExcludeRect, LPRECT pTargetRect)
 {   
     Element_PaintBg(This, hdc, value, pRect, pClipRect, pExcludeRect, pTargetRect);
+    if (!DCAllowed(hdc))
+        return;
 
     //unsigned char byteValue = *(reinterpret_cast<unsigned char*>(value) + 8);
     if ((INT)(*(DWORD *)value << 26) >> 26 != 9 )
@@ -1345,8 +1538,10 @@ static COLORREF GetCustomSysColor(INT nIndex)
     return GetSysColor_orig(nIndex);
 }
 
-COLORREF WINAPI HookedGetSysColor(INT nIndex) 
+COLORREF WINAPI HookedGetSysColor(INT nIndex)
 {
+    if (!ThreadAllowed())
+        return GetSysColor_orig(nIndex);
     if (g_DefaultSysColors)
         return GetDefaultSysColor(nIndex);
     else
@@ -1355,7 +1550,7 @@ COLORREF WINAPI HookedGetSysColor(INT nIndex)
 
 HBRUSH WINAPI HookedGetSysColorBrush(INT nIndex) 
 {
-    if (nIndex < 0 || nIndex > COLOR_MENUBAR)
+    if (!ThreadAllowed() || nIndex < 0 || nIndex > COLOR_MENUBAR)
         return GetSysColorBrush_orig(nIndex);
     
     auto& cacheArray = g_DefaultSysColors ? g_themeCachedDefaultSysColorBrushes : g_themeCachedCustomSysColorBrushes;
@@ -1405,7 +1600,11 @@ VOID ColorizeSysColors()
 HRESULT WINAPI HookedGetColorTheme(HTHEME hTheme, INT iPartId, INT iStateId, INT iPropId, COLORREF *pColor) 
 {
     HRESULT hr = GetThemeColor_orig(hTheme, iPartId, iStateId, iPropId, pColor);
+    if (!ThreadAllowed() || !pColor)
+        return hr;
     std::wstring ThemeClassName = GetThemeClass(hTheme);
+    if (IsGatedFlyoutThemeClass(ThemeClassName))
+        return hr;
 
     if (ThemeClassName == L"ItemsView" && iPropId == TMT_TEXTCOLOR && ((iPartId == 4 && iStateId == 1) || iPartId == 5))
     {
@@ -4740,8 +4939,12 @@ HRESULT WINAPI HookedDrawThemeBackground(
     INT iStateId,
     LPCRECT pRect,
     LPCRECT pClipRect)
-{       
+{
+    if (!DCAllowed(hdc))
+        return DrawThemeBackground_orig(hTheme, hdc, iPartId, iStateId, pRect, pClipRect);
     std::wstring ThemeClassName = GetThemeClass(hTheme);
+    if (IsGatedFlyoutThemeClass(ThemeClassName))
+        return DrawThemeBackground_orig(hTheme, hdc, iPartId, iStateId, pRect, pClipRect);
 
     if (ThemeClassName == L"ScrollBar")
     {
@@ -4958,8 +5161,12 @@ HRESULT WINAPI HookedDrawThemeBackgroundEx(
     INT iStateId,
     LPCRECT pRect,
     const DTBGOPTS* pOptions)
-{    
+{
+    if (!DCAllowed(hdc))
+        return DrawThemeBackgroundEx_orig(hTheme, hdc, iPartId, iStateId, pRect, pOptions);
     std::wstring ThemeClassName = GetThemeClass(hTheme);
+    if (IsGatedFlyoutThemeClass(ThemeClassName))
+        return DrawThemeBackgroundEx_orig(hTheme, hdc, iPartId, iStateId, pRect, pOptions);
 
     if (ThemeClassName == L"ScrollBar")
     {
@@ -5064,9 +5271,12 @@ HRESULT WINAPI HookedDrawThemeBackgroundEx(
 // Remove white rect below menubar (e.g. seen in mmc.exe)
 HRESULT WINAPI HookedDrawThemeEdge(HTHEME hTheme, HDC hdc, INT iPartId, INT iStateId, const RECT *pDestRect, UINT uEdge, UINT uFlags, RECT *pContentRect)
 {
+    if (!DCAllowed(hdc))
+        return DrawThemeEdge_orig(hTheme, hdc, iPartId, iStateId, pDestRect, uEdge, uFlags, pContentRect);
+
     std::wstring ThemeClass = GetThemeClass(hTheme);
 
-    if (ThemeClass == L"Rebar" && iPartId == RP_BAND) {
+    if (ThemeClass == L"Rebar" && iPartId == RP_BAND && pContentRect) {
         FillRect(hdc, pContentRect, (HBRUSH)GetStockObject(BLACK_BRUSH));
         return S_OK;
     }
@@ -5079,6 +5289,8 @@ HRESULT WINAPI HookedGetThemeMargins(HTHEME hTheme, HDC hdc, INT iPartId, INT iS
     std::wstring ThemeClassName = GetThemeClass(hTheme);
 
     auto ret = GetThemeMargins_orig(hTheme, hdc, iPartId, iStateId, iPropId, prc, pMargins);
+    if (!ThreadAllowed() || !pMargins)
+        return ret;
 
     if (ThemeClassName == L"Tooltip" && iPartId == TTP_STANDARD) {
         if (iPropId == TMT_CONTENTMARGINS)
@@ -5114,7 +5326,11 @@ HRESULT WINAPI HookedGetThemeMargins(HTHEME hTheme, HDC hdc, INT iPartId, INT iS
 HRESULT WINAPI HookedGetThemeFont (HTHEME hTheme, HDC hdc, INT iPartId, INT iStateId, INT iPropId, LOGFONTW* pFont)
 {
     auto hr = GetThemeFont_orig(hTheme, hdc, iPartId, iStateId, iPropId, pFont);
+    if (!ThreadAllowed() || !pFont)
+        return hr;
     std::wstring ThemeClassName = GetThemeClass(hTheme);
+    if (IsGatedFlyoutThemeClass(ThemeClassName))
+        return hr;
     
     if (ThemeClassName == L"Menu" && iPropId == TMT_FONT) 
     {
@@ -5189,8 +5405,11 @@ VOID EnableBlurBehind(HWND hWnd)
 }
 
 static LRESULT WINAPI HookedDefWindowProcW(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
-{    
-    if (msg == WM_SETTINGCHANGE) 
+{
+    if (!ThreadAllowed())
+        return DefWindowProc_orig(hWnd, msg, wParam, lParam);
+
+    if (msg == WM_SETTINGCHANGE)
     {
         // System theme change
         if (lParam && wcscmp((LPCWSTR)lParam, L"ImmersiveColorSet") == 0) 
@@ -5241,9 +5460,10 @@ VOID HandleEffects(HWND hWnd)
 {
     BOOL isFlyoutWindow = isWindowFlyout(hWnd);
 
-    if (g_IsSysThemeDarkMode) 
-        DwmSetWindowAttribute(hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &ENABLE, sizeof(UINT));
+    if (g_IsSysThemeDarkMode)
+        CallDwmSetWindowAttribute(hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &ENABLE, sizeof(UINT));
 
+    // The mod's own DWM calls go to the originals so they are not recorded as Explorer's requests.
     if(g_settings.BgType == g_settings.AccentBlurBehind || g_settings.BgType == g_settings.TransparentGradient)
         EnableBlurBehind(hWnd);
     else if (g_settings.BgType > g_settings.AccentBlurBehind)
@@ -5252,28 +5472,33 @@ VOID HandleEffects(HWND hWnd)
             DwmMakeWindowTransparent(hWnd);
             TriggerWindowNCRendering(hWnd);
         }
-        DwmSetWindowAttribute(hWnd, DWMWA_SYSTEMBACKDROP_TYPE, &g_settings.BgType, sizeof(UINT));
+        CallDwmSetWindowAttribute(hWnd, DWMWA_SYSTEMBACKDROP_TYPE, &g_settings.BgType, sizeof(UINT));
     }
 
     if (!isFlyoutWindow && g_settings.BgType != g_settings.Default) {
         MARGINS margins = {-1, -1, -1, -1};
-        DwmExtendFrameIntoClientArea(hWnd, &margins);
+        CallDwmExtendFrameIntoClientArea(hWnd, &margins);
     }
-    
+
     if (isFlyoutWindow) {
         UINT borderType = DWMWCP_ROUND;
-        DwmSetWindowAttribute(hWnd, DWMWA_WINDOW_CORNER_PREFERENCE, &borderType, sizeof(UINT));
+        CallDwmSetWindowAttribute(hWnd, DWMWA_WINDOW_CORNER_PREFERENCE, &borderType, sizeof(UINT));
     }
-    
+
     return;
 }
 
-VOID NewWindowShown(HWND hWnd) 
+VOID NewWindowShown(HWND hWnd)
 {
     if(!IsWindowEligible(hWnd))
-        return;        
+        return;
     //else
         //Wh_Log(L"Eligible window: %p", hWnd);
+    if (g_GateToFolderWindows) {
+        AcquireSRWLockExclusive(&g_folderLock);
+        g_folderWnds[hWnd].touched = TRUE;
+        ReleaseSRWLockExclusive(&g_folderLock);
+    }
     HandleEffects(hWnd);
 }
 
@@ -5288,6 +5513,8 @@ VOID DwmSetWindowAttributeHook() {
 HRESULT WINAPI HookedGetThemeTransitionDuration(HTHEME hTheme, INT iPartId, INT iStateIdFrom, INT iStateIdTo, INT iPropId, DWORD *pdwDuration)
 {
     auto hr = GetThemeTransitionDuration_orig(hTheme, iPartId, iStateIdFrom, iStateIdTo, iPropId, pdwDuration);
+    if (!ThreadAllowed() || !pdwDuration)
+        return hr;
     std::wstring ThemeClassStr = GetThemeClass(hTheme);
     
     if (ThemeClassStr == L"ScrollBar" && (iPartId == SBP_ARROWBTN || iPartId == SBP_THUMBBTNHORZ || iPartId == SBP_THUMBBTNVERT) && iStateIdTo == SCRBS_NORMAL)
@@ -5302,6 +5529,8 @@ LRESULT (STDCALL *CThemeMenu_MenuKeyboardMsgProc_orig)(INT, WPARAM, LPARAM);
 LRESULT STDCALL HookedCThemeMenu_MenuKeyboardMsgProc_orig(INT code, WPARAM wParam, LPARAM lParam)
 {
     auto res = CThemeMenu_MenuKeyboardMsgProc_orig(code, wParam, lParam);
+    if (!ThreadAllowed() || g_GateToFolderWindows || !lParam)
+        return res;
 
     #ifdef _WIN64
         INT archOffset = 1;
@@ -5321,8 +5550,10 @@ LRESULT STDCALL HookedCThemeMenu_MenuKeyboardMsgProc_orig(INT code, WPARAM wPara
 HRESULT (__fastcall *_GetBrushesForPart_orig)(HTHEME, INT, COLORREF, HBITMAP*, HBRUSH*);
 HRESULT __fastcall Hooked_GetBrushesForPart(HTHEME hTheme, INT iPartId, COLORREF Color, HBITMAP *phBitmap, HBRUSH *phBrush)
 {
-   std::wstring ThemeClass = GetThemeClass(hTheme);
-    
+    if (!ThreadAllowed() || !phBrush)
+        return _GetBrushesForPart_orig(hTheme, iPartId, Color, phBitmap, phBrush);
+    std::wstring ThemeClass = GetThemeClass(hTheme);
+
     if (ThemeClass == L"Tab" && (iPartId == TABP_BODY || iPartId == TABP_AEROWIZARDBODY)) {
         if (!*phBrush || *phBrush != GetSysColorBrush(COLOR_WINDOW)) {
             *phBrush = GetSysColorBrush(COLOR_WINDOW);
@@ -5337,6 +5568,8 @@ void (__fastcall *_BorderRect_orig)(HDC, COLORREF, LPRECT, INT, INT);
 void __fastcall Hooked_BorderRect(HDC hdc, COLORREF color, LPRECT pRect, INT cxThickness, INT cyThickness)
 {
     if (!pRect) return;
+    if (!DCAllowed(hdc))
+        return _BorderRect_orig(hdc, color, pRect, cxThickness, cyThickness);
 
     auto BorderComposition = [&](RECT rcBorder)
     {
@@ -5474,9 +5707,68 @@ VOID RestoreWindowCustomizations(HWND hWnd)
     }
 }
 
-BOOL CALLBACK EnumWindowsProc(HWND hWnd, LPARAM lParam) 
+// explorer.exe: undo the effects on the folder windows this mod touched, putting back the backdrop
+// type and frame margins Explorer itself last asked for (DWM defaults when it never asked while the
+// mod was loaded), then repaint them. Runs from Wh_ModBeforeUninit, while the hooks pass through.
+VOID RestoreFolderWindows()
+{
+    std::vector<std::pair<HWND, FolderWndState>> wnds;
+    AcquireSRWLockShared(&g_folderLock);
+    for (auto& kv : g_folderWnds)
+        if (kv.second.touched)
+            wnds.push_back(kv);
+    ReleaseSRWLockShared(&g_folderLock);
+
+    for (auto& [hWnd, st] : wnds)
+    {
+        DWORD pid = 0;
+        if (!IsWindow(hWnd) || !GetWindowThreadProcessId(hWnd, &pid) || pid != GetCurrentProcessId() || !IsFolderTopWindow(hWnd))
+            continue;
+
+        DWM_BLURBEHIND bb = {};
+        bb.dwFlags = DWM_BB_ENABLE;
+        bb.fEnable = FALSE;
+        DwmEnableBlurBehindWindow(hWnd, &bb);
+
+        ACCENT_POLICY accentPolicy = {};
+        accentPolicy.AccentState = ACCENT_STATE_DISABLED;
+        WINCOMPATTRDATA winCompositionAttrib = {};
+        winCompositionAttrib.Attrib = WCA_ACCENT_POLICY;
+        winCompositionAttrib.pvData = &accentPolicy;
+        winCompositionAttrib.cbData = sizeof(accentPolicy);
+        if (SetWindowCompositionAttribute)
+            SetWindowCompositionAttribute(hWnd, &winCompositionAttrib);
+
+        if (st.hasHostBd)
+            CallDwmSetWindowAttribute(hWnd, DWMWA_USE_HOSTBACKDROPBRUSH, &st.hostBd, sizeof(BOOL));
+        DWORD backdrop = st.hasBackdrop ? st.backdrop : AUTO;
+        CallDwmSetWindowAttribute(hWnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop, sizeof(DWORD));
+
+        MARGINS margins = st.hasMargins ? st.margins : MARGINS{0, 0, 0, 0};
+        CallDwmExtendFrameIntoClientArea(hWnd, &margins);
+
+        RedrawWindow(hWnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
+    }
+
+    AcquireSRWLockExclusive(&g_folderLock);
+    g_folderWnds.clear();
+    ReleaseSRWLockExclusive(&g_folderLock);
+}
+
+BOOL CALLBACK EnumWindowsProc(HWND hWnd, LPARAM lParam)
 {
     DWORD dwProcessId = 0;
+    if (g_GateToFolderWindows)
+    {
+        // explorer.exe, mod loaded into a running Explorer: pick up the open folder windows.
+        if (g_settings.Unload || !GetWindowThreadProcessId(hWnd, &dwProcessId) || dwProcessId != GetCurrentProcessId()
+            || !IsFolderTopWindow(hWnd))
+            return TRUE;
+        RegisterFolderThread(GetWindowThreadProcessId(hWnd, nullptr));
+        NewWindowShown(hWnd);
+        RedrawWindow(hWnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
+        return TRUE;
+    }
     // Pass console window, it might be called from other processes like Clink:https://github.com/chrisant996/clink
     if ((!GetWindowThreadProcessId(hWnd, &dwProcessId) || dwProcessId != GetCurrentProcessId()) && !IsWindowClass(hWnd, L"ConsoleWindowClass")) 
         return TRUE;
@@ -5495,6 +5787,10 @@ BOOL CALLBACK EnumWindowsProc(HWND hWnd, LPARAM lParam)
 
 VOID ApplyForExistingWindows()
 {
+    if (g_GateToFolderWindows && g_settings.Unload) {
+        RestoreFolderWindows();
+        return;
+    }
     EnumWindows(EnumWindowsProc, 0);
 }
 
@@ -5629,6 +5925,8 @@ LRESULT MyRealDefWindowProcWorker(UINT msg, WPARAM wParam)
     LRESULT (__fastcall *RealDefWindowProcWorker_orig)(struct tagWND*, UINT, WPARAM, LPARAM, UINT);
     LRESULT __fastcall HookedRealDefWindowProcWorker(struct tagWND* pwnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT flags)
     {
+        if (!ThreadAllowed())
+            return RealDefWindowProcWorker_orig(pwnd, msg, wParam, lParam, flags);
         switch (msg)
         {
             case WM_CTLCOLOR:
@@ -5651,6 +5949,8 @@ LRESULT MyRealDefWindowProcWorker(UINT msg, WPARAM wParam)
     LRESULT (__fastcall *RealDefWindowProcWorker_orig)(UINT, WPARAM, struct tagWND*, UINT, LPARAM, UINT);
     LRESULT __fastcall HookedRealDefWindowProcWorker(UINT msg, WPARAM wParam, struct tagWND* pwnd, UINT msg_dup, LPARAM lParam, UINT flags)
     {
+        if (!ThreadAllowed())
+            return RealDefWindowProcWorker_orig(msg, wParam, pwnd, msg_dup, lParam, flags);
         switch (msg)
         {
             case WM_CTLCOLOR:
@@ -5675,7 +5975,7 @@ LRESULT MyRealDefWindowProcWorker(UINT msg, WPARAM wParam)
 HBRUSH (STDCALL *MB_DlgProc_orig)(HWND, UINT, WPARAM, LPARAM);
 HBRUSH STDCALL Hooked_MB_DlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    if (msg == WM_CTLCOLORDLG || msg == WM_CTLCOLORSTATIC)
+    if (ThreadAllowed() && (msg == WM_CTLCOLORDLG || msg == WM_CTLCOLORSTATIC))
         return GetSysColorBrush(COLOR_WINDOW); // Default: gpsi + 4736 (COLOR_WINDOW)
     return MB_DlgProc_orig(hwnd, msg, wParam, lParam);
 }
@@ -5684,6 +5984,9 @@ HBRUSH STDCALL Hooked_MB_DlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 void (THISCALL *DrawCommandRectangle_orig)(HWND);
 void THISCALL Hooked_DrawCommandRectangle(HWND hWnd)
 {
+    if (!ThreadAllowed())
+        return DrawCommandRectangle_orig(hWnd);
+
     PAINTSTRUCT ps{};
     HDC hdc = BeginPaint(hWnd, &ps);
     if (!hdc)
@@ -5717,6 +6020,10 @@ void THISCALL Hooked_DrawCommandRectangle(HWND hWnd)
 void (__fastcall *RenderTooltip_orig)(HWND, HDC, HGDIOBJ*);
 void __fastcall HookedRenderTooltip(HWND hWnd, HDC hdc, HGDIOBJ *a3)
 {
+    // explorer.exe: tooltips are never customized here (they stay with win32-ui-modernizer).
+    if (g_GateToFolderWindows || !ThreadAllowed() || !a3)
+        return RenderTooltip_orig(hWnd, hdc, a3);
+
     HGDIOBJ oldObj = SelectObject(hdc, a3[1]);
     
     LPCWCHAR lpString = reinterpret_cast<LPCWCHAR>(*a3);
@@ -5860,7 +6167,7 @@ int (__fastcall *DrawShadowTextEx_orig)(HDC, LPCWSTR, INT, LPRECT, UINT, COLORRE
 int __fastcall HookedDrawShadowTextEx(HDC hdc, LPCWSTR lpchText, INT cchText, LPRECT pRect, UINT uformat, 
                 COLORREF crText, COLORREF crShadow, INT ixOffset, INT iyOffset, BYTE bAlpha, BOOL InitBufferPaintFlag)
 {
-    if (!g_IsSysThemeDarkMode && g_InsideExplorerProc) {
+    if (DCAllowed(hdc) && !g_IsSysThemeDarkMode && g_InsideExplorerProc) {
         crText = RGB(0, 0, 0);
         crShadow = RGB(255, 255, 255);
     }
@@ -5870,7 +6177,7 @@ int __fastcall HookedDrawShadowTextEx(HDC hdc, LPCWSTR lpchText, INT cchText, LP
 void (__fastcall *SHThemeDrawText_orig)(void*, HDC, INT, INT, DTTOPTS*, LPCWSTR, LPRECT, INT, UINT, INT, __int64, COLORREF, COLORREF);
 void __fastcall Hooked_SHThemeDrawText(void *hTheme, HDC hdc, INT iPartId, INT iStateId, DTTOPTS *pOptions, LPCWSTR lpString, LPRECT pRect, INT iLVGroupAlignFlag, UINT uFormat, INT a10, __int64 a11, COLORREF crText, COLORREF crBackground)
 {
-    if (!g_InsideTaskMgrProc)
+    if (!g_InsideTaskMgrProc && DCAllowed(hdc))
         crText = g_IsSysThemeDarkMode && (crText & 0x00ffffff) <= RGB(96, 96, 96) ? RGB(255, 255, 255) : !g_IsSysThemeDarkMode ? RGB(0, 0, 0) : crText;
 
     SHThemeDrawText_orig(hTheme, hdc, iPartId, iStateId, pOptions, lpString, pRect, iLVGroupAlignFlag, uFormat, a10, a11, crText, crBackground);
@@ -5882,7 +6189,7 @@ void __fastcall Hooked_SHThemeDrawText(void *hTheme, HDC hdc, INT iPartId, INT i
 void (__fastcall *SHThemeFillTextRect_orig)(HDC, LPRECT, COLORREF, INT);
 void __fastcall HookedSHThemeFillTextRect(HDC hDC, LPRECT lprc, COLORREF color, INT sysColorCode)
 {
-    if (color != GetSysColor(COLOR_HIGHLIGHT))
+    if (!DCAllowed(hDC) || !lprc || color != GetSysColor(COLOR_HIGHLIGHT))
         return SHThemeFillTextRect_orig(hDC, lprc, color, sysColorCode);
     
     BP_PAINTPARAMS params = { sizeof(BP_PAINTPARAMS) };
@@ -5904,7 +6211,7 @@ void __fastcall HookedSHThemeFillTextRect(HDC hDC, LPRECT lprc, COLORREF color, 
 COLORREF (__fastcall *FillRectClr_orig)(HDC, LPRECT, COLORREF);
 COLORREF __fastcall HookedFillRectClr(HDC hdc, LPRECT lprect, COLORREF color)
 {
-    if (color != GetSysColor(COLOR_HIGHLIGHT))
+    if (!DCAllowed(hdc) || !lprect || color != GetSysColor(COLOR_HIGHLIGHT))
         return FillRectClr_orig(hdc, lprect, color);
         
     BP_PAINTPARAMS params = { sizeof(BP_PAINTPARAMS) };
@@ -5931,7 +6238,7 @@ HBRUSH (__fastcall *ListBox_GetBrush_orig)(struct tagLBIV*, HBRUSH*);
 HBRUSH __fastcall HookedListBox_GetBrush(struct tagLBIV *a1, HBRUSH *hbr)
 {   
     // Default return brush: GetSysColorBrush(COLOR_WINDOW)
-    HBRUSH ret = g_IsSysThemeDarkMode ? ListBox_GetBrush_orig(a1, hbr) : (HBRUSH)GetStockObject(WHITE_BRUSH);
+    HBRUSH ret = (g_IsSysThemeDarkMode || !ThreadAllowed()) ? ListBox_GetBrush_orig(a1, hbr) : (HBRUSH)GetStockObject(WHITE_BRUSH);
     return ret;
 }
 
@@ -5941,7 +6248,7 @@ HBRUSH __fastcall HookedListBox_GetBrush(struct tagLBIV *a1, HBRUSH *hbr)
 void (__fastcall *ComboEx_OnDrawItem_orig)(struct COMBOEX*, struct tagDRAWITEMSTRUCT*);
 void __fastcall HookedComboEx_OnDrawItem(struct COMBOEX *a1, struct tagDRAWITEMSTRUCT *a2)
 {
-    if (!g_IsSysThemeDarkMode) 
+    if (!g_IsSysThemeDarkMode && a2 && DCAllowed(a2->hDC))
     {
         InflateRect(&a2->rcItem, 1, 1);
         FillRect(a2->hDC, &a2->rcItem, (HBRUSH)GetStockObject(WHITE_BRUSH));
@@ -6086,6 +6393,9 @@ void THISCALL Hooked_CNscTree_DrawDivider(CNscTree *__this, HDC hdc, struct _TRE
         return;
     };
 
+    if (!DCAllowed(hdc))
+        return Fallback();
+
     HWND hwndTreeView = nullptr;
     // CNscTree_GetWindowsDDT returns 0 if succeeded
     if (CNscTree_GetWindowsDDT_orig && CNscTree_GetWindowsDDT_orig(__this, &hwndTreeView, &hwndTreeView))
@@ -6216,7 +6526,7 @@ HANDLE STDCALL HookedBrandingLoadImage(LPCWSTR pszBrand, UINT uID, UINT type, IN
     auto hImage = BrandingLoadImage_orig(pszBrand, uID, type, cx, cy, fuLoad);
 
     // The image resource is fetched from basebrd.dll resource image 121.
-    if (!wcscmp(pszBrand, L"Basebrd") && uID == 121)
+    if (ThreadAllowed() && pszBrand && !IS_INTRESOURCE(pszBrand) && !wcscmp(pszBrand, L"Basebrd") && uID == 121)
         RecolorBrandingLogoBackground(reinterpret_cast<HBITMAP>(hImage));
     return hImage;
 }
@@ -6253,9 +6563,9 @@ VOID WinbrandHooks()
 
 // Imitate the internal pseudohandle logic and replace gpsi pointer with GetSysColorBrush getter API.
 BOOL WINAPI HookedFillRect(HDC hdc, LPCRECT lprc, HBRUSH hbr)
-{    
+{
     ULONG_PTR pseudoSystemBrush = (ULONG_PTR)hbr - 1;
-    if (pseudoSystemBrush <= 30)
+    if (pseudoSystemBrush <= 30 && DCAllowed(hdc))
         return FillRect_orig(hdc, lprc, GetSysColorBrush((INT)pseudoSystemBrush));    
 
     return FillRect_orig(hdc, lprc, hbr);
@@ -6265,6 +6575,8 @@ BOOL WINAPI HookedFillRect(HDC hdc, LPCRECT lprc, HBRUSH hbr)
 BOOL (__fastcall *SetDarkThemeColors_orig)(void **, HDC);
 BOOL __fastcall HookedSetDarkThemeColors(void **Brush, HDC hdc)
 {
+    if (!DCAllowed(hdc))
+        return SetDarkThemeColors_orig(Brush, hdc);
     SetBkColor(hdc, RGB(0, 0, 0));
     SetTextColor(hdc, g_IsSysThemeDarkMode ? RGB(255, 255, 255) : RGB(0, 0, 0));
     //if ( !*Brush )
@@ -6279,9 +6591,11 @@ LRESULT STDCALL HookedCFileNameComboBox_s_ComboBoxRootSubclass(HWND hWnd, UINT u
     auto ret = CFileNameComboBox_s_ComboBoxRootSubclass_orig(hWnd, uMsg, wParam, lParam, uIdSubclass, dwRefData);
 
     // Intercept the paint messages
-    if (uMsg != WM_CTLCOLOREDIT && uMsg != WM_CTLCOLORLISTBOX && uMsg != WM_CTLCOLORSTATIC) 
+    if (uMsg != WM_CTLCOLOREDIT && uMsg != WM_CTLCOLORLISTBOX && uMsg != WM_CTLCOLORSTATIC)
         return ret;
-    
+    if (!ThreadAllowed())
+        return ret;
+
     HDC hdc = reinterpret_cast<HDC>(wParam);
     SetBkColor(hdc, RGB(0, 0, 0));
     SetTextColor(hdc, g_IsSysThemeDarkMode ? RGB(255, 255, 255) : RGB(0, 0, 0));
@@ -6295,7 +6609,9 @@ BOOL STDCALL HookedCComboBoxExBase_OnWinEvent(class CComboBoxExBase *__this, HWN
     auto ret = CComboBoxExBase_OnWinEvent_orig(__this, hWnd, uMsg, hdc, lParam, pResult);
 
     // Intercept the paint messages
-    if (uMsg != WM_CTLCOLOREDIT && uMsg != WM_CTLCOLORLISTBOX && uMsg != WM_CTLCOLORSTATIC) 
+    if (uMsg != WM_CTLCOLOREDIT && uMsg != WM_CTLCOLORLISTBOX && uMsg != WM_CTLCOLORSTATIC)
+        return ret;
+    if (!ThreadAllowed())
         return ret;
 
     if (ret == false && pResult != nullptr && *pResult != 0) 
@@ -6381,9 +6697,11 @@ VOID CustomRenderingHooks()
     WindhawkUtils::SetFunctionHook(DrawThemeEdge, HookedDrawThemeEdge, &DrawThemeEdge_orig);
     ExplorerFrameHooks();
     Comctl32Hooks();
-    if (g_IsSysThemeDarkMode)
+    // explorer.exe: no common file dialog or branding bitmap belongs to a folder window.
+    if (g_IsSysThemeDarkMode && !g_GateToFolderWindows)
         Comdlg32Hooks();
-    WinbrandHooks();
+    if (!g_GateToFolderWindows)
+        WinbrandHooks();
     User32Hooks(g_settings.SetSystemColors);
     if (!g_settings.SetSystemColors) {
         WindhawkUtils::SetFunctionHook(FillRect, HookedFillRect, &FillRect_orig);
@@ -6601,6 +6919,8 @@ VOID LoadSettings()
 BOOL Wh_ModInit(VOID) 
 {
     g_InsideExplorerProc = CheckExplorerProcess();
+    // The shell explorer.exe hosts the taskbar, desktop and XAML islands: confine the mod to folder windows.
+    g_GateToFolderWindows = g_InsideExplorerProc;
     if (g_InsideExplorerProc)
         g_explorerStylerNoBackgroundEffectAtom = AddAtom(L"WindhawkFileExplorerStylerNoBackgroundEffect");
     if (InTaskManagerProcess())
@@ -6633,15 +6953,32 @@ VOID Wh_ModAfterInit()
         ApplyForExistingWindows();
 }
 
-VOID Wh_ModUninit(VOID) 
+// Hooks are still installed here: make every hook pass through first, then undo the window effects.
+VOID Wh_ModBeforeUninit(VOID)
 {
-    if (g_explorerStylerNoBackgroundEffectAtom)
-        DeleteAtom(g_explorerStylerNoBackgroundEffectAtom);
-     
+    g_unloading.store(true, std::memory_order_release);
     g_settings.Unload = TRUE;
-    if (g_settings.FillBg && g_d2dFactory)
+    ApplyForExistingWindows();
+}
+
+VOID Wh_ModUninit(VOID)
+{
+    if (g_explorerStylerNoBackgroundEffectAtom) {
+        DeleteAtom(g_explorerStylerNoBackgroundEffectAtom);
+        g_explorerStylerNoBackgroundEffectAtom = 0;
+    }
+
+    // Normally done in Wh_ModBeforeUninit; kept for engines that only call Wh_ModUninit.
+    BOOL restored = g_unloading.exchange(true);
+    g_settings.Unload = TRUE;
+    if (!restored)
+        ApplyForExistingWindows();
+
+    // In explorer.exe a folder thread may still be inside a paint hook that passed the gate just
+    // before unloading began, so the factory is left alive there (a few KB, freed with the process).
+    if (g_settings.FillBg && g_d2dFactory && !g_GateToFolderWindows)
         g_d2dFactory->Release();
-    
+
     if (g_settings.SetSystemColors)
         RevertSysColors();
 
@@ -6654,11 +6991,9 @@ VOID Wh_ModUninit(VOID)
         }
         if (brushDefault) { 
             DeleteObject(brushDefault); 
-            brushDefault = nullptr; 
+            brushDefault = nullptr;
         }
     }
-
-    ApplyForExistingWindows();
 }
 
 BOOL Wh_ModSettingsChanged(BOOL* bReload) 
