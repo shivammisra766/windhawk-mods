@@ -511,6 +511,7 @@ DWORD WINAPI BarThread(void*) {
         delete icon.pix;
     }
     g_tray.clear();
+    ShelfShutdown();  // Joins the thumbnail worker before the DLL can go.
     IslandShutdown();
     ReleaseGfx();
     OleUninitialize();
