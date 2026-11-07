@@ -2,7 +2,7 @@
 // @id              panel-split
 // @name            Panel split
 // @description     Lets the top bar open the native notifications or calendar on their own, hides toasts for the bar's island, and hides a cold first panel open
-// @version         1.13
+// @version         1.14
 // @author          local
 // @include         ShellExperienceHost.exe
 // @include         ShellHost.exe

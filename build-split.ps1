@@ -1,5 +1,5 @@
 ﻿$s = $PSScriptRoot
-$id = 'local@panel-split'; $ver = '1.13'; $serial = '400014'
+$id = 'local@panel-split'; $ver = '1.14'; $serial = '400015'
 $utf8 = New-Object Text.UTF8Encoding($false)
 $t = [IO.File]::ReadAllText("$s\$id.wh.cpp", $utf8)
 $comp = 'C:\Program Files\Windhawk\Compiler'

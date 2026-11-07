@@ -17246,7 +17246,8 @@ struct ACCENT_POLICY { INT AccentState; INT AccentFlags; UINT GradientColor; INT
 enum { WCA_ACCENT_POLICY = 19 };
 enum {
     ACCENT_DISABLED = 0,
-    ACCENT_ENABLE_ACRYLICBLURBEHIND = 4
+    ACCENT_ENABLE_ACRYLICBLURBEHIND = 4,
+    ACCENT_ENABLE_TRANSPARENTGRADIENT = 2  // User's theme: plain see-through, no blur
 };
 struct WINCOMPATTRDATA { INT Attrib; PVOID pvData; SIZE_T cbData; };
 using SetWindowCompositionAttribute_t = BOOL(WINAPI*)(HWND, WINCOMPATTRDATA*);
@@ -18516,9 +18517,9 @@ static DWORD MenuAcrylicTintColor(bool dark)
     // of almost anything, dark ink is not, so the light surface keeps more of
     // itself -- the same reason the tooltip pair is not symmetric either.
     // These two are the tuning knobs for how translucent a menu reads.
-    constexpr DWORD kDarkTintAlpha = 0xDC;   // Start's 86% (user's theme)
+    constexpr DWORD kDarkTintAlpha = 0xC4;   // Terminal's 77% (user's theme)
     constexpr DWORD kLightTintAlpha = 0xCC;  // 80%
-    const COLORREF solid = dark ? RGB(0x10, 0x10, 0x10) : WinUiFloatingSurfaceColor(dark);  // Start's #101010
+    const COLORREF solid = dark ? RGB(0, 0, 0) : WinUiFloatingSurfaceColor(dark);  // Terminal's black
     const DWORD alpha = dark ? kDarkTintAlpha : kLightTintAlpha;
     return (alpha << 24) | (GetBValue(solid) << 16) | (GetGValue(solid) << 8) |
            GetRValue(solid);
@@ -18532,8 +18533,8 @@ static DWORD TooltipAcrylicTintColor(bool dark)
     //
     // The surface color shared with menus and the drag label; see
     // WinUiFloatingSurfaceColor. Gray, so the byte order does not matter.
-    const COLORREF solid = WinUiFloatingSurfaceColor(dark);
-    const DWORD alpha = dark ? 0xD9u : 0xE6u;
+    const COLORREF solid = dark ? RGB(0, 0, 0) : WinUiFloatingSurfaceColor(dark);  // Terminal's black
+    const DWORD alpha = dark ? 0xC4u : 0xE6u;  // Terminal's 77%
     return (alpha << 24) | (GetBValue(solid) << 16) | (GetGValue(solid) << 8) |
            GetRValue(solid);
 }
@@ -18695,7 +18696,8 @@ static bool TooltipEnableAcrylic(HWND hwnd, bool dark)
         return false;
 
     ACCENT_POLICY accent{};
-    accent.AccentState = ACCENT_ENABLE_ACRYLICBLURBEHIND;
+    accent.AccentState = ACCENT_ENABLE_TRANSPARENTGRADIENT;
+    accent.AccentFlags = 2;  // Use GradientColor; without it DWM draws its own light tint.
     accent.GradientColor = TooltipAcrylicTintColor(dark);
     WINCOMPATTRDATA attr{};
     attr.Attrib = WCA_ACCENT_POLICY;
@@ -19287,7 +19289,8 @@ static void MenuApplyAcrylicEffects(HWND hwnd)
 
         if (transparentBackdrop) {
             ACCENT_POLICY accent{};
-            accent.AccentState = ACCENT_ENABLE_ACRYLICBLURBEHIND;
+            accent.AccentState = ACCENT_ENABLE_TRANSPARENTGRADIENT;
+    accent.AccentFlags = 2;  // Use GradientColor; without it DWM draws its own light tint.
             accent.GradientColor = MenuAcrylicTintColor(dark);
             WINCOMPATTRDATA attr{};
             attr.Attrib = WCA_ACCENT_POLICY;
@@ -20484,7 +20487,8 @@ static void CbdApplyAcrylic(HWND hwnd)
         return;
 
     ACCENT_POLICY accent{};
-    accent.AccentState = ACCENT_ENABLE_ACRYLICBLURBEHIND;
+    accent.AccentState = ACCENT_ENABLE_TRANSPARENTGRADIENT;
+    accent.AccentFlags = 2;  // Use GradientColor; without it DWM draws its own light tint.
     accent.GradientColor = ComboAcrylicTintColor();
     WINCOMPATTRDATA attr{};
     attr.Attrib = WCA_ACCENT_POLICY;
