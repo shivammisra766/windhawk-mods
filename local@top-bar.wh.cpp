@@ -4253,9 +4253,10 @@ constexpr unsigned long long kShelfItemCap = 512ULL << 20;
 bool g_dropActive = false;       // A drag is over the bar or the island.
 ULONGLONG g_dropLeft = 0;        // When it last left.
 bool g_shelfInternalDrag = false;  // Our own drag out: dropping it back on the bar does nothing.
+bool g_shelfChoiceOpen = false;    // The keep-or-send card after a drop is up: the island stays open for it.
 
 bool ShelfHoldsOpen() {
-    return g_dropActive || g_shelfInternalDrag || (g_dropLeft && GetTickCount64() - g_dropLeft < 300);
+    return g_shelfChoiceOpen || g_dropActive || g_shelfInternalDrag || (g_dropLeft && GetTickCount64() - g_dropLeft < 300);
 }
 
 std::wstring ShelfDir() { return DataRoot() + L"\\shelf"; }
@@ -4334,6 +4335,78 @@ std::wstring FormatSize(unsigned long long b) {
     else if (b >= 1024) swprintf_s(buf, L"%.0f KB", b / 1024.0);
     else swprintf_s(buf, L"%llu B", b);
     return buf;
+}
+
+// ---- Send to phone: the PCTracker app's Explorer verb, read at run time ----
+// The verb's command only drops a request in PCTracker's outbox and exits; the agent does the sending.
+// No verb registered: no phone option anywhere.
+void AlertsPhoneSent(int sent, int failed);  // alerts.inc
+void SetExpanded(bool expanded);             // island.inc
+
+struct PhoneVerb {
+    std::wstring file, dir;
+    ULONGLONG readAt = 0;
+};
+PhoneVerb g_phoneVerb;
+
+std::wstring ReadVerbCommand(const wchar_t* key) {
+    wchar_t buf[2048];
+    DWORD size = sizeof(buf), type = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, key, nullptr, RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND, &type, buf, &size) != ERROR_SUCCESS) return L"";
+    std::wstring cmd = buf;
+    if (type == REG_EXPAND_SZ) {
+        wchar_t out[4096];
+        const DWORD n = ExpandEnvironmentStringsW(buf, out, 4096);
+        if (n && n <= 4096) cmd = out;
+    }
+    while (!cmd.empty() && iswspace(cmd.back())) cmd.pop_back();
+    return cmd;
+}
+
+// Cached for 5 s: rows ask while they draw.
+const std::wstring& PhoneCommand(bool dir) {
+    const ULONGLONG now = GetTickCount64();
+    if (!g_phoneVerb.readAt || now - g_phoneVerb.readAt > 5000) {
+        g_phoneVerb.readAt = now;
+        g_phoneVerb.file = ReadVerbCommand(L"Software\\Classes\\*\\shell\\PCTrackerSendToPhone\\command");
+        g_phoneVerb.dir = ReadVerbCommand(L"Software\\Classes\\Directory\\shell\\PCTrackerSendToPhone\\command");
+    }
+    return dir ? g_phoneVerb.dir : g_phoneVerb.file;
+}
+
+// The verb's command with "%1" replaced by the quoted path. No window, not waited for.
+bool LaunchPhoneSend(const std::wstring& path, bool dir) {
+    const std::wstring& cmd = PhoneCommand(dir);
+    if (cmd.empty() || path.empty()) return false;
+    const std::wstring q = L"\"" + path + L"\"";
+    std::wstring line = cmd;
+    size_t at = line.find(L"\"%1\"");
+    if (at != std::wstring::npos) line.replace(at, 4, q);
+    else if ((at = line.find(L"%1")) != std::wstring::npos) line.replace(at, 2, q);
+    else line += L" " + q;
+    std::wstring cwd;  // The helper's own folder, when the command names it in quotes.
+    if (line[0] == L'"') {
+        const size_t e = line.find(L'"', 1);
+        if (e != std::wstring::npos) {
+            cwd = line.substr(1, e - 1);
+            const size_t s = cwd.find_last_of(L"\\/");
+            cwd = s == std::wstring::npos ? L"" : cwd.substr(0, s);
+        }
+    }
+    const DWORD ca = cwd.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(cwd.c_str());
+    if (ca == INVALID_FILE_ATTRIBUTES || !(ca & FILE_ATTRIBUTE_DIRECTORY)) cwd.clear();
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, &line[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, cwd.empty() ? nullptr : cwd.c_str(), &si, &pi)) {
+        Wh_Log(L"top-bar: send to phone failed to start, error %lu", GetLastError());
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
 }
 
 bool CopyTextToClipboard(const std::wstring& t) {
@@ -4868,8 +4941,11 @@ public:
             }
         }
         int added = 0;
+        lastIngest_.clear();
         for (ShelfItem& it : fresh) {
-            if (Commit(std::move(it))) added++; else refuse = L"Shelf is full";
+            bool isNew = false;
+            if (Commit(std::move(it), &isNew)) { added++; lastIngest_.push_back({items_.back().id, isNew}); }
+            else refuse = L"Shelf is full";
         }
         if (added) { Save(); scroll_ = 0; }
         if (!added) Flash(refuse.empty() ? L"Nothing to keep" : refuse);
@@ -4911,14 +4987,15 @@ public:
             ShelfItem& it = items_[n - 1 - d];
             const float top = 46 + r * (kRowH + kGap), bot = top + kRowH;
             const int rowId = 1000 + (int)it.id, rmId = 100000 + (int)it.id;
-            const bool hot = hover_ == rowId || hover_ == rmId;
+            const bool hot = hover_ == rowId || hover_ == rmId || hover_ == kPhoneIdBase + (int)it.id;
             if (hot) p.Fill(26, top, 354, bot, 9, kCard);
             Hit(26, top, 354, bot, rowId);
             const float a = it.missing ? 0.45f : 1.0f;
             DrawKindIcon(p, it, 34, top + 6, a);
             p.Col(kFg, a);
+            const bool phone = hot && CanPhone(it);
             p.Text(it.title, 58, top, 258, bot, 11, it.missing ? kMuted : kFg, TF_Ellipsis);
-            p.Text(SizeLabel(it), 258, top, 322, bot, 11, kMuted, TF_Right | TF_Ellipsis);
+            p.Text(SizeLabel(it), 258, top, phone ? 302 : 322, bot, 11, kMuted, TF_Right | TF_Ellipsis);
             if (hot) {
                 const float cx = 337, cy = top + kRowH / 2;
                 p.Dot(cx, cy, 7, hover_ == rmId ? kCardHover : kCard);
@@ -4926,13 +5003,37 @@ public:
                 p.Line(cx - 2.5f, cy + 2.5f, cx + 2.5f, cy - 2.5f, 1.3f, kFg);
                 Hit(cx - 10, cy - 10, cx + 10, cy + 10, rmId);
             }
+            if (phone) {  // Send to phone; the row stays.
+                const int phId = kPhoneIdBase + (int)it.id;
+                const float cx = 315, cy = top + kRowH / 2;
+                p.Dot(cx, cy, 7, hover_ == phId ? kCardHover : kCard);
+                PhoneGlyph(p, cx, cy, kFg);
+                Hit(cx - 9, cy - 10, cx + 9, cy + 10, phId);
+            }
         }
         if (n > cap) {  // A thin scroll mark
             const float trackT = 46, trackB = 46 + cap * (kRowH + kGap) - kGap;
             const float th = (trackB - trackT) * cap / n, ty = trackT + (trackB - trackT - th) * scroll_ / std::max(1, n - cap);
             p.Fill(358, ty, 360, ty + th, 1, kFg, 0.35f);
         }
+        DrawChoice(c);
         if (g_dropActive) p.Outline(3, 3, 377, 181, 14, 1.5f, kAccent, 0.8f);
+    }
+
+    bool Animating(View v) const override { return v == View::Dashboard && !choice_.Settled(); }
+
+    // After a drop: the card asks keep or send, for the dropped rows the phone can take. Keep is the default.
+    void OfferPhone() {
+        offer_.clear();
+        for (const Offer& o : lastIngest_) {
+            if (ShelfItem* it = Find(o.id)) if (CanPhone(*it)) offer_.push_back(o);
+        }
+        lastIngest_.clear();
+        if (offer_.empty()) return;
+        g_shelfChoiceOpen = true;
+        choiceUntil_ = GetTickCount64() + kChoiceMs;
+        ArmTimer();
+        ShowChoice(true);
     }
 
     bool OnWheel(int steps) override {
@@ -4950,7 +5051,8 @@ public:
         if (e.kind == PointerEvent::Down) {
             press_ = 0;
             for (const HitRect& h : hits_) if (x >= h.l && x < h.r && y >= h.t && y < h.b && h.id >= 1000 && h.id < 100000) press_ = h.id - 1000;
-            for (const HitRect& h : hits_) if (x >= h.l - 3 && x < h.r + 3 && y >= h.t - 3 && y < h.b + 3 && h.id >= 100000) press_ = 0;  // The remove button never starts a drag
+            for (const HitRect& h : hits_) if (x >= h.l - 3 && x < h.r + 3 && y >= h.t - 3 && y < h.b + 3 && h.id >= 100000) press_ = 0;  // The row buttons never start a drag
+            for (const HitRect& h : hits_) if (x >= h.l && x < h.r && y >= h.t && y < h.b && h.id == kChoiceCard) press_ = 0;  // Nor does the card over the rows
             pressPt_ = e.pt;
         } else if (e.kind == PointerEvent::Move && press_ && (GetKeyState(VK_LBUTTON) & 0x8000)) {
             if (fabsf(e.pt.x - pressPt_.x) > GetSystemMetrics(SM_CXDRAG) || fabsf(e.pt.y - pressPt_.y) > GetSystemMetrics(SM_CYDRAG)) {
@@ -4970,6 +5072,11 @@ protected:
     void Shown() override { EnsureLoaded(); }
     void Hidden() override {
         scroll_ = 0;
+        offer_.clear();  // Closing the island over the card keeps what was dropped.
+        g_shelfChoiceOpen = false;
+        choiceUntil_ = 0;
+        choice_.Snap(0);
+        ArmTimer();
         for (ShelfItem& it : items_) {  // Keep the small CPU pixels as the cache; drop the GPU copies.
             if (it.icon) it.icon->bmp.Reset();
             if (it.thumb) it.thumb->bmp.Reset();
@@ -4993,6 +5100,15 @@ protected:
                 confirmUntil_ = 0;
                 Save();
             }
+        } else if (id == kChoiceKeep) {
+            ResolveChoice(false);
+        } else if (id == kChoiceSend) {
+            ResolveChoice(true);
+        } else if (id == kChoiceCard) {
+            return;
+        } else if (id >= kPhoneIdBase) {
+            bool removed = false;
+            Flash(SendItem((unsigned)(id - kPhoneIdBase), false, &removed) ? L"Sent to phone" : L"Could not send to phone");
         } else if (id >= 100000) {
             Remove((unsigned)(id - 100000));
         } else if (id >= 1000) {
@@ -5004,6 +5120,154 @@ protected:
 private:
     static constexpr int kRows = 3;
     static constexpr float kRowH = 30, kGap = 6;
+    static constexpr int kChoiceKeep = 3, kChoiceSend = 4, kChoiceCard = 5;  // Hit ids of the drop card
+    static constexpr int kPhoneIdBase = 200000;                              // + item id: a row's phone button
+    static constexpr ULONGLONG kChoiceMs = 4000;                            // Then it stays in the bar.
+
+    struct Offer {
+        unsigned id;
+        bool fresh;  // Added by this drop, not an existing row that the drop promoted.
+    };
+
+    // Whether a row can go to the phone: a file or folder on disk, or the file the shelf stored.
+    bool CanPhone(const ShelfItem& it) {
+        if (it.missing) return false;
+        if (it.kind == SK::File) return !PhoneCommand(it.isDir).empty();
+        if (it.kind == SK::Link || it.path.empty() || !SafeBlobName(it.path)) return false;  // Links and short text are not files.
+        return !PhoneCommand(false).empty();
+    }
+
+    static void PhoneGlyph(const Pg& p, float cx, float cy, D2D1_COLOR_F k) {
+        p.Outline(cx - 3.2f, cy - 5, cx + 3.2f, cy + 5, 1.6f, 1.1f, k);
+        p.Line(cx - 1, cy + 3, cx + 1, cy + 3, 1.1f, k);
+    }
+
+    std::wstring SentDir() { return ShelfDir() + L"\\sent"; }
+
+    // Stored files go to the phone from their own folder under sent\, named after the row: the agent may send
+    // after the row is gone. A hard link costs no space; sent\ is swept after a week.
+    std::wstring SentLink(const ShelfItem& it, bool move) {
+        const std::wstring blob = BlobPath(it);
+        std::wstring name = SafeFileName(it.title, it.kind == SK::Text ? L"Text" : L"File", L"");
+        const std::wstring ext = ExtOf(it.path);
+        if (!ext.empty() && ExtOf(name) != ext) name += ext;
+        const std::wstring dir = SentDir() + L"\\" + std::to_wstring(WallSeconds()) + L"_" + std::to_wstring(it.id);
+        if (SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr) != ERROR_SUCCESS && GetFileAttributesW(dir.c_str()) == INVALID_FILE_ATTRIBUTES) return L"";
+        const std::wstring target = dir + L"\\" + name;
+        if (CreateHardLinkW(target.c_str(), blob.c_str(), nullptr)) return target;
+        if (move && MoveFileExW(blob.c_str(), target.c_str(), 0)) return target;
+        RemoveDirectoryW(dir.c_str());
+        return L"";
+    }
+
+    void SweepSent() {
+        const ULONGLONG now = WallSeconds();
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW((SentDir() + L"\\*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.') continue;
+            const ULONGLONG at = wcstoull(fd.cFileName, nullptr, 10);
+            if (!at || now < at || now - at < 7 * 86400) continue;
+            const std::wstring dir = SentDir() + L"\\" + fd.cFileName;
+            WIN32_FIND_DATAW f2;
+            HANDLE h2 = FindFirstFileW((dir + L"\\*").c_str(), &f2);
+            if (h2 != INVALID_HANDLE_VALUE) {
+                do {
+                    if (!(f2.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) DeleteFileW((dir + L"\\" + f2.cFileName).c_str());
+                } while (FindNextFileW(h2, &f2));
+                FindClose(h2);
+            }
+            RemoveDirectoryW(dir.c_str());
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+
+    // Hands one row to the phone. remove: drop the row once handed over (only when the file survives that).
+    bool SendItem(unsigned id, bool remove, bool* removed) {
+        *removed = false;
+        ShelfItem* it = Find(id);
+        if (!it || !CanPhone(*it)) return false;
+        bool ok = false, canRemove = true;
+        if (it->kind == SK::File) {
+            if (GetFileAttributesW(it->path.c_str()) == INVALID_FILE_ATTRIBUTES) { it->missing = true; return false; }
+            ok = LaunchPhoneSend(it->path, it->isDir);
+        } else {
+            std::wstring path = SentLink(*it, remove);
+            if (path.empty()) { path = BlobPath(*it); canRemove = false; }  // Only the stored copy: keep the row.
+            ok = LaunchPhoneSend(path, false);
+        }
+        if (ok && remove && canRemove) { Remove(id); *removed = true; }
+        return ok;
+    }
+
+    void ShowChoice(bool on) {
+        choice_.Aim(on ? 1.0f : 0.0f, on ? kSpringExpandK : kSpringCollapseK, on ? kSpringExpandC : kSpringCollapseC);
+        choiceT_ = QpcSeconds();
+        if (sv_) { sv_->WakeAnimation(); sv_->Invalidate(); }
+    }
+
+    void ResolveChoice(bool send) {
+        if (offer_.empty()) return;
+        const std::vector<Offer> o = std::move(offer_);
+        offer_.clear();
+        g_shelfChoiceOpen = false;
+        choiceUntil_ = 0;
+        ArmTimer();
+        ShowChoice(false);
+        if (!send) return;
+        int sent = 0, failed = 0;
+        for (const Offer& f : o) {
+            bool removed = false;  // Sent from the drop: not kept, unless the drop only promoted a row already there.
+            if (SendItem(f.id, f.fresh, &removed)) sent++; else failed++;
+        }
+        Flash(sent ? L"Sent to phone" : L"Could not send to phone");
+        AlertsPhoneSent(sent, failed);
+        // The confirmation is an alert, and alerts wait while the island is open: let it close.
+        if (sv_) sv_->Post([] { if (!g_pinned) SetExpanded(false); });
+    }
+
+    // The drop card: rises over the bottom rows, dark and flat like the island.
+    void DrawChoice(const DrawCtx& c) {
+        if (!choice_.Settled()) {
+            double dt = c.now - choiceT_;
+            if (dt > 0.05) dt = 0.05;
+            if (dt > 0) choice_.Step(dt);
+        }
+        choiceT_ = c.now;
+        const float a = std::clamp(choice_.x, 0.0f, 1.0f);
+        if (a <= 0.01f) return;
+        DrawCtx cc = c;
+        cc.alpha *= a;
+        Pg q(cc);
+        const float dy = (1.0f - choice_.x) * 22.0f;  // Overshoot shows as a small lift
+        const float t = 116 + dy, b = 174 + dy;
+        q.Fill(22, t, 358, b, 13, kCentreBg);
+        q.Fill(22, t, 358, b, 13, kCard);
+        q.Outline(22.5f, t + 0.5f, 357.5f, b - 0.5f, 13, 1, kHairline);
+        const bool open = !offer_.empty();
+        if (open) Hit(22, t, 358, b, kChoiceCard);
+        std::wstring what;
+        if (offer_.size() == 1) { if (ShelfItem* it = Find(offer_[0].id)) what = it->title; }
+        else if (offer_.size() > 1) what = std::to_wstring(offer_.size()) + L" items";
+        q.Text(L"Dropped", 36, t + 9, 160, t + 27, 10.5f, kMuted, TF_Ellipsis);
+        q.Text(what, 36, t + 27, 160, t + 47, 11.5f, kFg, TF_Ellipsis, 600);
+        auto button = [&](int id, float l, float r, const wchar_t* text, bool primary) {
+            const float bt = t + 14, bb = b - 14;
+            const bool hot = open && hover_ == id;
+            if (primary) q.Fill(l, bt, r, bb, 9, kAccent, hot ? 1.0f : 0.9f);
+            else q.Fill(l, bt, r, bb, 9, hot ? kCardHover : kCard);
+            if (id == kChoiceSend) {
+                PhoneGlyph(q, l + 14, (bt + bb) / 2, primary ? kInk : kFg);
+                q.Text(text, l + 22, bt, r - 6, bb, 11, primary ? kInk : kFg, TF_Center | TF_Ellipsis, 600);
+            } else {
+                q.Text(text, l + 4, bt, r - 4, bb, 11, primary ? kInk : kFg, TF_Center | TF_Ellipsis, 600);
+            }
+            if (open) Hit(l, bt, r, bb, id);
+        };
+        button(kChoiceKeep, 166, 250, L"Keep in bar", false);
+        button(kChoiceSend, 256, 346, L"Send to phone", true);
+    }
 
     ShelfItem* Find(unsigned id) {
         for (ShelfItem& it : items_) if (it.id == id) return &it;
@@ -5027,7 +5291,8 @@ private:
         Save();
     }
     // Dedup promotes the existing row. Text and links compare exactly, paths without case.
-    bool Commit(ShelfItem it) {
+    bool Commit(ShelfItem it, bool* isNew) {
+        *isNew = false;
         for (size_t i = 0; i < items_.size(); i++) {
             ShelfItem& o = items_[i];
             const bool same = o.kind == it.kind && ((it.kind == SK::File && Lower(o.path) == Lower(it.path)) ||
@@ -5051,6 +5316,7 @@ private:
         it.id = nextId_++;
         it.addedAt = WallSeconds();
         items_.push_back(std::move(it));
+        *isNew = true;
         return true;
     }
 
@@ -5059,7 +5325,28 @@ private:
         ArmStatusTimer(1800);
     }
     void ArmStatusTimer(UINT ms) {
-        if (sv_) sv_->SetTimer(this, ms, [this] { status_.clear(); confirmUntil_ = 0; sv_->KillTimer(this); sv_->Invalidate(); });
+        statusUntil_ = GetTickCount64() + ms;
+        ArmTimer();
+    }
+    // The module has one timer: it serves the status line and the drop card, whichever is due first.
+    void ArmTimer() {
+        if (!sv_) return;
+        const ULONGLONG now = GetTickCount64();
+        ULONGLONG next = statusUntil_;
+        if (choiceUntil_ && (!next || choiceUntil_ < next)) next = choiceUntil_;
+        if (!next) { sv_->KillTimer(this); return; }
+        sv_->SetTimer(this, (UINT)std::max<ULONGLONG>(next > now ? next - now : 0, 10), [this] { OnTimer(); });
+    }
+    void OnTimer() {
+        const ULONGLONG now = GetTickCount64();
+        if (statusUntil_ && statusUntil_ <= now) {
+            statusUntil_ = 0;
+            status_.clear();
+            confirmUntil_ = 0;
+            sv_->Invalidate();
+        }
+        if (choiceUntil_ && choiceUntil_ <= now) ResolveChoice(false);  // Nothing chosen: it stays in the bar.
+        ArmTimer();
     }
 
     std::wstring SizeLabel(const ShelfItem& it) {
@@ -5259,6 +5546,7 @@ private:
         if (loaded_) return;
         loaded_ = true;
         SHCreateDirectoryExW(nullptr, BlobDir().c_str(), nullptr);
+        SweepSent();
         std::string raw;
         const std::wstring index = ShelfDir() + L"\\index.txt";
         if (!ReadWholeFile(index, raw)) {
@@ -5370,7 +5658,12 @@ private:
     int press_ = 0;
     D2D1_POINT_2F pressPt_{};
     std::wstring status_;
-    ULONGLONG confirmUntil_ = 0;
+    ULONGLONG confirmUntil_ = 0, statusUntil_ = 0;
+    std::vector<Offer> lastIngest_;  // Rows the last Ingest added or promoted.
+    std::vector<Offer> offer_;       // Rows the drop card is asking about.
+    ULONGLONG choiceUntil_ = 0;
+    Spring choice_;                  // The card: 0 gone, 1 up.
+    double choiceT_ = 0;
 };
 
 ShelfPage g_shelf;
@@ -5422,6 +5715,7 @@ public:
         if (accept_) {
             IslandOpenShelf();  // Stay on the shelf after the drop
             if (g_shelf.Ingest(d) == 0) *eff = DROPEFFECT_NONE;
+            else g_shelf.OfferPhone();  // Keep in bar, or send to the phone
         }
         Left();
         return S_OK;
@@ -6954,7 +7248,7 @@ std::wstring AlFmt(const wchar_t* fmt, ...) {
     return buf;
 }
 
-enum class AK { Caps, Battery, Bluetooth, Device, Dnd, Notification, Clipboard, Volume, Brightness };
+enum class AK { Caps, Battery, Bluetooth, Device, Dnd, Notification, Clipboard, Volume, Brightness, Phone };
 constexpr UINT WM_AL_LEVEL = WM_APP + 42;  // wParam: volume 0-100 (-1 unknown) | 0x10000 muted; lParam: brightness (-1 unknown).
 HANDLE g_alLevelRead = nullptr, g_alLevelSet = nullptr;  // Auto-reset: read both levels / apply the requested one.
 std::atomic<int> g_alSetVolume{-1}, g_alSetBright{-1};
@@ -7124,6 +7418,9 @@ public:
     void Draw(const DrawCtx& c) override;
     bool OnPointer(const PointerEvent& e, View v) override;
     void OnClickAlert() override;
+    // The slider's fill runs on its own spring; the frame clock runs only while it moves.
+    bool Animating(View v) const override { return v == View::Alert && IsLevel() && !fill_.Settled(); }
+    void OnSettings(const Settings&) override { pctLayout_.Reset(); }  // The font may have changed.
     void OnVisibility(View v, bool shown) override {
         if (v != View::Alert) return;
         visible_ = shown;
@@ -7139,7 +7436,8 @@ public:
     void PublishGeometry();
     void FullscreenChanged();
     int Dots() const { return (mic_ ? 1 : 0) + (cam_ ? 1 : 0); }
-    bool HoldsHover() const { return IsLevel(); }
+    // A slider, or the short "Sent to phone" that follows closing the shelf under the pointer.
+    bool HoldsHover() const { return IsLevel() || (hasCur_ && cur_.kind == AK::Phone); }
     void DrawOverlay(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* brush, float L, float R, float B, float s);
     LRESULT Wnd(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
@@ -7159,6 +7457,7 @@ private:
     void OnLevels(WPARAM wp, LPARAM lp);
     bool IsLevel() const { return hasCur_ && (cur_.kind == AK::Volume || cur_.kind == AK::Brightness); }
     void SetLevelAt(float x);
+    void AimFill(int level);
     void Launch(const wchar_t* uri) { ShellExecuteW(nullptr, L"open", uri, nullptr, nullptr, SW_SHOWNORMAL); }
 
     Services* sv_ = nullptr;
@@ -7177,6 +7476,12 @@ private:
     bool lastMute_ = false, levelsPrimed_ = false, dragging_ = false;
     AK lastLevelKind_ = AK::Volume;
     float trackL_ = 0, trackR_ = 0;  // Slider track, pixels from the card's left edge.
+    int levelFrom_ = -1;             // The reading before the one being shown, for the fill to start from.
+    Spring fill_;                    // Fill fraction as drawn: springs to key presses, follows a drag at once.
+    double fillT_ = 0;               // QPC time of the last fill step.
+    Com<IDWriteTextLayout> pctLayout_;  // The percent, laid out once per value at the hover size.
+    int pctLevel_ = -1;
+    float pctSize_ = 0, pctScale_ = 0;
     bool mic_ = false, cam_ = false;
     std::wstring micApp_, camApp_;
     HPOWERNOTIFY powerA_ = nullptr, powerB_ = nullptr;
@@ -7242,12 +7547,16 @@ void AlertsModule::Enqueue(AItem it) {
                 cur_.level = it.level;
                 cur_.on = it.on;
                 cur_.remaining = it.ms;
+                AimFill(it.level);
                 IslandRecompute();
                 return;
             }
             if (hasCur_ && cur_.kind != AK::Clipboard && !IsLevel()) pending_.push_front(cur_);
             cur_ = it;
             hasCur_ = true;
+            // A new card starts from the previous reading and springs to the new one.
+            fill_.Snap(std::clamp((levelFrom_ >= 0 ? levelFrom_ : it.level) / 100.0f, 0.0f, 1.0f));
+            AimFill(it.level);
             Present();
             return;
         case AK::Caps:
@@ -7285,7 +7594,8 @@ void AlertsModule::Enqueue(AItem it) {
 
 void AlertsModule::Tick() {
     if (!hasCur_) { KillTimer(hwnd_, kAlTick); return; }
-    if (!visible_ || hovered_ || g_covered) return;  // Waiting, reading, or under the volume popup.
+    // Waiting, reading, or under the volume popup. The phone confirmation runs out under the pointer too.
+    if (!visible_ || (hovered_ && cur_.kind != AK::Phone) || g_covered) return;
     cur_.remaining -= 100;
     if (cur_.remaining <= 0) Finish();
 }
@@ -7499,6 +7809,7 @@ void AlertsModule::OnLevels(WPARAM wp, LPARAM lp) {
     AK kind = lastLevelKind_;
     if (vol >= 0 && (vol != lastVol_ || mute != lastMute_)) kind = AK::Volume;
     else if (bright >= 0 && bright != lastBright_) kind = AK::Brightness;
+    levelFrom_ = kind == AK::Volume ? lastVol_ : lastBright_;
     lastVol_ = vol; lastMute_ = mute; lastBright_ = bright;
     if (dragging_) return;  // The card already shows what the drag set.
     lastLevelKind_ = kind;
@@ -7511,10 +7822,20 @@ void AlertsModule::OnLevels(WPARAM wp, LPARAM lp) {
     Enqueue(it);
 }
 
+void AlertsModule::AimFill(int level) {
+    const float to = std::clamp(level / 100.0f, 0.0f, 1.0f);
+    if (fill_.Settled() && fabsf(fill_.x - to) < fill_.eps) return;
+    if (fill_.Settled()) fillT_ = QpcSeconds();  // Moving again after a rest: no stale step.
+    fill_.Aim(to, 300.0f, 34.0f);                // About critically damped, settles in some 250 ms.
+    if (sv_) sv_->WakeAnimation();
+}
+
 void AlertsModule::SetLevelAt(float x) {
     if (!IsLevel() || trackR_ <= trackL_) return;
-    const int v = (int)std::lround(std::clamp((x - trackL_) / (trackR_ - trackL_), 0.0f, 1.0f) * 100.0f);
-    if (v == cur_.level) return;
+    const float frac = std::clamp((x - trackL_) / (trackR_ - trackL_), 0.0f, 1.0f);
+    fill_.Snap(frac);  // A drag is followed exactly, between whole percents too.
+    const int v = (int)std::lround(frac * 100.0f);
+    if (v == cur_.level) { sv_->Invalidate(); return; }
     cur_.level = v;
     cur_.remaining = cur_.ms;
     if (cur_.kind == AK::Volume) { g_alSetVolume = v; lastVol_ = v; cur_.on = false; }
@@ -7535,9 +7856,10 @@ Size2 AlertsModule::Measure(View v) {
         case AK::Notification: w = 360.0f; break;
         case AK::Clipboard: w = 340.0f; break;
         case AK::Device: w = 300.0f; break;
+        case AK::Phone: w = 250.0f; break;
         default: break;
     }
-    return {w + 2.0f * AlertsDotsReserve(), hovered_ ? 66.0f : 44.0f};
+    return {w + 2.0f * AlertsDotsReserve(), hovered_ && cur_.kind != AK::Phone ? 66.0f : 44.0f};
 }
 
 bool AlertsModule::OnPointer(const PointerEvent& e, View v) {
@@ -7563,13 +7885,14 @@ bool AlertsModule::OnPointer(const PointerEvent& e, View v) {
 }
 
 void AlertsModule::Draw(const DrawCtx& c) {
-    if (c.view != View::Alert || !hasCur_) return;
+    // Once finished, the card is still drawn while the island fades it out, so it leaves with the body.
+    if (c.view != View::Alert || (!hasCur_ && c.alpha >= 0.999f)) return;
     const float s = c.scale;
     const D2D1_RECT_F r = c.rect;
     const float badge = 28.0f * s, bx = r.left + 10.0f * s, by = r.top + 8.0f * s;
     auto col = [&](D2D1_COLOR_F k, float a = 1.0f) { k.a *= a * c.alpha; c.brush->SetColor(k); };
 
-    if (IsLevel()) {  // Glyph, track with fill, percent.
+    if (cur_.kind == AK::Volume || cur_.kind == AK::Brightness) {  // Glyph, track with fill, percent.
         const bool vol = cur_.kind == AK::Volume;
         // Lay out in the body as it stands now, so the hover growth rides the island's size springs:
         // g goes 0 to 1 as the body grows from the normal card to the hover card.
@@ -7602,19 +7925,40 @@ void AlertsModule::Draw(const DrawCtx& c) {
         const float tr = std::max(tl, right - (52.0f + 8.0f * g + 12.0f * Dots()) * s);  // Never inverted while the body is narrow.
         trackL_ = tl - r.left;  // Pointer x is measured from the view's left edge, r.left.
         trackR_ = tr - r.left;
-        const float frac = std::clamp(cur_.level / 100.0f, 0.0f, 1.0f);
+        if (!fill_.Settled()) {  // Stepped by real time, here, so it moves at the display's rate.
+            double dt = c.now - fillT_;
+            if (dt > 0.05) dt = 0.05;
+            if (dt > 0) fill_.Step(dt);
+        }
+        fillT_ = c.now;
+        const float frac = std::clamp(fill_.x, 0.0f, 1.0f);
         col(Rgb(255, 255, 255, 0x2e));
         c.rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(tl, cy - th / 2, tr, cy + th / 2), th / 2, th / 2), c.brush);
         if (frac > 0) {
             col(kFg, cur_.on ? 0.4f : 1.0f);
             c.rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(tl, cy - th / 2, tl + std::max(th, (tr - tl) * frac), cy + th / 2), th / 2, th / 2), c.brush);
         }
-        TextOpts o;
-        o.maxW = (40.0f + 8.0f * g) * s;
-        o.maxH = (18.0f + 8.0f * g) * s;
-        o.size = g_text.DefaultSize() * (1.0f + 0.3f * g);
-        col(kFg, 0.8f);
-        g_text.Draw(c.rt, std::to_wstring(cur_.level), tr + 10.0f * s, cy - o.maxH / 2.0f, c.brush, o);
+        // The percent is laid out once per value at the hover size and scaled down: no new layout per frame.
+        const float big = g_text.DefaultSize() * 1.3f;
+        if (!pctLayout_ || pctLevel_ != cur_.level || pctSize_ != big || pctScale_ != s) {
+            TextOpts o;
+            o.maxW = 48.0f * s;
+            o.maxH = 26.0f * s;
+            o.size = big;
+            pctLayout_ = g_text.Layout(std::to_wstring(cur_.level), o);
+            pctLevel_ = cur_.level;
+            pctSize_ = big;
+            pctScale_ = s;
+        }
+        if (pctLayout_) {
+            const float k = (1.0f + 0.3f * g) / 1.3f, x0 = tr + 10.0f * s;
+            D2D1_MATRIX_3X2_F old;
+            c.rt->GetTransform(&old);
+            c.rt->SetTransform(D2D1::Matrix3x2F::Scale(k, k, D2D1::Point2F(x0, cy)) * old);
+            col(kFg, 0.8f);
+            c.rt->DrawTextLayout(D2D1::Point2F(x0, cy - 13.0f * s), pctLayout_.Get(), c.brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            c.rt->SetTransform(old);
+        }
         return;
     }
 
@@ -7643,6 +7987,13 @@ void AlertsModule::Draw(const DrawCtx& c) {
             case AK::Caps: o.size = 15.0f * s; g_text.Draw(c.rt, L"A", bx, by, c.brush, o); break;
             case AK::Dnd: o.size = 15.0f * s; g_text.Draw(c.rt, L"☾", bx, by, c.brush, o); break;
             case AK::Device: o.size = 9.0f * s; g_text.Draw(c.rt, wcsstr(cur_.title.c_str(), L"erial") ? L"COM" : L"USB", bx, by, c.brush, o); break;
+            case AK::Phone:
+                c.rt->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - 5.0f * s, cy - 8.0f * s, cx + 5.0f * s, cy + 8.0f * s), 2.5f * s, 2.5f * s), c.brush, 1.4f * s);
+                c.rt->DrawLine(D2D1::Point2F(cx - 1.5f * s, cy + 5.0f * s), D2D1::Point2F(cx + 1.5f * s, cy + 5.0f * s), c.brush, 1.2f * s);
+                break;
+            case AK::Volume:
+            case AK::Brightness:
+                break;
             case AK::Clipboard:
                 c.rt->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - 6.0f * s, cy - 7.0f * s, cx + 6.0f * s, cy + 8.0f * s), 2.0f * s, 2.0f * s), c.brush, 1.4f * s);
                 c.rt->DrawLine(D2D1::Point2F(cx - 3.0f * s, cy), D2D1::Point2F(cx + 3.0f * s, cy), c.brush, 1.2f * s);
@@ -7697,6 +8048,10 @@ void AlertsModule::OnClickAlert() {
             else Launch(L"ms-settings:quietmomentshome");
             break;
         case AK::Clipboard: SendWinKey('V'); break;
+        case AK::Phone:
+        case AK::Volume:
+        case AK::Brightness:
+            break;
         case AK::Notification:
             if (it.more) {
                 RECT body = g_isBody;
@@ -8237,6 +8592,24 @@ void AlertsDrawOverlay(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* brush, float
 }
 void AlertsPublishGeometry() {
     if (g_alMod) g_alMod->PublishGeometry();
+}
+// The shelf handed something to the phone (or could not): a short confirmation.
+void AlertsPhoneSent(int sent, int failed) {
+    if (!g_alMod) return;
+    AItem it;
+    it.kind = AK::Phone;
+    it.ms = 2200;
+    if (sent) {
+        it.title = AlT(L"alert.phone.sent", L"Sent to phone");
+        if (failed) it.sub = AlFmt(AlT(L"alert.phone.some", L"%d sent, %d failed"), sent, failed);
+        else if (sent > 1) it.sub = AlFmt(AlT(L"alert.phone.n", L"%d items"), sent);
+        it.good = !failed;
+        it.danger = failed > 0;
+    } else {
+        it.title = AlT(L"alert.phone.fail", L"Could not send to phone");
+        it.danger = true;
+    }
+    g_alMod->Enqueue(it);
 }
 bool AlertsHoldsHover() {
     return g_alMod && g_alMod->HoldsHover();

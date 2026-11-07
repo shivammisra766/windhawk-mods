@@ -37,7 +37,7 @@ std::wstring AlFmt(const wchar_t* fmt, ...) {
     return buf;
 }
 
-enum class AK { Caps, Battery, Bluetooth, Device, Dnd, Notification, Clipboard, Volume, Brightness };
+enum class AK { Caps, Battery, Bluetooth, Device, Dnd, Notification, Clipboard, Volume, Brightness, Phone };
 constexpr UINT WM_AL_LEVEL = WM_APP + 42;  // wParam: volume 0-100 (-1 unknown) | 0x10000 muted; lParam: brightness (-1 unknown).
 HANDLE g_alLevelRead = nullptr, g_alLevelSet = nullptr;  // Auto-reset: read both levels / apply the requested one.
 std::atomic<int> g_alSetVolume{-1}, g_alSetBright{-1};
@@ -207,6 +207,9 @@ public:
     void Draw(const DrawCtx& c) override;
     bool OnPointer(const PointerEvent& e, View v) override;
     void OnClickAlert() override;
+    // The slider's fill runs on its own spring; the frame clock runs only while it moves.
+    bool Animating(View v) const override { return v == View::Alert && IsLevel() && !fill_.Settled(); }
+    void OnSettings(const Settings&) override { pctLayout_.Reset(); }  // The font may have changed.
     void OnVisibility(View v, bool shown) override {
         if (v != View::Alert) return;
         visible_ = shown;
@@ -222,7 +225,8 @@ public:
     void PublishGeometry();
     void FullscreenChanged();
     int Dots() const { return (mic_ ? 1 : 0) + (cam_ ? 1 : 0); }
-    bool HoldsHover() const { return IsLevel(); }
+    // A slider, or the short "Sent to phone" that follows closing the shelf under the pointer.
+    bool HoldsHover() const { return IsLevel() || (hasCur_ && cur_.kind == AK::Phone); }
     void DrawOverlay(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* brush, float L, float R, float B, float s);
     LRESULT Wnd(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
@@ -242,6 +246,7 @@ private:
     void OnLevels(WPARAM wp, LPARAM lp);
     bool IsLevel() const { return hasCur_ && (cur_.kind == AK::Volume || cur_.kind == AK::Brightness); }
     void SetLevelAt(float x);
+    void AimFill(int level);
     void Launch(const wchar_t* uri) { ShellExecuteW(nullptr, L"open", uri, nullptr, nullptr, SW_SHOWNORMAL); }
 
     Services* sv_ = nullptr;
@@ -260,6 +265,12 @@ private:
     bool lastMute_ = false, levelsPrimed_ = false, dragging_ = false;
     AK lastLevelKind_ = AK::Volume;
     float trackL_ = 0, trackR_ = 0;  // Slider track, pixels from the card's left edge.
+    int levelFrom_ = -1;             // The reading before the one being shown, for the fill to start from.
+    Spring fill_;                    // Fill fraction as drawn: springs to key presses, follows a drag at once.
+    double fillT_ = 0;               // QPC time of the last fill step.
+    Com<IDWriteTextLayout> pctLayout_;  // The percent, laid out once per value at the hover size.
+    int pctLevel_ = -1;
+    float pctSize_ = 0, pctScale_ = 0;
     bool mic_ = false, cam_ = false;
     std::wstring micApp_, camApp_;
     HPOWERNOTIFY powerA_ = nullptr, powerB_ = nullptr;
@@ -325,12 +336,16 @@ void AlertsModule::Enqueue(AItem it) {
                 cur_.level = it.level;
                 cur_.on = it.on;
                 cur_.remaining = it.ms;
+                AimFill(it.level);
                 IslandRecompute();
                 return;
             }
             if (hasCur_ && cur_.kind != AK::Clipboard && !IsLevel()) pending_.push_front(cur_);
             cur_ = it;
             hasCur_ = true;
+            // A new card starts from the previous reading and springs to the new one.
+            fill_.Snap(std::clamp((levelFrom_ >= 0 ? levelFrom_ : it.level) / 100.0f, 0.0f, 1.0f));
+            AimFill(it.level);
             Present();
             return;
         case AK::Caps:
@@ -368,7 +383,8 @@ void AlertsModule::Enqueue(AItem it) {
 
 void AlertsModule::Tick() {
     if (!hasCur_) { KillTimer(hwnd_, kAlTick); return; }
-    if (!visible_ || hovered_ || g_covered) return;  // Waiting, reading, or under the volume popup.
+    // Waiting, reading, or under the volume popup. The phone confirmation runs out under the pointer too.
+    if (!visible_ || (hovered_ && cur_.kind != AK::Phone) || g_covered) return;
     cur_.remaining -= 100;
     if (cur_.remaining <= 0) Finish();
 }
@@ -582,6 +598,7 @@ void AlertsModule::OnLevels(WPARAM wp, LPARAM lp) {
     AK kind = lastLevelKind_;
     if (vol >= 0 && (vol != lastVol_ || mute != lastMute_)) kind = AK::Volume;
     else if (bright >= 0 && bright != lastBright_) kind = AK::Brightness;
+    levelFrom_ = kind == AK::Volume ? lastVol_ : lastBright_;
     lastVol_ = vol; lastMute_ = mute; lastBright_ = bright;
     if (dragging_) return;  // The card already shows what the drag set.
     lastLevelKind_ = kind;
@@ -594,10 +611,20 @@ void AlertsModule::OnLevels(WPARAM wp, LPARAM lp) {
     Enqueue(it);
 }
 
+void AlertsModule::AimFill(int level) {
+    const float to = std::clamp(level / 100.0f, 0.0f, 1.0f);
+    if (fill_.Settled() && fabsf(fill_.x - to) < fill_.eps) return;
+    if (fill_.Settled()) fillT_ = QpcSeconds();  // Moving again after a rest: no stale step.
+    fill_.Aim(to, 300.0f, 34.0f);                // About critically damped, settles in some 250 ms.
+    if (sv_) sv_->WakeAnimation();
+}
+
 void AlertsModule::SetLevelAt(float x) {
     if (!IsLevel() || trackR_ <= trackL_) return;
-    const int v = (int)std::lround(std::clamp((x - trackL_) / (trackR_ - trackL_), 0.0f, 1.0f) * 100.0f);
-    if (v == cur_.level) return;
+    const float frac = std::clamp((x - trackL_) / (trackR_ - trackL_), 0.0f, 1.0f);
+    fill_.Snap(frac);  // A drag is followed exactly, between whole percents too.
+    const int v = (int)std::lround(frac * 100.0f);
+    if (v == cur_.level) { sv_->Invalidate(); return; }
     cur_.level = v;
     cur_.remaining = cur_.ms;
     if (cur_.kind == AK::Volume) { g_alSetVolume = v; lastVol_ = v; cur_.on = false; }
@@ -618,9 +645,10 @@ Size2 AlertsModule::Measure(View v) {
         case AK::Notification: w = 360.0f; break;
         case AK::Clipboard: w = 340.0f; break;
         case AK::Device: w = 300.0f; break;
+        case AK::Phone: w = 250.0f; break;
         default: break;
     }
-    return {w + 2.0f * AlertsDotsReserve(), hovered_ ? 66.0f : 44.0f};
+    return {w + 2.0f * AlertsDotsReserve(), hovered_ && cur_.kind != AK::Phone ? 66.0f : 44.0f};
 }
 
 bool AlertsModule::OnPointer(const PointerEvent& e, View v) {
@@ -646,13 +674,14 @@ bool AlertsModule::OnPointer(const PointerEvent& e, View v) {
 }
 
 void AlertsModule::Draw(const DrawCtx& c) {
-    if (c.view != View::Alert || !hasCur_) return;
+    // Once finished, the card is still drawn while the island fades it out, so it leaves with the body.
+    if (c.view != View::Alert || (!hasCur_ && c.alpha >= 0.999f)) return;
     const float s = c.scale;
     const D2D1_RECT_F r = c.rect;
     const float badge = 28.0f * s, bx = r.left + 10.0f * s, by = r.top + 8.0f * s;
     auto col = [&](D2D1_COLOR_F k, float a = 1.0f) { k.a *= a * c.alpha; c.brush->SetColor(k); };
 
-    if (IsLevel()) {  // Glyph, track with fill, percent.
+    if (cur_.kind == AK::Volume || cur_.kind == AK::Brightness) {  // Glyph, track with fill, percent.
         const bool vol = cur_.kind == AK::Volume;
         // Lay out in the body as it stands now, so the hover growth rides the island's size springs:
         // g goes 0 to 1 as the body grows from the normal card to the hover card.
@@ -685,19 +714,40 @@ void AlertsModule::Draw(const DrawCtx& c) {
         const float tr = std::max(tl, right - (52.0f + 8.0f * g + 12.0f * Dots()) * s);  // Never inverted while the body is narrow.
         trackL_ = tl - r.left;  // Pointer x is measured from the view's left edge, r.left.
         trackR_ = tr - r.left;
-        const float frac = std::clamp(cur_.level / 100.0f, 0.0f, 1.0f);
+        if (!fill_.Settled()) {  // Stepped by real time, here, so it moves at the display's rate.
+            double dt = c.now - fillT_;
+            if (dt > 0.05) dt = 0.05;
+            if (dt > 0) fill_.Step(dt);
+        }
+        fillT_ = c.now;
+        const float frac = std::clamp(fill_.x, 0.0f, 1.0f);
         col(Rgb(255, 255, 255, 0x2e));
         c.rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(tl, cy - th / 2, tr, cy + th / 2), th / 2, th / 2), c.brush);
         if (frac > 0) {
             col(kFg, cur_.on ? 0.4f : 1.0f);
             c.rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(tl, cy - th / 2, tl + std::max(th, (tr - tl) * frac), cy + th / 2), th / 2, th / 2), c.brush);
         }
-        TextOpts o;
-        o.maxW = (40.0f + 8.0f * g) * s;
-        o.maxH = (18.0f + 8.0f * g) * s;
-        o.size = g_text.DefaultSize() * (1.0f + 0.3f * g);
-        col(kFg, 0.8f);
-        g_text.Draw(c.rt, std::to_wstring(cur_.level), tr + 10.0f * s, cy - o.maxH / 2.0f, c.brush, o);
+        // The percent is laid out once per value at the hover size and scaled down: no new layout per frame.
+        const float big = g_text.DefaultSize() * 1.3f;
+        if (!pctLayout_ || pctLevel_ != cur_.level || pctSize_ != big || pctScale_ != s) {
+            TextOpts o;
+            o.maxW = 48.0f * s;
+            o.maxH = 26.0f * s;
+            o.size = big;
+            pctLayout_ = g_text.Layout(std::to_wstring(cur_.level), o);
+            pctLevel_ = cur_.level;
+            pctSize_ = big;
+            pctScale_ = s;
+        }
+        if (pctLayout_) {
+            const float k = (1.0f + 0.3f * g) / 1.3f, x0 = tr + 10.0f * s;
+            D2D1_MATRIX_3X2_F old;
+            c.rt->GetTransform(&old);
+            c.rt->SetTransform(D2D1::Matrix3x2F::Scale(k, k, D2D1::Point2F(x0, cy)) * old);
+            col(kFg, 0.8f);
+            c.rt->DrawTextLayout(D2D1::Point2F(x0, cy - 13.0f * s), pctLayout_.Get(), c.brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            c.rt->SetTransform(old);
+        }
         return;
     }
 
@@ -726,6 +776,13 @@ void AlertsModule::Draw(const DrawCtx& c) {
             case AK::Caps: o.size = 15.0f * s; g_text.Draw(c.rt, L"A", bx, by, c.brush, o); break;
             case AK::Dnd: o.size = 15.0f * s; g_text.Draw(c.rt, L"☾", bx, by, c.brush, o); break;
             case AK::Device: o.size = 9.0f * s; g_text.Draw(c.rt, wcsstr(cur_.title.c_str(), L"erial") ? L"COM" : L"USB", bx, by, c.brush, o); break;
+            case AK::Phone:
+                c.rt->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - 5.0f * s, cy - 8.0f * s, cx + 5.0f * s, cy + 8.0f * s), 2.5f * s, 2.5f * s), c.brush, 1.4f * s);
+                c.rt->DrawLine(D2D1::Point2F(cx - 1.5f * s, cy + 5.0f * s), D2D1::Point2F(cx + 1.5f * s, cy + 5.0f * s), c.brush, 1.2f * s);
+                break;
+            case AK::Volume:
+            case AK::Brightness:
+                break;
             case AK::Clipboard:
                 c.rt->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - 6.0f * s, cy - 7.0f * s, cx + 6.0f * s, cy + 8.0f * s), 2.0f * s, 2.0f * s), c.brush, 1.4f * s);
                 c.rt->DrawLine(D2D1::Point2F(cx - 3.0f * s, cy), D2D1::Point2F(cx + 3.0f * s, cy), c.brush, 1.2f * s);
@@ -780,6 +837,10 @@ void AlertsModule::OnClickAlert() {
             else Launch(L"ms-settings:quietmomentshome");
             break;
         case AK::Clipboard: SendWinKey('V'); break;
+        case AK::Phone:
+        case AK::Volume:
+        case AK::Brightness:
+            break;
         case AK::Notification:
             if (it.more) {
                 RECT body = g_isBody;
@@ -1320,6 +1381,24 @@ void AlertsDrawOverlay(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* brush, float
 }
 void AlertsPublishGeometry() {
     if (g_alMod) g_alMod->PublishGeometry();
+}
+// The shelf handed something to the phone (or could not): a short confirmation.
+void AlertsPhoneSent(int sent, int failed) {
+    if (!g_alMod) return;
+    AItem it;
+    it.kind = AK::Phone;
+    it.ms = 2200;
+    if (sent) {
+        it.title = AlT(L"alert.phone.sent", L"Sent to phone");
+        if (failed) it.sub = AlFmt(AlT(L"alert.phone.some", L"%d sent, %d failed"), sent, failed);
+        else if (sent > 1) it.sub = AlFmt(AlT(L"alert.phone.n", L"%d items"), sent);
+        it.good = !failed;
+        it.danger = failed > 0;
+    } else {
+        it.title = AlT(L"alert.phone.fail", L"Could not send to phone");
+        it.danger = true;
+    }
+    g_alMod->Enqueue(it);
 }
 bool AlertsHoldsHover() {
     return g_alMod && g_alMod->HoldsHover();
