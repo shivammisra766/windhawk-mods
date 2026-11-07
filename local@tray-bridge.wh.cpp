@@ -2,7 +2,7 @@
 // @id              tray-bridge
 // @name            Tray bridge
 // @description     Passes tray icon updates to the top bar, and places the volume and brightness popup over its centre bubble
-// @version         1.4
+// @version         1.5
 // @author          local
 // @include         explorer.exe
 // @architecture    x86-64
@@ -80,6 +80,13 @@ HANDLE g_setupThread = nullptr;
 HHOOK g_hook = nullptr;
 HWND g_tray = nullptr;
 
+constexpr int kQueueSize = 256;
+CRITICAL_SECTION g_queueLock;
+HANDLE g_queueEvent = nullptr;
+HANDLE g_senderThread = nullptr;
+int g_queueHead = 0, g_queueCount = 0;
+BarTrayMessage g_queue[kQueueSize];
+
 void Forward(const COPYDATASTRUCT* cds) {
     // Older apps send a shorter structure, so only trust what has arrived.
     constexpr DWORD kMinimum = offsetof(TrayData, nid) + offsetof(NotifyIconData32, szTip);
@@ -115,10 +122,41 @@ void Forward(const COPYDATASTRUCT* cds) {
     if (size >= offsetof(NotifyIconData32, hBalloonIcon)) {
         out.guid = data->nid.guidItem;
     }
-    COPYDATASTRUCT forward{kBarCopyData, sizeof(out), &out};
-    DWORD_PTR result = 0;
-    SendMessageTimeoutW(bar, WM_COPYDATA, reinterpret_cast<WPARAM>(g_tray), reinterpret_cast<LPARAM>(&forward),
-                        SMTO_ABORTIFHUNG, 200, &result);
+    // Never send from the taskbar's thread: while it waits, sent messages are dispatched into it, and during
+    // startup (every app re-adding its icon while the taskbar's XAML loads) that reentrancy crashed Explorer
+    // (0xc000027b in CoreMessaging). Queue it; the sender thread forwards. A full queue drops the update.
+    EnterCriticalSection(&g_queueLock);
+    if (g_queueCount < kQueueSize) {
+        g_queue[(g_queueHead + g_queueCount) % kQueueSize] = out;
+        g_queueCount++;
+        SetEvent(g_queueEvent);
+    }
+    LeaveCriticalSection(&g_queueLock);
+}
+
+DWORD WINAPI SenderThread(void*) {
+    HANDLE waits[] = {g_stopEvent, g_queueEvent};
+    while (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
+        for (;;) {
+            BarTrayMessage msg;
+            EnterCriticalSection(&g_queueLock);
+            if (!g_queueCount) {
+                LeaveCriticalSection(&g_queueLock);
+                break;
+            }
+            msg = g_queue[g_queueHead];
+            g_queueHead = (g_queueHead + 1) % kQueueSize;
+            g_queueCount--;
+            LeaveCriticalSection(&g_queueLock);
+            HWND bar = FindWindowW(L"WindhawkTopBar", nullptr);
+            if (!bar) continue;
+            COPYDATASTRUCT forward{kBarCopyData, sizeof(msg), &msg};
+            DWORD_PTR result = 0;
+            SendMessageTimeoutW(bar, WM_COPYDATA, reinterpret_cast<WPARAM>(g_tray), reinterpret_cast<LPARAM>(&forward),
+                                SMTO_ABORTIFHUNG, 200, &result);
+        }
+    }
+    return 0;
 }
 
 LRESULT CALLBACK CallWndProc(int code, WPARAM wParam, LPARAM lParam) {
@@ -228,6 +266,9 @@ HANDLE g_osdThread = nullptr;
 
 BOOL Wh_ModInit() {
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    InitializeCriticalSection(&g_queueLock);
+    g_queueEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_senderThread = CreateThread(nullptr, 0, SenderThread, nullptr, 0, nullptr);
     g_setupThread = CreateThread(nullptr, 0, SetupThread, nullptr, 0, nullptr);
     g_osdMessage = RegisterWindowMessageW(L"Windhawk_TopBar_Osd");
     g_osdThread = CreateThread(nullptr, 0, OsdThread, nullptr, 0, nullptr);
@@ -248,6 +289,17 @@ void Wh_ModUninit() {
         CloseHandle(g_osdThread);
         g_osdThread = nullptr;
     }
+    // The hook is gone, so nothing queues any more; the sender may be mid-send (up to 200 ms).
+    if (g_senderThread) {
+        WaitForSingleObject(g_senderThread, 5000);
+        CloseHandle(g_senderThread);
+        g_senderThread = nullptr;
+    }
+    if (g_queueEvent) {
+        CloseHandle(g_queueEvent);
+        g_queueEvent = nullptr;
+    }
+    DeleteCriticalSection(&g_queueLock);
     if (g_stopEvent) {
         CloseHandle(g_stopEvent);
         g_stopEvent = nullptr;
