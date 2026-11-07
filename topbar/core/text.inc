@@ -63,8 +63,10 @@ public:
     }
 
     // Width including trailing spaces, as the GDI+ build measured it.
-    float Measure(const std::wstring& text) {
-        Com<IDWriteTextLayout> layout = Layout(text);
+    float Measure(const std::wstring& text, float size = 0) {
+        TextOpts o;
+        o.size = size;
+        Com<IDWriteTextLayout> layout = Layout(text, o);
         if (!layout) return 0;
         DWRITE_TEXT_METRICS m{};
         layout->GetMetrics(&m);

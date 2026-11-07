@@ -22,6 +22,8 @@ constexpr UINT_PTR kDwellTimer = 9;    // Hover dwell before the island expands.
 constexpr UINT_PTR kZoneTimer = 10;    // Polls the pointer against the hover zone, only while expanded.
 constexpr UINT_PTR kAlertTimer = 11;   // Next alert deadline.
 constexpr UINT_PTR kWingTimer = 12;    // End of the hold that keeps bell and calendar out while a panel opens.
+constexpr UINT_PTR kFollowTimer = 13;  // Follow-mouse: which monitor the island is on. Exists only in that mode.
+constexpr int kHotkeyId = 1;  // Ctrl+Alt+D
 constexpr UINT_PTR kModuleTimerBase = 100;  // Module timers: base + slot.
 
 // From the tray-bridge mod in Explorer, which declares the same layout.
@@ -110,6 +112,7 @@ struct TrayIcon {
 };
 
 HWND g_hwnd = nullptr;
+HWND g_isHwnd = nullptr;  // The island window (island.inc)
 HANDLE g_thread = nullptr;
 DWORD g_threadId = 0;
 UINT g_taskbarCreated = 0;
@@ -130,6 +133,11 @@ int g_regionTop[3] = {};  // Clip top last seen for each mode, to place the pane
 int g_hoverId = H_none;
 std::vector<Hit> g_hits;
 
+bool g_pinned = false;      // Island held open by the menu; saved in the mod's own storage.
+bool g_hidden = false;      // Hidden by the hotkey or the menu: windows gone, strip released.
+bool g_fsRaw = false;       // A fullscreen app is up, whether or not the hotkey shows the bar over it.
+bool g_fsOverride = false;  // The hotkey brought the bar back over that app.
+RECT g_isMon{};             // rcMonitor the island hangs from: g_monitor, or the pointer's monitor when following.
 RECT g_monitor{};  // rcMonitor of the bar's monitor, set by PlaceBar. The notch hangs from its top edge.
 
 HWINEVENTHOOK g_foregroundHook = nullptr;

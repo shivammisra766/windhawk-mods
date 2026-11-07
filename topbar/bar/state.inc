@@ -188,17 +188,20 @@ bool IsShellWindow(HWND hwnd) {
            !wcscmp(cls, L"XamlExplorerHostIslandWindow") || !wcscmp(cls, kClassName) || !wcscmp(cls, kIslandClass);
 }
 
-void ReadForeground() {
+// True when what the bar shows (name, title, icon) is different now.
+bool ReadForeground() {
     HWND fg = GetForegroundWindow();
     if (!fg || IsShellWindow(fg)) {
-        return;
+        return false;
     }
+    const std::wstring oldApp = g_appName, oldTitle = g_title, oldPath = g_appIconPath;
     wchar_t title[256] = {};
     GetWindowTextW(fg, title, 256);
     std::wstring path;
     g_appName = AppInfo(fg, &path);
     g_title = g_appName == title ? L"" : title;
     LoadAppIcon(path);
+    return g_appName != oldApp || g_title != oldTitle || g_appIconPath != oldPath;
 }
 
 // Finds the account picture. The image itself is decoded at the size the bar needs, later, by EnsureAvatar.

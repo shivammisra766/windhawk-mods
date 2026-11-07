@@ -3,7 +3,7 @@
 // each frame presents the crop that holds the shape, so a settled notch is a small window and an
 // idle one costs nothing. Hover, alerts and tabs are decided here; modules draw the content.
 
-HWND g_isHwnd = nullptr;
+
 LayeredSurface g_isSurface;
 Com<ID2D1SolidColorBrush> g_isBrush;
 unsigned g_isBrushGen = 0;
@@ -31,7 +31,6 @@ Size2 g_curSize{}, g_prevSize{};  // Measure() of each, taken when state changes
 double g_frameDt = 0;
 bool g_isInit = false;
 bool g_expanded = false;   // Hover (after the dwell) or pinned.
-bool g_pinned = false;     // Reserved for the menu (P5c).
 bool g_covered = false;    // Reserved for the native volume popup (P5b): blocks hover expansion.
 bool g_isTracking = false;
 bool g_dwelling = false;
@@ -97,7 +96,7 @@ bool IslandSettled() {
 
 // Derives everything from the inputs: alerts, hover, tab, panel. Called when an input changes, never per frame.
 void IslandRecompute() {
-    if (!g_isHwnd || g_fullscreen || !EnsureGfx()) return;
+    if (!g_isHwnd || g_fullscreen || g_hidden || !EnsureGfx()) return;
     PrepareText();
     const ULONGLONG now = GetTickCount64();
     g_alerts.erase(std::remove_if(g_alerts.begin(), g_alerts.end(), [&](const AlertItem& a) { return a.expires && a.expires <= now; }),
@@ -117,7 +116,7 @@ void IslandRecompute() {
     const float tw = std::min(std::max(size.w, 40.0f), kIslandMaxW) * s;
     const float th = std::min(std::max(size.h, 20.0f), kIslandMaxH) * s;
 
-    const bool wings = state == IState::Expanded || PanelWingsWanted() || now < g_wingHold;
+    const bool wings = IslandOnBar() && (state == IState::Expanded || PanelWingsWanted() || now < g_wingHold);  // The buttons belong to the bar's monitor.
     if (!g_isInit) {
         g_isInit = true;
         g_isW.eps = g_isH.eps = 0.25f;  // Pixels.
@@ -149,8 +148,8 @@ void IslandRecompute() {
     g_isState = state;
 
     // Where the body will stand once settled, for the pointer tests.
-    const float cx = (g_monitor.left + g_monitor.right) / 2.0f;
-    g_isTarget = {(LONG)roundf(cx - tw / 2.0f), g_monitor.top, (LONG)roundf(cx + tw / 2.0f), g_monitor.top + (LONG)roundf(th)};
+    const float cx = (g_isMon.left + g_isMon.right) / 2.0f;
+    g_isTarget = {(LONG)roundf(cx - tw / 2.0f), g_isMon.top, (LONG)roundf(cx + tw / 2.0f), g_isMon.top + (LONG)roundf(th)};
 
     if (state == IState::Expanded) SetTimer(g_hwnd, kZoneTimer, kZonePollMs, nullptr);
     else KillTimer(g_hwnd, kZoneTimer);
@@ -216,9 +215,9 @@ void IslandZoneTick() {
     bool in = PtInRect(&zone, p) != FALSE;
     // The strip band from the left edge of the bell to the right edge of the calendar keeps hover alive across the gaps.
     int lo = zone.left, hi = zone.right;
-    if (g_wingOk[0]) lo = std::min<int>(lo, g_monitor.left + (int)g_wingX[0]);
-    if (g_wingOk[1]) hi = std::max<int>(hi, g_monitor.left + (int)(g_wingX[1] + g_wingSize));
-    const RECT band{lo, g_monitor.top, hi, g_monitor.top + (LONG)(kBarH * s + 0.5f)};
+    if (IslandOnBar() && g_wingOk[0]) lo = std::min<int>(lo, g_monitor.left + (int)g_wingX[0]);
+    if (IslandOnBar() && g_wingOk[1]) hi = std::max<int>(hi, g_monitor.left + (int)(g_wingX[1] + g_wingSize));
+    const RECT band{lo, g_isMon.top, hi, g_isMon.top + (LONG)(kBarH * s + 0.5f)};
     if (PtInRect(&band, p)) in = true;
     // Over the settled body, a window that covers it (a panel, a popup) counts as leaving.
     if (in && IslandSettled() && PtInRect(&g_isTarget, p)) {
@@ -276,7 +275,7 @@ Com<ID2D1PathGeometry> NotchGeometry(float L, float R, float B, float r, float r
 void IslandPaint() {
     if (!g_isDirty || !g_isHwnd) return;
     g_isDirty = false;
-    if (g_fullscreen || !g_isInit || !EnsureGfx()) return;
+    if (g_fullscreen || g_hidden || !g_isInit || !EnsureGfx()) return;
     PrepareText();
     g_isDirty = false;
 
@@ -351,10 +350,10 @@ void IslandPaint() {
         RequestPaint();
         return;
     }
-    const int x0 = (g_monitor.left + g_monitor.right) / 2 - stageW / 2;
+    const int x0 = (g_isMon.left + g_isMon.right) / 2 - stageW / 2;
     g_isCropX = cl;
-    g_isBody = {x0 + (LONG)L, g_monitor.top, x0 + (LONG)R, g_monitor.top + (LONG)B};
-    g_isSurface.PresentCrop(g_isHwnd, POINT{x0 + cl, g_monitor.top}, POINT{cl, 0}, SIZE{cr - cl, cb});
+    g_isBody = {x0 + (LONG)L, g_isMon.top, x0 + (LONG)R, g_isMon.top + (LONG)B};
+    g_isSurface.PresentCrop(g_isHwnd, POINT{x0 + cl, g_isMon.top}, POINT{cl, 0}, SIZE{cr - cl, cb});
     if (!IsWindowVisible(g_isHwnd)) ShowWindow(g_isHwnd, SW_SHOWNOACTIVATE);
 }
 
@@ -415,7 +414,7 @@ LRESULT CALLBACK IslandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         case WM_RBUTTONUP:
-            g_demoAlert.Raise();  // Stub: shows the alert queue until the real alert modules exist.
+            ShowBarMenu();
             return 0;
         case WM_DESTROY:
             g_isHwnd = nullptr;
@@ -509,6 +508,7 @@ bool IslandInit() {
     if (!g_isHwnd) return false;
     for (IModule* m : g_modules) m->Start(g_services);
     IslandRecompute();
+    if (g_pinned) SetExpanded(true);
     return true;
 }
 

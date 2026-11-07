@@ -12,4 +12,4 @@ Source: `topbar/bar/module.inc` (interface, stubs) and `topbar/bar/island.inc` (
 - **Panels**: `OpenPanel(Notifications|Calendar, anchorX)` opens the native panel under that x.
 - Reserved for later modules: `Services::Images()`, `PersistInt`. Add them in `module.inc` when first needed, then update this file.
 
-Stubs shipped: `ClockModule` (collapsed), `PlaceholderPage` x2 (dashboards), `DemoAlertModule` (right-click the island to raise it; remove when P6b lands).
+Stubs shipped: `ClockModule` (collapsed), `PlaceholderPage` x2 (dashboards).

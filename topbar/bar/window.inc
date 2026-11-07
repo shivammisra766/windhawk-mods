@@ -56,11 +56,35 @@ void CALLBACK OnNetChange(void*, void*, int) {
     }
 }
 
-// One timer per minute, aimed at the next minute boundary, so the clock never polls.
+// One timer per minute (per second with seconds on), aimed at the next boundary, so the clock never polls.
 void ArmClock() {
     SYSTEMTIME st;
     GetLocalTime(&st);
-    SetTimer(g_hwnd, kClockTimer, (60 - st.wSecond) * 1000 - st.wMilliseconds + 50, nullptr);
+    const int ms = g_settings.clockSeconds ? 1000 - st.wMilliseconds + 20 : (60 - st.wSecond) * 1000 - st.wMilliseconds + 50;
+    SetTimer(g_hwnd, kClockTimer, ms, nullptr);
+}
+
+// The clock text is only on screen as the collapsed pill; any other view redraws it when it comes back.
+void ClockTick() {
+    if (g_viewCur.m == &g_clockModule && g_viewCur.v == View::Pill) IslandRecompute();  // The text may be wider now.
+}
+
+// Follow-mouse moves only the island: it hangs from the monitor the pointer is on. Not while it is open under the pointer.
+void FollowTick() {
+    if (g_settings.monitor != -1 || g_expanded || g_hidden) return;
+    const RECT before = g_isMon;
+    UpdateIslandMonitor();
+    if (!EqualRect(&before, &g_isMon)) {
+        g_isInit = false;  // No spring across screens: it appears in its new place.
+        IslandRecompute();
+    }
+}
+
+// The monitor choice changed (settings) or a display was added or removed.
+void ApplyMonitor() {
+    PlaceBar();
+    if (g_settings.monitor == -1) SetTimer(g_hwnd, kFollowTimer, 250, nullptr);
+    else KillTimer(g_hwnd, kFollowTimer);
 }
 
 int HitIndexAt(POINT p) {
@@ -158,7 +182,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;  // The bar's own request for tray icons, not a new taskbar.
         }
         g_registered = false;
-        RegisterBar();
+        if (!g_hidden) RegisterBar();
         InvalidateAll();
         return 0;
     }
@@ -224,9 +248,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             const int index = HitIndexAt(p);
             if (index >= 0 && g_hits[index].action == Action::TrayIcon) {
                 ClickTrayIcon(g_hits[index].data, true);
+            } else {
+                ShowBarMenu();
             }
             return 0;
         }
+        case WM_HOTKEY:
+            if (wp == kHotkeyId) ToggleHotkey();
+            return 0;
         case WM_COPYDATA: {
             auto cds = reinterpret_cast<const COPYDATASTRUCT*>(lp);
             if (cds && cds->dwData == kTrayCopyData && cds->cbData >= sizeof(BarTrayMessage)) {
@@ -263,15 +292,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_TIMER:
             if (wp == kClockTimer) {
                 ArmClock();
-                InvalidateAll();
-                g_isDirty = true;
-                IslandRecompute();  // The text may be wider now.
+                ClockTick();
+            } else if (wp == kFollowTimer) {
+                FollowTick();
             } else if (wp == kTitleTimer) {
                 KillTimer(hwnd, kTitleTimer);
                 g_titlePending = false;
-                ReadForeground();
-                InvalidateAll();
-                ResyncHover();
+                if (ReadForeground()) {  // A spinner in a terminal title changes nothing the bar shows.
+                    InvalidateAll();
+                    ResyncHover();
+                }
             } else if (wp == kDwellTimer) {
                 IslandDwellTick();
             } else if (wp == kZoneTimer) {
@@ -357,6 +387,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_APP_SETTINGS:
             g_settings = LoadSettings();
             for (IModule* m : g_modules) m->OnSettings(g_settings);
+            ArmClock();
+            ApplyMonitor();
             InvalidateAll();
             IslandRecompute();
             return 0;
@@ -368,18 +400,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_REFRESH_FOREGROUND:
             RehookTitle();
-            ReadForeground();
-            InvalidateAll();
+            if (ReadForeground()) InvalidateAll();
             IslandRecompute();  // A panel opening or closing moves the buttons.
             return 0;
         case WM_SETTINGCHANGE:
-            ReadAccent();
-            ReadForeground();
-            InvalidateAll();
+            {
+                const BYTE before[3] = {g_accent[0], g_accent[1], g_accent[2]};
+                ReadAccent();
+                if (ReadForeground() || memcmp(before, g_accent, 3)) InvalidateAll();  // Many settings broadcast; few matter.
+            }
             return 0;
         case WM_DISPLAYCHANGE:
         case WM_DPICHANGED:
-            PlaceBar();
+            ApplyMonitor();  // Picks the monitor again: the chosen one may be gone, or its scale new.
             IslandRescale();
             InvalidateAll();
             return 0;
@@ -387,6 +420,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             DestroyWindow(hwnd);
             return 0;
         case WM_DESTROY:
+            UnregisterHotKey(hwnd, kHotkeyId);
             RemovePropW(hwnd, L"TopBarAnchorX");
             RemovePropW(hwnd, L"TopBarAnchorTick");
             UnregisterBar();
@@ -422,6 +456,10 @@ DWORD WINAPI BarThread(void*) {
     ChangeWindowMessageFilterEx(g_hwnd, WM_COPYDATA, MSGFLT_ALLOW, nullptr);
 
     g_settings = LoadSettings();
+    g_pinned = Wh_GetIntValue(L"pinned", 0) != 0;
+    if (!RegisterHotKey(g_hwnd, kHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'D')) {
+        Wh_Log(L"Ctrl+Alt+D is taken (the old island mod?): error %lu", GetLastError());
+    }
     g_clock.Start(g_hwnd, WM_APP_FRAME);
     ReadAccent();
     LoadAvatar();
@@ -438,6 +476,7 @@ DWORD WINAPI BarThread(void*) {
 
     RegisterBar();
     IslandInit();
+    ApplyMonitor();
     ArmClock();
     InvalidateAll();
 

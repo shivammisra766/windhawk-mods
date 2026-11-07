@@ -369,7 +369,7 @@ void DrawFrame(ID2D1RenderTarget* rt) {
 
 void Paint() {
     g_paintPending = false;
-    if (!g_hwnd || g_fullscreen || !g_dirtyAny) {
+    if (!g_hwnd || g_fullscreen || g_hidden || !g_dirtyAny) {
         return;
     }
     RECT wr;

@@ -17,6 +17,45 @@
   $description: 50 to 200. Other values mean 100.
 - language: ""
   $name: Language
-  $description: A code such as de, fr, hi, ja. Leave empty to follow Windows.
+  $description: Menu and label language. Takes effect at once.
+  $options:
+  - "": Follow Windows
+  - en: English
+  - hi: Hindi
+  - zh: Chinese (Simplified)
+  - ja: Japanese
+  - ko: Korean
+  - de: German
+  - es: Spanish
+  - fr: French
+  - pt: Portuguese
+  - ru: Russian
+  - ar: Arabic
+  - it: Italian
+  - tr: Turkish
+- clockFormat: system
+  $name: Clock hours
+  $options:
+  - system: Follow Windows
+  - h12: 12-hour
+  - h24: 24-hour
+- clockSeconds: false
+  $name: Show seconds
+- dateFormat: ""
+  $name: Date format
+  $description: "A Windows date pattern such as ddd d MMM or yyyy-MM-dd. Leave empty for ddd d MMM."
+- dateAbove: false
+  $name: Date above the time
+  $description: Put the date on a line above the time instead of beside it.
+- monitor: primary
+  $name: Monitor
+  $description: "The bar stays on the chosen monitor. Follow the mouse moves only the island, and the bar stays on the primary one."
+  $options:
+  - primary: Primary monitor
+  - follow: Follow the mouse (island only)
+  - "1": Monitor 1
+  - "2": Monitor 2
+  - "3": Monitor 3
+  - "4": Monitor 4
 */
 // ==/WindhawkModSettings==

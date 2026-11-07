@@ -72,12 +72,33 @@ public:
 
 float ToDip(float px) { return px / Scale(); }
 
+// The clock string from the settings: 12/24 hours, seconds, a custom date pattern, date above or beside.
 std::wstring ClockText() {
-    wchar_t timeText[32] = {};
-    wchar_t dateText[32] = {};
-    GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, L"hh':'mm tt", timeText, 32);
-    GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, L"ddd d MMM", dateText, 32, nullptr);
-    return std::wstring(dateText) + L", " + timeText;
+    wchar_t timeText[64] = {};
+    wchar_t dateText[128] = {};
+    const Settings& st = g_settings;
+    const wchar_t* pattern = nullptr;
+    DWORD flags = st.clockSeconds ? 0 : TIME_NOSECONDS;
+    if (st.clockHours == 24) { pattern = st.clockSeconds ? L"HH':'mm':'ss" : L"HH':'mm"; flags = 0; }
+    else if (st.clockHours == 12) { pattern = st.clockSeconds ? L"h':'mm':'ss tt" : L"h':'mm tt"; flags = 0; }
+    if (!GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, flags, nullptr, pattern, timeText, 64)) wcscpy_s(timeText, L"--:--");
+    bool ok = false;
+    if (!st.dateFormat.empty()) ok = GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, st.dateFormat.c_str(), dateText, 128, nullptr) > 0;
+    if (!ok) GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, L"ddd d MMM", dateText, 128, nullptr);
+    return std::wstring(dateText) + (st.dateAbove ? L"\n" : L", ") + timeText;
+}
+
+// Width of text with every digit set as the widest one, so a ticking clock never changes the notch's size.
+float StableWidth(const std::wstring& text, float size) {
+    wchar_t widest = L'0';
+    float best = 0;
+    for (wchar_t d = L'0'; d <= L'9'; d++) {
+        const float w = g_text.Measure(std::wstring(1, d), size);
+        if (w > best) { best = w; widest = d; }
+    }
+    std::wstring t = text;
+    for (wchar_t& ch : t) if (ch >= L'0' && ch <= L'9') ch = widest;
+    return g_text.Measure(t, size);
 }
 
 void DrawCentredText(const DrawCtx& c, const std::wstring& text, D2D1_RECT_F r, float size = 0) {
@@ -96,28 +117,13 @@ void DrawCentredText(const DrawCtx& c, const std::wstring& text, D2D1_RECT_F r, 
 class ClockModule : public IModule {
 public:
     const wchar_t* Id() const override { return L"clock"; }
-    Size2 Measure(View) override { return {ToDip(g_text.Measure(ClockText())) + 2 * kPillPadX, kNotchH}; }
-    void Draw(const DrawCtx& c) override { DrawCentredText(c, ClockText(), c.rect); }
-};
-
-// Stub alert, raised by right-clicking the island so the alert queue can be seen. Replaced by P6b.
-class DemoAlertModule : public IModule {
-public:
-    const wchar_t* Id() const override { return L"demo-alert"; }
-    void Start(Services& s) override { services_ = &s; }
-    Size2 Measure(View) override { return {240.0f, kNotchH}; }
-    void Draw(const DrawCtx& c) override {
-        D2D1_COLOR_F col = kFg;
-        col.a *= c.alpha;
-        c.brush->SetColor(col);
-        const float cy = (c.rect.top + c.rect.bottom) / 2.0f;
-        g_icons.Draw(c.rt, c.brush, I_bell, c.rect.left + 22.0f * c.scale, cy, 16.0f * c.scale);
-        DrawCentredText(c, L"Demo alert", D2D1::RectF(c.rect.left + 40.0f * c.scale, c.rect.top, c.rect.right, c.rect.bottom));
+    Size2 Measure(View) override {
+        const float size = g_settings.dateAbove ? g_text.DefaultSize() * 0.85f : 0.0f;  // Two lines need to be smaller.
+        return {ToDip(StableWidth(ClockText(), size)) + 2 * kPillPadX, kNotchH};
     }
-    void OnClickAlert() override { if (services_) services_->ClearAlert(this); }
-    void Raise() { if (services_) services_->ShowAlert(this, 1, 3000); }
-private:
-    Services* services_ = nullptr;
+    void Draw(const DrawCtx& c) override {
+        DrawCentredText(c, ClockText(), c.rect, g_settings.dateAbove ? g_text.DefaultSize() * 0.85f : 0.0f);
+    }
 };
 
 // Stub dashboard page. Replaced by the real dashboards (P6c).
@@ -140,6 +146,5 @@ private:
 };
 
 ClockModule g_clockModule;
-DemoAlertModule g_demoAlert;
 PlaceholderPage g_page1(1, 2), g_page2(2, 2);
-IModule* const g_modules[] = {&g_clockModule, &g_demoAlert, &g_page1, &g_page2};
+IModule* const g_modules[] = {&g_clockModule, &g_page1, &g_page2};

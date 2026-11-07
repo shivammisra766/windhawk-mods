@@ -9,9 +9,15 @@ const wchar_t* Loc(const wchar_t* key) {
     static int column = 0;
     std::wstring want = g_settings.language;
     if (want.empty()) {
-        wchar_t name[LOCALE_NAME_MAX_LENGTH] = {};
-        GetUserDefaultLocaleName(name, LOCALE_NAME_MAX_LENGTH);
-        want = name;
+        if (g_uiLang.empty()) {  // The display language, not the regional format.
+            wchar_t names[256] = {};
+            ULONG count = 0, size = 256;
+            if (!GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &count, names, &size) || !names[0]) {
+                GetUserDefaultLocaleName(names, LOCALE_NAME_MAX_LENGTH);
+            }
+            g_uiLang = names;  // The first of the double-null list.
+        }
+        want = g_uiLang;
     }
     if (want != cachedFor) {
         cachedFor = want;

@@ -3,15 +3,53 @@
 void IslandMoved();
 void IslandReset();
 void IslandRecompute();
+void SetExpanded(bool expanded);
+void RegisterBar();
+void UnregisterBar();
+
+struct MonitorList { std::vector<HMONITOR> list; };
+
+BOOL CALLBACK CollectMonitor(HMONITOR m, HDC, LPRECT, LPARAM lp) {
+    reinterpret_cast<MonitorList*>(lp)->list.push_back(m);
+    return TRUE;
+}
+
+// The monitor the bar and its strip live on: the chosen one, else the primary. Follow-mouse keeps the bar on the primary.
+HMONITOR BarMonitor() {
+    if (g_settings.monitor > 0) {
+        MonitorList all;
+        EnumDisplayMonitors(nullptr, nullptr, CollectMonitor, reinterpret_cast<LPARAM>(&all));
+        if ((size_t)g_settings.monitor <= all.list.size()) return all.list[g_settings.monitor - 1];
+    }
+    return MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+}
+
+// Where the island hangs: with the bar, or under the pointer in follow mode.
+void UpdateIslandMonitor() {
+    RECT want = g_monitor;
+    if (g_settings.monitor == -1) {
+        POINT p;
+        GetCursorPos(&p);
+        MONITORINFO mi{sizeof(mi)};
+        if (GetMonitorInfoW(MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST), &mi)) want = mi.rcMonitor;
+    }
+    g_isMon = want;
+}
+
+bool IslandOnBar() { return EqualRect(&g_isMon, &g_monitor) != FALSE; }
 
 void PlaceBar() {
-    if (!g_hwnd) {
+    if (!g_hwnd || g_hidden) {
         return;
     }
-    HMONITOR monitor = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFO mi{sizeof(mi)};
-    GetMonitorInfoW(monitor, &mi);
+    GetMonitorInfoW(BarMonitor(), &mi);
+    if (!EqualRect(&g_monitor, &mi.rcMonitor)) {
+        // Another monitor may have another DPI: move there first, so the height is worked out at its scale.
+        SetWindowPos(g_hwnd, HWND_TOPMOST, mi.rcMonitor.left, mi.rcMonitor.top, 100, 10, SWP_NOACTIVATE | SWP_NOREDRAW);
+    }
     g_monitor = mi.rcMonitor;
+    UpdateIslandMonitor();
     const int height = (int)(kBarH * Scale() + 0.5f);
 
     APPBARDATA abd{sizeof(abd)};
@@ -41,11 +79,16 @@ bool ForegroundCoversMonitor() {
 }
 
 void UpdateFullscreen() {
-    const bool fullscreen = g_abnFullscreen || ForegroundCoversMonitor();
+    g_fsRaw = g_abnFullscreen || ForegroundCoversMonitor();
+    if (!g_fsRaw) g_fsOverride = false;
+    const bool fullscreen = g_fsRaw && !g_fsOverride;  // The hotkey can bring the bar back over the app.
     if (fullscreen == g_fullscreen) {
         return;
     }
     g_fullscreen = fullscreen;
+    if (g_hidden) {
+        return;  // Nothing is shown; the state is kept for when the bar comes back.
+    }
     if (fullscreen) {
         ShowWindow(g_hwnd, SW_HIDE);
         // Forget the pointer and a half-open island, so it does not come back expanded.
@@ -57,8 +100,44 @@ void UpdateFullscreen() {
     } else {
         PlaceBar();
         IslandRecompute();
+        if (g_pinned) SetExpanded(true);
         InvalidateAll();
     }
+}
+
+// Hide releases the reserved strip, so windows get the space back; show takes it again.
+void SetHidden(bool hide) {
+    if (hide == g_hidden || !g_hwnd) {
+        return;
+    }
+    g_hidden = hide;
+    if (hide) {
+        ShowWindow(g_hwnd, SW_HIDE);
+        g_tracking = false;
+        g_hoverId = H_none;
+        IslandReset();
+        g_clock.Sleep();
+        g_lastFrame = 0;
+        UnregisterBar();
+    } else {
+        g_fsOverride = false;
+        g_fullscreen = false;
+        UpdateFullscreen();
+        RegisterBar();
+        IslandRecompute();
+        if (g_pinned) SetExpanded(true);
+        InvalidateAll();
+    }
+}
+
+// Ctrl+Alt+D. Over a fullscreen app it only shows or hides the bar for that app and keeps the strip as it is.
+void ToggleHotkey() {
+    if (g_fsRaw && !g_hidden) {
+        g_fsOverride = !g_fsOverride;
+        UpdateFullscreen();
+        return;
+    }
+    SetHidden(!g_hidden);
 }
 
 void RegisterBar() {
@@ -80,3 +159,30 @@ void UnregisterBar() {
     }
 }
 
+
+// ---- Right-click menu: one for every bubble. Pin and hide only; the look has no options. ----
+
+void SetPinned(bool pin) {
+    g_pinned = pin;
+    Wh_SetIntValue(L"pinned", pin ? 1 : 0);
+    if (pin) SetExpanded(true);  // Does nothing while covered or in fullscreen; the pin still stands.
+}
+
+void ShowBarMenu() {
+    if (!g_hwnd) return;
+    constexpr UINT kPin = 1, kHide = 2;
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenuW(menu, MF_STRING | (g_pinned ? MF_CHECKED : 0), kPin, Loc(g_pinned ? L"menu.unpin" : L"menu.pin"));
+    AppendMenuW(menu, MF_STRING, kHide, Loc(L"menu.hide"));
+    POINT p;
+    GetCursorPos(&p);
+    HWND previous = GetForegroundWindow();  // Handing focus to the menu must not leave the user's app without it.
+    SetForegroundWindow(g_hwnd);
+    const UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, p.x, p.y, 0, g_hwnd, nullptr);
+    PostMessageW(g_hwnd, WM_NULL, 0, 0);  // Lets the menu loop finish cleanly.
+    DestroyMenu(menu);
+    if (previous && previous != g_hwnd && previous != g_isHwnd && IsWindow(previous)) SetForegroundWindow(previous);
+    if (cmd == kPin) SetPinned(!g_pinned);
+    else if (cmd == kHide) SetHidden(true);
+}

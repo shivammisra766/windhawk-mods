@@ -17,7 +17,46 @@
   $description: 50 to 200. Other values mean 100.
 - language: ""
   $name: Language
-  $description: A code such as de, fr, hi, ja. Leave empty to follow Windows.
+  $description: Menu and label language. Takes effect at once.
+  $options:
+  - "": Follow Windows
+  - en: English
+  - hi: Hindi
+  - zh: Chinese (Simplified)
+  - ja: Japanese
+  - ko: Korean
+  - de: German
+  - es: Spanish
+  - fr: French
+  - pt: Portuguese
+  - ru: Russian
+  - ar: Arabic
+  - it: Italian
+  - tr: Turkish
+- clockFormat: system
+  $name: Clock hours
+  $options:
+  - system: Follow Windows
+  - h12: 12-hour
+  - h24: 24-hour
+- clockSeconds: false
+  $name: Show seconds
+- dateFormat: ""
+  $name: Date format
+  $description: "A Windows date pattern such as ddd d MMM or yyyy-MM-dd. Leave empty for ddd d MMM."
+- dateAbove: false
+  $name: Date above the time
+  $description: Put the date on a line above the time instead of beside it.
+- monitor: primary
+  $name: Monitor
+  $description: "The bar stays on the chosen monitor. Follow the mouse moves only the island, and the bar stays on the primary one."
+  $options:
+  - primary: Primary monitor
+  - follow: Follow the mouse (island only)
+  - "1": Monitor 1
+  - "2": Monitor 2
+  - "3": Monitor 3
+  - "4": Monitor 4
 */
 // ==/WindhawkModSettings==
 #line 1 "core/includes.inc"
@@ -195,6 +234,8 @@ constexpr UINT_PTR kDwellTimer = 9;    // Hover dwell before the island expands.
 constexpr UINT_PTR kZoneTimer = 10;    // Polls the pointer against the hover zone, only while expanded.
 constexpr UINT_PTR kAlertTimer = 11;   // Next alert deadline.
 constexpr UINT_PTR kWingTimer = 12;    // End of the hold that keeps bell and calendar out while a panel opens.
+constexpr UINT_PTR kFollowTimer = 13;  // Follow-mouse: which monitor the island is on. Exists only in that mode.
+constexpr int kHotkeyId = 1;  // Ctrl+Alt+D
 constexpr UINT_PTR kModuleTimerBase = 100;  // Module timers: base + slot.
 
 // From the tray-bridge mod in Explorer, which declares the same layout.
@@ -283,6 +324,7 @@ struct TrayIcon {
 };
 
 HWND g_hwnd = nullptr;
+HWND g_isHwnd = nullptr;  // The island window (island.inc)
 HANDLE g_thread = nullptr;
 DWORD g_threadId = 0;
 UINT g_taskbarCreated = 0;
@@ -303,6 +345,11 @@ int g_regionTop[3] = {};  // Clip top last seen for each mode, to place the pane
 int g_hoverId = H_none;
 std::vector<Hit> g_hits;
 
+bool g_pinned = false;      // Island held open by the menu; saved in the mod's own storage.
+bool g_hidden = false;      // Hidden by the hotkey or the menu: windows gone, strip released.
+bool g_fsRaw = false;       // A fullscreen app is up, whether or not the hotkey shows the bar over it.
+bool g_fsOverride = false;  // The hotkey brought the bar back over that app.
+RECT g_isMon{};             // rcMonitor the island hangs from: g_monitor, or the pointer's monitor when following.
 RECT g_monitor{};  // rcMonitor of the bar's monitor, set by PlaceBar. The notch hangs from its top edge.
 
 HWINEVENTHOOK g_foregroundHook = nullptr;
@@ -823,8 +870,10 @@ public:
     }
 
     // Width including trailing spaces, as the GDI+ build measured it.
-    float Measure(const std::wstring& text) {
-        Com<IDWriteTextLayout> layout = Layout(text);
+    float Measure(const std::wstring& text, float size = 0) {
+        TextOpts o;
+        o.size = size;
+        Com<IDWriteTextLayout> layout = Layout(text, o);
         if (!layout) return 0;
         DWRITE_TEXT_METRICS m{};
         layout->GetMetrics(&m);
@@ -866,16 +915,35 @@ struct Settings {
     std::wstring fontFamily;  // empty: Segoe UI Variable Text, then Segoe UI
     int fontScale = 100;      // percent of the usual text size
     std::wstring language;    // empty: follow Windows
+    int clockHours = 0;       // 0 follow Windows, 12, 24
+    bool clockSeconds = false;
+    std::wstring dateFormat;  // empty: "ddd d MMM"; otherwise a GetDateFormat pattern
+    bool dateAbove = false;   // date on a line above the time
+    int monitor = 0;          // 0 primary, -1 follow the pointer (island only), n: the nth monitor
 };
 
 Settings g_settings;
+std::wstring g_uiLang;  // Windows display language, cached until the settings are read again.
 
 Settings LoadSettings() {
     Settings s;
     if (PCWSTR v = Wh_GetStringSetting(L"fontFamily")) { s.fontFamily = v; Wh_FreeStringSetting(v); }
     if (PCWSTR v = Wh_GetStringSetting(L"language")) { s.language = v; Wh_FreeStringSetting(v); }
+    if (PCWSTR v = Wh_GetStringSetting(L"dateFormat")) { s.dateFormat = v; Wh_FreeStringSetting(v); }
+    if (PCWSTR v = Wh_GetStringSetting(L"clockFormat")) {
+        s.clockHours = !wcscmp(v, L"h12") ? 12 : !wcscmp(v, L"h24") ? 24 : 0;
+        Wh_FreeStringSetting(v);
+    }
+    if (PCWSTR v = Wh_GetStringSetting(L"monitor")) {
+        s.monitor = !wcscmp(v, L"follow") ? -1 : _wtoi(v);  // "primary" and anything else read as 0
+        if (s.monitor < -1) s.monitor = 0;
+        Wh_FreeStringSetting(v);
+    }
+    s.clockSeconds = Wh_GetIntSetting(L"clockSeconds") != 0;
+    s.dateAbove = Wh_GetIntSetting(L"dateAbove") != 0;
     const int scale = Wh_GetIntSetting(L"fontScale");
     s.fontScale = scale >= 50 && scale <= 200 ? scale : 100;
+    g_uiLang.clear();
     return s;
 }
 
@@ -883,11 +951,48 @@ Settings LoadSettings() {
 
 // ---- Loc: strings per language, generated from strings.tsv by build-bar.ps1 ----
 
-constexpr int kLocLangCount = 12;
-const wchar_t* const kLocLangs[kLocLangCount] = { L"en", L"hi", L"zh", L"ja", L"ko", L"de", L"es", L"fr", L"pt", L"ru", L"ar", L"it" };
+constexpr int kLocLangCount = 13;
+const wchar_t* const kLocLangs[kLocLangCount] = { L"en", L"hi", L"zh", L"ja", L"ko", L"de", L"es", L"fr", L"pt", L"ru", L"ar", L"it", L"tr" };
 struct LocEntry { const wchar_t* key; const wchar_t* text[kLocLangCount]; };
 const LocEntry kLoc[] = {
-    { L"window.title", { L"Top bar", L"", L"", L"", L"", L"", L"", L"", L"", L"", L"", L"" } },
+    { L"window.title", { L"Top bar", L"", L"", L"", L"", L"", L"", L"", L"", L"", L"", L"", L"" } },
+    { L"Media", { L"Media", L"मीडिया", L"媒体", L"メディア", L"미디어", L"Medien", L"Multimedia", L"Média", L"Mídia", L"Медиа", L"", L"Media", L"Medya" } },
+    { L"Calendar", { L"Calendar", L"कैलेंडर", L"日历", L"カレンダー", L"캘린더", L"Kalender", L"Calendario", L"Calendrier", L"Calendário", L"Календарь", L"", L"Calendario", L"Takvim" } },
+    { L"Weather", { L"Weather", L"मौसम", L"天气", L"天気", L"날씨", L"Wetter", L"Tiempo", L"Météo", L"Tempo", L"Погода", L"", L"Meteo", L"Hava" } },
+    { L"Hardware Monitor", { L"Hardware Monitor", L"हार्डवेयर मॉनिटर", L"硬件监视器", L"ハードウェア モニター", L"하드웨어 모니터", L"Hardware-Monitor", L"Monitor de hardware", L"Moniteur matériel", L"Monitor de hardware", L"Монитор системы", L"", L"Monitor hardware", L"Donanım İzleme" } },
+    { L"File Tray", { L"File Tray", L"फ़ाइल ट्रे", L"文件托盘", L"ファイル トレイ", L"파일 트레이", L"Dateiablage", L"Bandeja de archivos", L"Bac à fichiers", L"Bandeja de arquivos", L"Файлы", L"", L"Vassoio file", L"Dosya Tepsisi" } },
+    { L"Bluetooth", { L"Bluetooth", L"ब्लूटूथ", L"蓝牙", L"Bluetooth", L"블루투스", L"Bluetooth", L"Bluetooth", L"Bluetooth", L"Bluetooth", L"Bluetooth", L"", L"Bluetooth", L"Bluetooth" } },
+    { L"Copied", { L"Copied", L"कॉपी किया गया", L"已复制", L"コピーしました", L"복사됨", L"Kopiert", L"Copiado", L"Copié", L"Copiado", L"Скопировано", L"", L"Copiato", L"Kopyalandı" } },
+    { L"Volume", { L"Volume", L"वॉल्यूम", L"音量", L"音量", L"볼륨", L"Lautstärke", L"Volumen", L"Volume", L"Volume", L"Громкость", L"", L"Volume", L"Ses" } },
+    { L"Brightness", { L"Brightness", L"चमक", L"亮度", L"明るさ", L"밝기", L"Helligkeit", L"Brillo", L"Luminosité", L"Brilho", L"Яркость", L"", L"Luminosità", L"Parlaklık" } },
+    { L"Muted", { L"Muted", L"म्यूट", L"已静音", L"ミュート", L"음소거", L"Stumm", L"Silenciado", L"Muet", L"Sem som", L"Без звука", L"", L"Muto", L"Sessiz" } },
+    { L"Low Battery", { L"Low Battery", L"बैटरी कम", L"电量低", L"バッテリー残量低下", L"배터리 부족", L"Akku schwach", L"Batería baja", L"Batterie faible", L"Bateria fraca", L"Батарея разряжена", L"", L"Batteria scarica", L"Pil Az" } },
+    { L"Charging", { L"Charging", L"चार्ज हो रहा है", L"正在充电", L"充電中", L"충전 중", L"Wird geladen", L"Cargando", L"En charge", L"Carregando", L"Зарядка", L"", L"In carica", L"Şarj oluyor" } },
+    { L"Connected", { L"Connected", L"कनेक्ट किया गया", L"已连接", L"接続済み", L"연결됨", L"Verbunden", L"Conectado", L"Connecté", L"Conectado", L"Подключено", L"", L"Connesso", L"Bağlandı" } },
+    { L"Disconnected", { L"Disconnected", L"डिस्कनेक्ट किया गया", L"已断开", L"切断されました", L"연결 끊김", L"Getrennt", L"Desconectado", L"Déconnecté", L"Desconectado", L"Отключено", L"", L"Disconnesso", L"Bağlantı kesildi" } },
+    { L"Caps Lock", { L"Caps Lock", L"कैप्स लॉक", L"大写锁定", L"Caps Lock", L"Caps Lock", L"Feststelltaste", L"Bloq Mayús", L"Verr. Maj", L"Caps Lock", L"Caps Lock", L"", L"Blocco maiuscole", L"Caps Lock" } },
+    { L"Num Lock", { L"Num Lock", L"नम लॉक", L"数字锁定", L"Num Lock", L"Num Lock", L"Num-Taste", L"Bloq Num", L"Verr. Num", L"Num Lock", L"Num Lock", L"", L"Blocco num", L"Num Lock" } },
+    { L"On", { L"On", L"चालू", L"开", L"オン", L"켜짐", L"Ein", L"Activado", L"Activé", L"Ligado", L"Вкл", L"", L"Attivo", L"Açık" } },
+    { L"Off", { L"Off", L"बंद", L"关", L"オフ", L"꺼짐", L"Aus", L"Desactivado", L"Désactivé", L"Desligado", L"Выкл", L"", L"Disattivo", L"Kapalı" } },
+    { L"Do Not Disturb", { L"Do Not Disturb", L"परेशान न करें", L"专注助手", L"応答不可", L"방해 금지", L"Nicht stören", L"No molestar", L"Ne pas déranger", L"Não perturbe", L"Не беспокоить", L"", L"Non disturbare", L"Rahatsız Etme" } },
+    { L"Focus", { L"Focus", L"फ़ोकस", L"专注", L"集中", L"집중", L"Fokus", L"Concentración", L"Concentration", L"Foco", L"Фокус", L"", L"Concentrazione", L"Odak" } },
+    { L"Break", { L"Break", L"विराम", L"休息", L"休憩", L"휴식", L"Pause", L"Descanso", L"Pause", L"Pausa", L"Перерыв", L"", L"Pausa", L"Mola" } },
+    { L"Unknown", { L"Unknown", L"अज्ञात", L"未知", L"不明", L"알 수 없음", L"Unbekannt", L"Desconocido", L"Inconnu", L"Desconhecido", L"Неизвестно", L"", L"Sconosciuto", L"Bilinmiyor" } },
+    { L"Loading...", { L"Loading...", L"लोड हो रहा है...", L"加载中...", L"読み込み中...", L"불러오는 중...", L"Wird geladen...", L"Cargando...", L"Chargement...", L"Carregando...", L"Загрузка...", L"", L"Caricamento...", L"Yükleniyor..." } },
+    { L"Locating...", { L"Locating...", L"स्थान...", L"定位中...", L"位置情報...", L"위치 확인 중...", L"Standort...", L"Ubicando...", L"Localisation...", L"Localizando...", L"Определение...", L"", L"Localizzazione...", L"Konum..." } },
+    { L"Wind", { L"Wind", L"हवा", L"风速", L"風", L"바람", L"Wind", L"Viento", L"Vent", L"Vento", L"Ветер", L"", L"Vento", L"Rüzgar" } },
+    { L"Feels Like", { L"Feels Like", L"महसूस", L"体感", L"体感", L"체감", L"Gefühlt", L"Sensación", L"Ressenti", L"Sensação", L"Ощущается", L"", L"Percepita", L"Hissedilen" } },
+    { L"Humidity", { L"Humidity", L"नमी", L"湿度", L"湿度", L"습도", L"Luftfeuchte", L"Humedad", L"Humidité", L"Umidade", L"Влажность", L"", L"Umidità", L"Nem" } },
+    { L"Drag files here", { L"Drag files here", L"फ़ाइलें यहाँ खींचें", L"将文件拖到此处", L"ここにファイルをドラッグ", L"여기에 파일을 끌어다 놓으세요", L"Dateien hierher ziehen", L"Arrastra archivos aquí", L"Déposez des fichiers ici", L"Arraste arquivos aqui", L"Перетащите файлы сюда", L"", L"Trascina i file qui", L"Dosyaları buraya sürükleyin" } },
+    { L"No devices", { L"No devices", L"कोई डिवाइस नहीं", L"无设备", L"デバイスなし", L"장치 없음", L"Keine Geräte", L"Sin dispositivos", L"Aucun appareil", L"Nenhum dispositivo", L"Нет устройств", L"", L"Nessun dispositivo", L"Cihaz yok" } },
+    { L"item", { L"item", L"आइटम", L"项", L"項目", L"항목", L"Element", L"elemento", L"élément", L"item", L"элемент", L"", L"elemento", L"öğe" } },
+    { L"items", { L"items", L"आइटम", L"项", L"項目", L"항목", L"Elemente", L"elementos", L"éléments", L"itens", L"элементов", L"", L"elementi", L"öğe" } },
+    { L"Media source", { L"Media source", L"मीडिया स्रोत", L"媒体来源", L"メディア ソース", L"미디어 소스", L"Medienquelle", L"Fuente multimedia", L"Source multimédia", L"Fonte de mídia", L"Источник медиа", L"", L"Sorgente multimediale", L"Medya kaynağı" } },
+    { L"Auto", { L"Auto", L"स्वचालित", L"自动", L"自動", L"자동", L"Automatisch", L"Automático", L"Auto", L"Automático", L"Авто", L"", L"Automatico", L"Otomatik" } },
+    { L"Playing from %s", { L"Playing from %s", L"%s से चल रहा है", L"正在 %s 中播放", L"%s で再生中", L"%s에서 재생 중", L"Wiedergabe über %s", L"Reproduciendo desde %s", L"Lecture depuis %s", L"Reproduzindo em %s", L"Воспроизводится в %s", L"", L"In riproduzione da %s", L"%s üzerinden oynatılıyor" } },
+    { L"menu.pin", { L"Pin island open", L"खुला रखें", L"固定展开", L"開いたままにする", L"열어 두기", L"Offen halten", L"Mantener abierta", L"Garder ouvert", L"Manter aberta", L"Держать открытым", L"إبقاء مفتوحًا", L"Tieni aperta", L"Açık tut" } },
+    { L"menu.unpin", { L"Unpin island", L"अनपिन करें", L"取消固定", L"固定を解除", L"고정 해제", L"Lösen", L"Soltar", L"Détacher", L"Soltar", L"Открепить", L"إلغاء التثبيت", L"Sblocca", L"Sabitlemeyi kaldır" } },
+    { L"menu.hide", { L"Hide bar (Ctrl+Alt+D)", L"बार छिपाएँ (Ctrl+Alt+D)", L"隐藏栏 (Ctrl+Alt+D)", L"バーを隠す (Ctrl+Alt+D)", L"바 숨기기 (Ctrl+Alt+D)", L"Leiste ausblenden (Strg+Alt+D)", L"Ocultar barra (Ctrl+Alt+D)", L"Masquer la barre (Ctrl+Alt+D)", L"Ocultar barra (Ctrl+Alt+D)", L"Скрыть панель (Ctrl+Alt+D)", L"إخفاء الشريط (Ctrl+Alt+D)", L"Nascondi barra (Ctrl+Alt+D)", L"Çubuğu gizle (Ctrl+Alt+D)" } },
 };
 
 // Language of the current settings: the chosen one, else the Windows display language, else English.
@@ -896,9 +1001,15 @@ const wchar_t* Loc(const wchar_t* key) {
     static int column = 0;
     std::wstring want = g_settings.language;
     if (want.empty()) {
-        wchar_t name[LOCALE_NAME_MAX_LENGTH] = {};
-        GetUserDefaultLocaleName(name, LOCALE_NAME_MAX_LENGTH);
-        want = name;
+        if (g_uiLang.empty()) {  // The display language, not the regional format.
+            wchar_t names[256] = {};
+            ULONG count = 0, size = 256;
+            if (!GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &count, names, &size) || !names[0]) {
+                GetUserDefaultLocaleName(names, LOCALE_NAME_MAX_LENGTH);
+            }
+            g_uiLang = names;  // The first of the double-null list.
+        }
+        want = g_uiLang;
     }
     if (want != cachedFor) {
         cachedFor = want;
@@ -1108,17 +1219,20 @@ bool IsShellWindow(HWND hwnd) {
            !wcscmp(cls, L"XamlExplorerHostIslandWindow") || !wcscmp(cls, kClassName) || !wcscmp(cls, kIslandClass);
 }
 
-void ReadForeground() {
+// True when what the bar shows (name, title, icon) is different now.
+bool ReadForeground() {
     HWND fg = GetForegroundWindow();
     if (!fg || IsShellWindow(fg)) {
-        return;
+        return false;
     }
+    const std::wstring oldApp = g_appName, oldTitle = g_title, oldPath = g_appIconPath;
     wchar_t title[256] = {};
     GetWindowTextW(fg, title, 256);
     std::wstring path;
     g_appName = AppInfo(fg, &path);
     g_title = g_appName == title ? L"" : title;
     LoadAppIcon(path);
+    return g_appName != oldApp || g_title != oldTitle || g_appIconPath != oldPath;
 }
 
 // Finds the account picture. The image itself is decoded at the size the bar needs, later, by EnsureAvatar.
@@ -1540,7 +1654,7 @@ void DrawFrame(ID2D1RenderTarget* rt) {
 
 void Paint() {
     g_paintPending = false;
-    if (!g_hwnd || g_fullscreen || !g_dirtyAny) {
+    if (!g_hwnd || g_fullscreen || g_hidden || !g_dirtyAny) {
         return;
     }
     RECT wr;
@@ -1690,12 +1804,33 @@ public:
 
 float ToDip(float px) { return px / Scale(); }
 
+// The clock string from the settings: 12/24 hours, seconds, a custom date pattern, date above or beside.
 std::wstring ClockText() {
-    wchar_t timeText[32] = {};
-    wchar_t dateText[32] = {};
-    GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, L"hh':'mm tt", timeText, 32);
-    GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, L"ddd d MMM", dateText, 32, nullptr);
-    return std::wstring(dateText) + L", " + timeText;
+    wchar_t timeText[64] = {};
+    wchar_t dateText[128] = {};
+    const Settings& st = g_settings;
+    const wchar_t* pattern = nullptr;
+    DWORD flags = st.clockSeconds ? 0 : TIME_NOSECONDS;
+    if (st.clockHours == 24) { pattern = st.clockSeconds ? L"HH':'mm':'ss" : L"HH':'mm"; flags = 0; }
+    else if (st.clockHours == 12) { pattern = st.clockSeconds ? L"h':'mm':'ss tt" : L"h':'mm tt"; flags = 0; }
+    if (!GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, flags, nullptr, pattern, timeText, 64)) wcscpy_s(timeText, L"--:--");
+    bool ok = false;
+    if (!st.dateFormat.empty()) ok = GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, st.dateFormat.c_str(), dateText, 128, nullptr) > 0;
+    if (!ok) GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, L"ddd d MMM", dateText, 128, nullptr);
+    return std::wstring(dateText) + (st.dateAbove ? L"\n" : L", ") + timeText;
+}
+
+// Width of text with every digit set as the widest one, so a ticking clock never changes the notch's size.
+float StableWidth(const std::wstring& text, float size) {
+    wchar_t widest = L'0';
+    float best = 0;
+    for (wchar_t d = L'0'; d <= L'9'; d++) {
+        const float w = g_text.Measure(std::wstring(1, d), size);
+        if (w > best) { best = w; widest = d; }
+    }
+    std::wstring t = text;
+    for (wchar_t& ch : t) if (ch >= L'0' && ch <= L'9') ch = widest;
+    return g_text.Measure(t, size);
 }
 
 void DrawCentredText(const DrawCtx& c, const std::wstring& text, D2D1_RECT_F r, float size = 0) {
@@ -1714,28 +1849,13 @@ void DrawCentredText(const DrawCtx& c, const std::wstring& text, D2D1_RECT_F r, 
 class ClockModule : public IModule {
 public:
     const wchar_t* Id() const override { return L"clock"; }
-    Size2 Measure(View) override { return {ToDip(g_text.Measure(ClockText())) + 2 * kPillPadX, kNotchH}; }
-    void Draw(const DrawCtx& c) override { DrawCentredText(c, ClockText(), c.rect); }
-};
-
-// Stub alert, raised by right-clicking the island so the alert queue can be seen. Replaced by P6b.
-class DemoAlertModule : public IModule {
-public:
-    const wchar_t* Id() const override { return L"demo-alert"; }
-    void Start(Services& s) override { services_ = &s; }
-    Size2 Measure(View) override { return {240.0f, kNotchH}; }
-    void Draw(const DrawCtx& c) override {
-        D2D1_COLOR_F col = kFg;
-        col.a *= c.alpha;
-        c.brush->SetColor(col);
-        const float cy = (c.rect.top + c.rect.bottom) / 2.0f;
-        g_icons.Draw(c.rt, c.brush, I_bell, c.rect.left + 22.0f * c.scale, cy, 16.0f * c.scale);
-        DrawCentredText(c, L"Demo alert", D2D1::RectF(c.rect.left + 40.0f * c.scale, c.rect.top, c.rect.right, c.rect.bottom));
+    Size2 Measure(View) override {
+        const float size = g_settings.dateAbove ? g_text.DefaultSize() * 0.85f : 0.0f;  // Two lines need to be smaller.
+        return {ToDip(StableWidth(ClockText(), size)) + 2 * kPillPadX, kNotchH};
     }
-    void OnClickAlert() override { if (services_) services_->ClearAlert(this); }
-    void Raise() { if (services_) services_->ShowAlert(this, 1, 3000); }
-private:
-    Services* services_ = nullptr;
+    void Draw(const DrawCtx& c) override {
+        DrawCentredText(c, ClockText(), c.rect, g_settings.dateAbove ? g_text.DefaultSize() * 0.85f : 0.0f);
+    }
 };
 
 // Stub dashboard page. Replaced by the real dashboards (P6c).
@@ -1758,9 +1878,8 @@ private:
 };
 
 ClockModule g_clockModule;
-DemoAlertModule g_demoAlert;
 PlaceholderPage g_page1(1, 2), g_page2(2, 2);
-IModule* const g_modules[] = {&g_clockModule, &g_demoAlert, &g_page1, &g_page2};
+IModule* const g_modules[] = {&g_clockModule, &g_page1, &g_page2};
 
 #line 1 "bar/placement.inc"
 // ---- Bar placement and panels ----
@@ -1768,15 +1887,53 @@ IModule* const g_modules[] = {&g_clockModule, &g_demoAlert, &g_page1, &g_page2};
 void IslandMoved();
 void IslandReset();
 void IslandRecompute();
+void SetExpanded(bool expanded);
+void RegisterBar();
+void UnregisterBar();
+
+struct MonitorList { std::vector<HMONITOR> list; };
+
+BOOL CALLBACK CollectMonitor(HMONITOR m, HDC, LPRECT, LPARAM lp) {
+    reinterpret_cast<MonitorList*>(lp)->list.push_back(m);
+    return TRUE;
+}
+
+// The monitor the bar and its strip live on: the chosen one, else the primary. Follow-mouse keeps the bar on the primary.
+HMONITOR BarMonitor() {
+    if (g_settings.monitor > 0) {
+        MonitorList all;
+        EnumDisplayMonitors(nullptr, nullptr, CollectMonitor, reinterpret_cast<LPARAM>(&all));
+        if ((size_t)g_settings.monitor <= all.list.size()) return all.list[g_settings.monitor - 1];
+    }
+    return MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+}
+
+// Where the island hangs: with the bar, or under the pointer in follow mode.
+void UpdateIslandMonitor() {
+    RECT want = g_monitor;
+    if (g_settings.monitor == -1) {
+        POINT p;
+        GetCursorPos(&p);
+        MONITORINFO mi{sizeof(mi)};
+        if (GetMonitorInfoW(MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST), &mi)) want = mi.rcMonitor;
+    }
+    g_isMon = want;
+}
+
+bool IslandOnBar() { return EqualRect(&g_isMon, &g_monitor) != FALSE; }
 
 void PlaceBar() {
-    if (!g_hwnd) {
+    if (!g_hwnd || g_hidden) {
         return;
     }
-    HMONITOR monitor = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFO mi{sizeof(mi)};
-    GetMonitorInfoW(monitor, &mi);
+    GetMonitorInfoW(BarMonitor(), &mi);
+    if (!EqualRect(&g_monitor, &mi.rcMonitor)) {
+        // Another monitor may have another DPI: move there first, so the height is worked out at its scale.
+        SetWindowPos(g_hwnd, HWND_TOPMOST, mi.rcMonitor.left, mi.rcMonitor.top, 100, 10, SWP_NOACTIVATE | SWP_NOREDRAW);
+    }
     g_monitor = mi.rcMonitor;
+    UpdateIslandMonitor();
     const int height = (int)(kBarH * Scale() + 0.5f);
 
     APPBARDATA abd{sizeof(abd)};
@@ -1806,11 +1963,16 @@ bool ForegroundCoversMonitor() {
 }
 
 void UpdateFullscreen() {
-    const bool fullscreen = g_abnFullscreen || ForegroundCoversMonitor();
+    g_fsRaw = g_abnFullscreen || ForegroundCoversMonitor();
+    if (!g_fsRaw) g_fsOverride = false;
+    const bool fullscreen = g_fsRaw && !g_fsOverride;  // The hotkey can bring the bar back over the app.
     if (fullscreen == g_fullscreen) {
         return;
     }
     g_fullscreen = fullscreen;
+    if (g_hidden) {
+        return;  // Nothing is shown; the state is kept for when the bar comes back.
+    }
     if (fullscreen) {
         ShowWindow(g_hwnd, SW_HIDE);
         // Forget the pointer and a half-open island, so it does not come back expanded.
@@ -1822,8 +1984,44 @@ void UpdateFullscreen() {
     } else {
         PlaceBar();
         IslandRecompute();
+        if (g_pinned) SetExpanded(true);
         InvalidateAll();
     }
+}
+
+// Hide releases the reserved strip, so windows get the space back; show takes it again.
+void SetHidden(bool hide) {
+    if (hide == g_hidden || !g_hwnd) {
+        return;
+    }
+    g_hidden = hide;
+    if (hide) {
+        ShowWindow(g_hwnd, SW_HIDE);
+        g_tracking = false;
+        g_hoverId = H_none;
+        IslandReset();
+        g_clock.Sleep();
+        g_lastFrame = 0;
+        UnregisterBar();
+    } else {
+        g_fsOverride = false;
+        g_fullscreen = false;
+        UpdateFullscreen();
+        RegisterBar();
+        IslandRecompute();
+        if (g_pinned) SetExpanded(true);
+        InvalidateAll();
+    }
+}
+
+// Ctrl+Alt+D. Over a fullscreen app it only shows or hides the bar for that app and keeps the strip as it is.
+void ToggleHotkey() {
+    if (g_fsRaw && !g_hidden) {
+        g_fsOverride = !g_fsOverride;
+        UpdateFullscreen();
+        return;
+    }
+    SetHidden(!g_hidden);
 }
 
 void RegisterBar() {
@@ -1845,6 +2043,33 @@ void UnregisterBar() {
     }
 }
 
+
+// ---- Right-click menu: one for every bubble. Pin and hide only; the look has no options. ----
+
+void SetPinned(bool pin) {
+    g_pinned = pin;
+    Wh_SetIntValue(L"pinned", pin ? 1 : 0);
+    if (pin) SetExpanded(true);  // Does nothing while covered or in fullscreen; the pin still stands.
+}
+
+void ShowBarMenu() {
+    if (!g_hwnd) return;
+    constexpr UINT kPin = 1, kHide = 2;
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenuW(menu, MF_STRING | (g_pinned ? MF_CHECKED : 0), kPin, Loc(g_pinned ? L"menu.unpin" : L"menu.pin"));
+    AppendMenuW(menu, MF_STRING, kHide, Loc(L"menu.hide"));
+    POINT p;
+    GetCursorPos(&p);
+    HWND previous = GetForegroundWindow();  // Handing focus to the menu must not leave the user's app without it.
+    SetForegroundWindow(g_hwnd);
+    const UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, p.x, p.y, 0, g_hwnd, nullptr);
+    PostMessageW(g_hwnd, WM_NULL, 0, 0);  // Lets the menu loop finish cleanly.
+    DestroyMenu(menu);
+    if (previous && previous != g_hwnd && previous != g_isHwnd && IsWindow(previous)) SetForegroundWindow(previous);
+    if (cmd == kPin) SetPinned(!g_pinned);
+    else if (cmd == kHide) SetHidden(true);
+}
 
 #line 1 "bar/panels.inc"
 void SendWinKey(WORD vk) {
@@ -2280,7 +2505,7 @@ void ToggleProfile() {
 // each frame presents the crop that holds the shape, so a settled notch is a small window and an
 // idle one costs nothing. Hover, alerts and tabs are decided here; modules draw the content.
 
-HWND g_isHwnd = nullptr;
+
 LayeredSurface g_isSurface;
 Com<ID2D1SolidColorBrush> g_isBrush;
 unsigned g_isBrushGen = 0;
@@ -2308,7 +2533,6 @@ Size2 g_curSize{}, g_prevSize{};  // Measure() of each, taken when state changes
 double g_frameDt = 0;
 bool g_isInit = false;
 bool g_expanded = false;   // Hover (after the dwell) or pinned.
-bool g_pinned = false;     // Reserved for the menu (P5c).
 bool g_covered = false;    // Reserved for the native volume popup (P5b): blocks hover expansion.
 bool g_isTracking = false;
 bool g_dwelling = false;
@@ -2374,7 +2598,7 @@ bool IslandSettled() {
 
 // Derives everything from the inputs: alerts, hover, tab, panel. Called when an input changes, never per frame.
 void IslandRecompute() {
-    if (!g_isHwnd || g_fullscreen || !EnsureGfx()) return;
+    if (!g_isHwnd || g_fullscreen || g_hidden || !EnsureGfx()) return;
     PrepareText();
     const ULONGLONG now = GetTickCount64();
     g_alerts.erase(std::remove_if(g_alerts.begin(), g_alerts.end(), [&](const AlertItem& a) { return a.expires && a.expires <= now; }),
@@ -2394,7 +2618,7 @@ void IslandRecompute() {
     const float tw = std::min(std::max(size.w, 40.0f), kIslandMaxW) * s;
     const float th = std::min(std::max(size.h, 20.0f), kIslandMaxH) * s;
 
-    const bool wings = state == IState::Expanded || PanelWingsWanted() || now < g_wingHold;
+    const bool wings = IslandOnBar() && (state == IState::Expanded || PanelWingsWanted() || now < g_wingHold);  // The buttons belong to the bar's monitor.
     if (!g_isInit) {
         g_isInit = true;
         g_isW.eps = g_isH.eps = 0.25f;  // Pixels.
@@ -2426,8 +2650,8 @@ void IslandRecompute() {
     g_isState = state;
 
     // Where the body will stand once settled, for the pointer tests.
-    const float cx = (g_monitor.left + g_monitor.right) / 2.0f;
-    g_isTarget = {(LONG)roundf(cx - tw / 2.0f), g_monitor.top, (LONG)roundf(cx + tw / 2.0f), g_monitor.top + (LONG)roundf(th)};
+    const float cx = (g_isMon.left + g_isMon.right) / 2.0f;
+    g_isTarget = {(LONG)roundf(cx - tw / 2.0f), g_isMon.top, (LONG)roundf(cx + tw / 2.0f), g_isMon.top + (LONG)roundf(th)};
 
     if (state == IState::Expanded) SetTimer(g_hwnd, kZoneTimer, kZonePollMs, nullptr);
     else KillTimer(g_hwnd, kZoneTimer);
@@ -2493,9 +2717,9 @@ void IslandZoneTick() {
     bool in = PtInRect(&zone, p) != FALSE;
     // The strip band from the left edge of the bell to the right edge of the calendar keeps hover alive across the gaps.
     int lo = zone.left, hi = zone.right;
-    if (g_wingOk[0]) lo = std::min<int>(lo, g_monitor.left + (int)g_wingX[0]);
-    if (g_wingOk[1]) hi = std::max<int>(hi, g_monitor.left + (int)(g_wingX[1] + g_wingSize));
-    const RECT band{lo, g_monitor.top, hi, g_monitor.top + (LONG)(kBarH * s + 0.5f)};
+    if (IslandOnBar() && g_wingOk[0]) lo = std::min<int>(lo, g_monitor.left + (int)g_wingX[0]);
+    if (IslandOnBar() && g_wingOk[1]) hi = std::max<int>(hi, g_monitor.left + (int)(g_wingX[1] + g_wingSize));
+    const RECT band{lo, g_isMon.top, hi, g_isMon.top + (LONG)(kBarH * s + 0.5f)};
     if (PtInRect(&band, p)) in = true;
     // Over the settled body, a window that covers it (a panel, a popup) counts as leaving.
     if (in && IslandSettled() && PtInRect(&g_isTarget, p)) {
@@ -2553,7 +2777,7 @@ Com<ID2D1PathGeometry> NotchGeometry(float L, float R, float B, float r, float r
 void IslandPaint() {
     if (!g_isDirty || !g_isHwnd) return;
     g_isDirty = false;
-    if (g_fullscreen || !g_isInit || !EnsureGfx()) return;
+    if (g_fullscreen || g_hidden || !g_isInit || !EnsureGfx()) return;
     PrepareText();
     g_isDirty = false;
 
@@ -2628,10 +2852,10 @@ void IslandPaint() {
         RequestPaint();
         return;
     }
-    const int x0 = (g_monitor.left + g_monitor.right) / 2 - stageW / 2;
+    const int x0 = (g_isMon.left + g_isMon.right) / 2 - stageW / 2;
     g_isCropX = cl;
-    g_isBody = {x0 + (LONG)L, g_monitor.top, x0 + (LONG)R, g_monitor.top + (LONG)B};
-    g_isSurface.PresentCrop(g_isHwnd, POINT{x0 + cl, g_monitor.top}, POINT{cl, 0}, SIZE{cr - cl, cb});
+    g_isBody = {x0 + (LONG)L, g_isMon.top, x0 + (LONG)R, g_isMon.top + (LONG)B};
+    g_isSurface.PresentCrop(g_isHwnd, POINT{x0 + cl, g_isMon.top}, POINT{cl, 0}, SIZE{cr - cl, cb});
     if (!IsWindowVisible(g_isHwnd)) ShowWindow(g_isHwnd, SW_SHOWNOACTIVATE);
 }
 
@@ -2692,7 +2916,7 @@ LRESULT CALLBACK IslandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         case WM_RBUTTONUP:
-            g_demoAlert.Raise();  // Stub: shows the alert queue until the real alert modules exist.
+            ShowBarMenu();
             return 0;
         case WM_DESTROY:
             g_isHwnd = nullptr;
@@ -2786,6 +3010,7 @@ bool IslandInit() {
     if (!g_isHwnd) return false;
     for (IModule* m : g_modules) m->Start(g_services);
     IslandRecompute();
+    if (g_pinned) SetExpanded(true);
     return true;
 }
 
@@ -2857,11 +3082,35 @@ void CALLBACK OnNetChange(void*, void*, int) {
     }
 }
 
-// One timer per minute, aimed at the next minute boundary, so the clock never polls.
+// One timer per minute (per second with seconds on), aimed at the next boundary, so the clock never polls.
 void ArmClock() {
     SYSTEMTIME st;
     GetLocalTime(&st);
-    SetTimer(g_hwnd, kClockTimer, (60 - st.wSecond) * 1000 - st.wMilliseconds + 50, nullptr);
+    const int ms = g_settings.clockSeconds ? 1000 - st.wMilliseconds + 20 : (60 - st.wSecond) * 1000 - st.wMilliseconds + 50;
+    SetTimer(g_hwnd, kClockTimer, ms, nullptr);
+}
+
+// The clock text is only on screen as the collapsed pill; any other view redraws it when it comes back.
+void ClockTick() {
+    if (g_viewCur.m == &g_clockModule && g_viewCur.v == View::Pill) IslandRecompute();  // The text may be wider now.
+}
+
+// Follow-mouse moves only the island: it hangs from the monitor the pointer is on. Not while it is open under the pointer.
+void FollowTick() {
+    if (g_settings.monitor != -1 || g_expanded || g_hidden) return;
+    const RECT before = g_isMon;
+    UpdateIslandMonitor();
+    if (!EqualRect(&before, &g_isMon)) {
+        g_isInit = false;  // No spring across screens: it appears in its new place.
+        IslandRecompute();
+    }
+}
+
+// The monitor choice changed (settings) or a display was added or removed.
+void ApplyMonitor() {
+    PlaceBar();
+    if (g_settings.monitor == -1) SetTimer(g_hwnd, kFollowTimer, 250, nullptr);
+    else KillTimer(g_hwnd, kFollowTimer);
 }
 
 int HitIndexAt(POINT p) {
@@ -2959,7 +3208,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;  // The bar's own request for tray icons, not a new taskbar.
         }
         g_registered = false;
-        RegisterBar();
+        if (!g_hidden) RegisterBar();
         InvalidateAll();
         return 0;
     }
@@ -3025,9 +3274,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             const int index = HitIndexAt(p);
             if (index >= 0 && g_hits[index].action == Action::TrayIcon) {
                 ClickTrayIcon(g_hits[index].data, true);
+            } else {
+                ShowBarMenu();
             }
             return 0;
         }
+        case WM_HOTKEY:
+            if (wp == kHotkeyId) ToggleHotkey();
+            return 0;
         case WM_COPYDATA: {
             auto cds = reinterpret_cast<const COPYDATASTRUCT*>(lp);
             if (cds && cds->dwData == kTrayCopyData && cds->cbData >= sizeof(BarTrayMessage)) {
@@ -3064,15 +3318,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_TIMER:
             if (wp == kClockTimer) {
                 ArmClock();
-                InvalidateAll();
-                g_isDirty = true;
-                IslandRecompute();  // The text may be wider now.
+                ClockTick();
+            } else if (wp == kFollowTimer) {
+                FollowTick();
             } else if (wp == kTitleTimer) {
                 KillTimer(hwnd, kTitleTimer);
                 g_titlePending = false;
-                ReadForeground();
-                InvalidateAll();
-                ResyncHover();
+                if (ReadForeground()) {  // A spinner in a terminal title changes nothing the bar shows.
+                    InvalidateAll();
+                    ResyncHover();
+                }
             } else if (wp == kDwellTimer) {
                 IslandDwellTick();
             } else if (wp == kZoneTimer) {
@@ -3158,6 +3413,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_APP_SETTINGS:
             g_settings = LoadSettings();
             for (IModule* m : g_modules) m->OnSettings(g_settings);
+            ArmClock();
+            ApplyMonitor();
             InvalidateAll();
             IslandRecompute();
             return 0;
@@ -3169,18 +3426,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_REFRESH_FOREGROUND:
             RehookTitle();
-            ReadForeground();
-            InvalidateAll();
+            if (ReadForeground()) InvalidateAll();
             IslandRecompute();  // A panel opening or closing moves the buttons.
             return 0;
         case WM_SETTINGCHANGE:
-            ReadAccent();
-            ReadForeground();
-            InvalidateAll();
+            {
+                const BYTE before[3] = {g_accent[0], g_accent[1], g_accent[2]};
+                ReadAccent();
+                if (ReadForeground() || memcmp(before, g_accent, 3)) InvalidateAll();  // Many settings broadcast; few matter.
+            }
             return 0;
         case WM_DISPLAYCHANGE:
         case WM_DPICHANGED:
-            PlaceBar();
+            ApplyMonitor();  // Picks the monitor again: the chosen one may be gone, or its scale new.
             IslandRescale();
             InvalidateAll();
             return 0;
@@ -3188,6 +3446,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             DestroyWindow(hwnd);
             return 0;
         case WM_DESTROY:
+            UnregisterHotKey(hwnd, kHotkeyId);
             RemovePropW(hwnd, L"TopBarAnchorX");
             RemovePropW(hwnd, L"TopBarAnchorTick");
             UnregisterBar();
@@ -3223,6 +3482,10 @@ DWORD WINAPI BarThread(void*) {
     ChangeWindowMessageFilterEx(g_hwnd, WM_COPYDATA, MSGFLT_ALLOW, nullptr);
 
     g_settings = LoadSettings();
+    g_pinned = Wh_GetIntValue(L"pinned", 0) != 0;
+    if (!RegisterHotKey(g_hwnd, kHotkeyId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'D')) {
+        Wh_Log(L"Ctrl+Alt+D is taken (the old island mod?): error %lu", GetLastError());
+    }
     g_clock.Start(g_hwnd, WM_APP_FRAME);
     ReadAccent();
     LoadAvatar();
@@ -3239,6 +3502,7 @@ DWORD WINAPI BarThread(void*) {
 
     RegisterBar();
     IslandInit();
+    ApplyMonitor();
     ArmClock();
     InvalidateAll();
 
