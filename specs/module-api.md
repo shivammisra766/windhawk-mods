@@ -13,3 +13,5 @@ Source: `topbar/bar/module.inc` (interface, stubs) and `topbar/bar/island.inc` (
 - Reserved for later modules: `Services::Images()`, `PersistInt`. Add them in `module.inc` when first needed, then update this file.
 
 Stubs shipped: `ClockModule` (collapsed), `PlaceholderPage` x2 (dashboards), `DemoAlertModule` (right-click the island to raise it; remove when P6b lands).
+
+- Added in P6a: `Services::Relayout()` (re-measure after a module changed size or presence) and `Services::Expand(module, ms)` (open the island on that module's dashboard for at least ms, then hover rules). `g_modules` moved to `bar/modules.inc`. Media lives in `topbar/media/`.
