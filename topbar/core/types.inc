@@ -87,11 +87,11 @@ D2D1_COLOR_F Rgb(int r, int g, int b, int a = 255) {
 }
 
 // The theme: Start's. Every surface the bar draws takes its colour from here.
-// Surface: Start's panel, #101010 at 86% (0xDC), no blur. Side bubbles, the island and notch, and
+// Surface: Windows Terminal's look, black at 77% (0xC4), no blur. Side bubbles, the island and notch, and
 // everything that opens in it (cards, alerts, dashboards, shelf).
-const D2D1_COLOR_F kSurface = Rgb(0x10, 0x10, 0x10, 0xDC);
+const D2D1_COLOR_F kSurface = Rgb(0x00, 0x00, 0x00, 0xC4);
 // The same colour, solid: rings that cut a badge out of the art under it.
-const D2D1_COLOR_F kSurfaceSolid = Rgb(0x10, 0x10, 0x10);
+const D2D1_COLOR_F kSurfaceSolid = Rgb(0x00, 0x00, 0x00);
 // Inner elements: Start's tiles, #1F1F1F. Cards, chips, buttons, slider tracks, the hover under an icon.
 const D2D1_COLOR_F kTile = Rgb(0x1F, 0x1F, 0x1F);
 const D2D1_COLOR_F kTileHover = Rgb(0x2D, 0x2D, 0x2D);  // A tile under the pointer, or a tile on a tile.
