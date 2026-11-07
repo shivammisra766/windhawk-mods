@@ -41,13 +41,14 @@ bool IsQuickSettingsWindow(HWND hwnd) {
     return !wcscmp(cls, L"ControlCenterWindow");
 }
 
-// The bar opened the calendar a moment ago, so the panel host now taking focus is that calendar.
-bool CalendarOpenWanted() {
-    return g_panelMode == kPanelCalendar && GetTickCount64() - g_calendarTick < (ULONGLONG)kCalendarClaimMs;
+// The bar opened one part (the bell's notifications or the island's calendar) a moment ago, so the
+// panel host now taking focus is that part, to hang from the bar.
+bool BarPanelOpenWanted() {
+    return g_panelMode != kPanelNative && GetTickCount64() - g_panelClaimTick < (ULONGLONG)kPanelClaimMs;
 }
 
-// The notification panel opens wherever its window was left, so before the bar moves it for the
-// calendar, remember the native place, and put it back before a native open. A place that does not
+// The notification panel opens wherever its window was left, so before the bar moves it under the
+// bell or the island, remember the native place, and put it back before a native open. A place that does not
 // end near the bottom of the work area was left by an older bar: use the native corner instead.
 void SaveNativePanelRect(HWND hwnd) {
     if (g_panelMoved || IsQuickSettingsWindow(hwnd)) {
@@ -83,10 +84,15 @@ void RestoreNativePanel(HWND hwnd) {
     }
 }
 
-// Centred under the clicked icon (the calendar: under the island).
-int AnchoredPanelX(HWND, const RECT& box, const MONITORINFO& mi, float s) {
+// Centred under the clicked icon (the calendar: under the island), except the notifications: the
+// bell is the bar's rightmost icon, so that panel ends where the bell's bubble ends.
+int AnchoredPanelX(HWND hwnd, const RECT& box, const MONITORINFO& mi, float s) {
+    constexpr float kBellToBubbleEdge = kItem / 2.0f + kItemPad + kBubblePad;  // From the bell's centre.
     const int edge = (int)(kPanelEdge * s + 0.5f);
     int x = g_anchorX - (box.left + box.right) / 2;
+    if (g_panelMode == kPanelNotifications && !IsQuickSettingsWindow(hwnd)) {
+        x = g_anchorX + (int)(kBellToBubbleEdge * s + 0.5f) - box.right;
+    }
     if (x + box.right > mi.rcMonitor.right - edge) x = mi.rcMonitor.right - edge - box.right;
     if (x + box.left < mi.rcMonitor.left + edge) x = mi.rcMonitor.left + edge - box.left;
     return x;
@@ -96,8 +102,9 @@ int AnchoredPanelX(HWND, const RECT& box, const MONITORINFO& mi, float s) {
 // only paint inside it. Moving the window is what puts the content under the bar;
 // moving the content inside the window would push it out of the region.
 void PlacePanel(HWND hwnd) {
-    // Only Quick Settings and the bar's calendar hang from the bar; the notifications stay native.
-    if (!IsQuickSettingsWindow(hwnd) && g_panelMode != kPanelCalendar) {
+    // Quick Settings, the bell's notifications and the island's calendar hang from the bar; the
+    // notifications opened any other way stay native.
+    if (!IsQuickSettingsWindow(hwnd) && g_panelMode == kPanelNative) {
         return;
     }
     RECT box;
@@ -202,8 +209,8 @@ void StepPanelFollow() {
     }
 }
 
-// Shows one half of the native notification and calendar panel: the calendar under the island, or
-// the notifications at their native place (kPanelNative).
+// Shows one half of the native notification and calendar panel: the calendar under the island, the
+// notifications under the bell, or the notifications at their native place (kPanelNative).
 void TogglePanel(WPARAM mode) {
     HWND fg = GetForegroundWindow();
     const bool open = fg && IsShellExperienceWindow(fg);
@@ -212,7 +219,7 @@ void TogglePanel(WPARAM mode) {
         return;
     }
     g_panelMode = mode;
-    if (mode == kPanelCalendar) g_calendarTick = GetTickCount64();
+    if (mode != kPanelNative) g_panelClaimTick = GetTickCount64();
     if (open) {
         // Windows sizes the panel's clip region as it opens, so changing parts means reopening.
         SendWinKey('N');
@@ -229,7 +236,7 @@ void TogglePanel(WPARAM mode) {
     SendPanelMode(mode);
     // This panel opens wherever it was left, so put it in place first. The clip only updates
     // once it opens, so use its top from the last time this mode was shown.
-    if (mode == kPanelCalendar && g_notificationPanel && IsWindow(g_notificationPanel) && g_regionTop[mode]) {
+    if (mode != kPanelNative && g_notificationPanel && IsWindow(g_notificationPanel) && g_regionTop[mode]) {
         RECT box, bar, r;
         const int kind = GetWindowRgnBox(g_notificationPanel, &box);
         if (kind != ERROR && kind != NULLREGION) {

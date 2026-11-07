@@ -47,10 +47,12 @@ struct BarTrayMessage {
     WCHAR tip[128];
 };
 // Modes understood by the panel-split mod inside ShellExperienceHost. Native: notifications alone at
-// their usual place above the dock (panel-split's default while the bar is up). Calendar: alone, under the island.
+// their usual place above the dock (panel-split's default while the bar is up). Notifications: alone,
+// under the bar's bell. Calendar: alone, under the island.
 constexpr WPARAM kPanelNative = 0;
+constexpr WPARAM kPanelNotifications = 1;
 constexpr WPARAM kPanelCalendar = 2;
-constexpr int kCalendarClaimMs = 4000;  // A panel host focused this soon after the bar opened the calendar is the calendar.
+constexpr int kPanelClaimMs = 4000;  // A panel host focused this soon after the bar opened one part is that part.
 
 // Seelen fancy-toolbar, in CSS px scaled by DPI: item size 16, padding 8, margin 0.
 constexpr float kItem = 16.0f;
@@ -84,18 +86,25 @@ D2D1_COLOR_F Rgb(int r, int g, int b, int a = 255) {
     return D2D1::ColorF(r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
 }
 
-// Side bubbles are a little see-through, the centre one is solid. Text is Seelen's gray.
-const D2D1_COLOR_F kSideBg = Rgb(0x10, 0x10, 0x10, 0xDC);
-const D2D1_COLOR_F kCentreBg = Rgb(0x10, 0x10, 0x10);
-const D2D1_COLOR_F kFg = Rgb(228, 228, 228);
+// The theme: Start's. Every surface the bar draws takes its colour from here.
+// Surface: Start's panel, #101010 at 86% (0xDC), no blur. Side bubbles, the island and notch, and
+// everything that opens in it (cards, alerts, dashboards, shelf).
+const D2D1_COLOR_F kSurface = Rgb(0x10, 0x10, 0x10, 0xDC);
+// The same colour, solid: rings that cut a badge out of the art under it.
+const D2D1_COLOR_F kSurfaceSolid = Rgb(0x10, 0x10, 0x10);
+// Inner elements: Start's tiles, #1F1F1F. Cards, chips, buttons, slider tracks, the hover under an icon.
+const D2D1_COLOR_F kTile = Rgb(0x1F, 0x1F, 0x1F);
+const D2D1_COLOR_F kTileHover = Rgb(0x2D, 0x2D, 0x2D);  // A tile under the pointer, or a tile on a tile.
+const D2D1_COLOR_F kTileRaised = Rgb(0x3A, 0x3A, 0x3A);  // A tile on a tile, under the pointer.
+const D2D1_COLOR_F kFg = Rgb(255, 255, 255);  // Text and glyphs; secondary text is this at lower alpha.
 
 const GUID kGuidBatteryPercent = {0xA7AD8041, 0xB45A, 0x4CAE, {0x87, 0xA3, 0xEE, 0xCB, 0xB4, 0x68, 0xA9, 0xE1}};
 const GUID kGuidAcDc = {0x5D3E9A59, 0xE9D5, 0x4B00, {0xA6, 0xBD, 0xFF, 0x34, 0xFF, 0x51, 0x65, 0x48}};
 
-enum class Action { None, QuickSettings, Wifi, Bluetooth, TrayIcon, Profile };
+enum class Action { None, QuickSettings, Wifi, Bluetooth, TrayIcon, Notifications, Profile };
 
 // Stable ids for hover, so a list that changes under the pointer doesn't move the highlight.
-enum HitId { H_none = 0, H_profile = 1, H_settings, H_battery, H_wifi, H_bluetooth, H_trayBase = 1000 };
+enum HitId { H_none = 0, H_profile = 1, H_settings, H_battery, H_wifi, H_bluetooth, H_bell, H_trayBase = 1000 };
 
 struct Hit {
     RECT rect;
@@ -133,9 +142,9 @@ Action g_quickPage = Action::None;
 int g_anchorX = 0;
 ULONGLONG g_anchorTick = 0;
 ULONGLONG g_panelOpenTick = 0;
-ULONGLONG g_calendarTick = 0;  // Last time the bar opened (or reopened) the calendar.
+ULONGLONG g_panelClaimTick = 0;  // Last time the bar opened (or reopened) the bell's or the calendar's part.
 RECT g_nativePanelRect{};      // The panel host's window where Windows keeps it, saved before the bar first moves it.
-bool g_panelMoved = false;     // The bar moved that window for the calendar and has not put it back yet.
+bool g_panelMoved = false;     // The bar moved that window (bell or calendar) and has not put it back yet.
 HWND g_notificationPanel = nullptr;
 int g_regionTop[3] = {};  // Clip top last seen for each mode, to place the panel before it opens.
 int g_hoverId = H_none;

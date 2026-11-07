@@ -155,7 +155,7 @@ void Layout(int W, int H) {
         g_cmds.push_back(c);
     };
 
-    // Right bubble: tray icons, Bluetooth, Wi-Fi, battery, settings, laid out from the right edge.
+    // Right bubble: tray icons, Bluetooth, Wi-Fi, battery, settings, bell, laid out from the right edge.
     float right = W - margin - bpad;
     auto iconItem = [&](IconId id, Action action, int hitId) {
         const float w = IconGeometries::Width(id, icon) + 2 * pad;
@@ -164,6 +164,7 @@ void Layout(int W, int H) {
         iconCmd(id, right + w / 2.0f, cy, icon);
         right -= gap;
     };
+    iconItem(I_bell, Action::Notifications, H_bell);  // Rightmost: the notifications hang under it.
     iconItem(I_settings, Action::QuickSettings, H_settings);
     if (g_battery >= 0) {
         wchar_t pct[8];
@@ -274,14 +275,14 @@ void DrawFrame(ID2D1RenderTarget* rt) {
 
     for (int i = 0; i < kBubbles; i++) {
         if (!g_hasBubble[i]) continue;
-        color(kSideBg);
+        color(kSurface);
         rt->FillRoundedRectangle(D2D1::RoundedRect(g_bubbles[i], g_bubbleRadius, g_bubbleRadius), brush);
     }
 
     for (const Cmd& c : g_cmds) {
         switch (c.kind) {
             case CmdKind::Hover:
-                color(Overlay(51));
+                color(kTile);  // The theme's hover: Start's tile.
                 rt->FillRoundedRectangle(D2D1::RoundedRect(c.r, c.radius, c.radius), brush);
                 break;
             case CmdKind::Text: {

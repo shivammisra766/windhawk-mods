@@ -2,9 +2,7 @@
 // Pages are modules with HasDashboard(). The island owns switching, the dot column and the slide;
 // a page does work only between OnVisibility(Dashboard, true) and (…, false).
 
-// Fixed look (specs/dashboards.md section 2).
-const D2D1_COLOR_F kCard = Rgb(255, 255, 255, 22);
-const D2D1_COLOR_F kCardHover = Rgb(255, 255, 255, 38);
+// Fixed look (specs/dashboards.md section 2). Cards are the theme's tiles (kTile, kTileHover in types.inc).
 const D2D1_COLOR_F kHairline = Rgb(255, 255, 255, 26);
 const D2D1_COLOR_F kMuted = Rgb(228, 228, 228, 153);
 const D2D1_COLOR_F kAccent = Rgb(228, 228, 228);
@@ -291,7 +289,7 @@ public:
         const int dim = DaysInMonth(now.wYear, now.wMonth);
         const int rows = (startIdx + dim + 6) / 7;
 
-        p.Fill(22, 16, 115, 164, 12, kCard);
+        p.Fill(22, 16, 115, 164, 12, kTile);
         p.Text(month, 28, 22, 112, 38, 12, kAccent, TF_Ellipsis, 700);
         wchar_t year[8];
         swprintf_s(year, L"%d", now.wYear);
@@ -432,7 +430,7 @@ public:
         for (int i = 0; i < 6; i++) {
             const Card& k = cards[order[i]];
             const float l = 24 + (i % 2) * (cw + 9), t = 22 + (i / 2) * 44, r = l + cw, bt = t + 38;
-            p.Fill(l, t, r, bt, 9, kCard);
+            p.Fill(l, t, r, bt, 9, kTile);
             D2D1_COLOR_F tint = k.frac >= 0.90f ? kRed : k.frac >= 0.75f ? kAmber : kAccent;
             Glyph(p, k.glyph, l + 16, t + 19, tint);
             p.Text(k.label, l + 30, t + 2, r - 9, t + 15, 11, kMuted);
@@ -675,7 +673,7 @@ public:
         const wchar_t* values[3] = {wind, feels, hum};
         for (int i = 0; i < 3; i++) {
             const float top = 25 + i * 47;
-            p.Fill(214, top, 358, top + 40, 10, kCard, dim);
+            p.Fill(214, top, 358, top + 40, 10, kTile, dim);
             if (i == 0) { p.Line(222, top + 15, 235, top + 15, 1.4f, kAccent, dim); p.Line(222, top + 20, 232, top + 20, 1.4f, kAccent, dim); p.Line(222, top + 25, 236, top + 25, 1.4f, kAccent, dim); }
             else if (i == 1) { p.Line(229, top + 12, 229, top + 24, 1.6f, kAccent, dim); p.Dot(229, top + 27, 3, kAccent, dim); }
             else { p.Dot(229, top + 24, 4, kAccent, dim); p.Line(229, top + 12, 225.5f, top + 21, 1.4f, kAccent, dim); p.Line(229, top + 12, 232.5f, top + 21, 1.4f, kAccent, dim); }
@@ -848,14 +846,14 @@ public:
         }
         Pg p(c);
         hits_.clear();
-        p.Ring(86, 92, 44, 5, kCardHover);
+        p.Ring(86, 92, 44, 5, kTileHover);
         DrawArcFrac(p, 86, 92, 44, frac, 5, col);
         p.Text(active_ || finished_ ? tm : L"Ready", 46, 72, 126, 112, 18, kFg, TF_Center, 600);
         if (!running_ && active_) p.Text(L"Paused", 46, 108, 126, 124, 10, kMuted, TF_Center);
         const wchar_t* label = finished_ ? (isBreak_ ? L"Break Complete" : L"Focus Complete") : active_ ? (isBreak_ ? L"Break Timer" : L"Focus Timer") : L"Focus Timer";
         p.Text(label, 160, 26, 350, 48, 13.5f, finished_ ? kRed : kFg, TF_Ellipsis, 600);
         auto button = [&](int id, const wchar_t* text, float t) {
-            p.Fill(160, t, 340, t + 28, 8, hover_ == id ? kCardHover : kCard);
+            p.Fill(160, t, 340, t + 28, 8, hover_ == id ? kTileHover : kTile);
             p.Text(text, 160, t, 340, t + 28, 12, kFg, TF_Center, 600);
             Hit(160, t, 340, t + 28, id);
         };

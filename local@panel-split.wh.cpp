@@ -12,9 +12,10 @@
 
 // Both are parts of one native panel. The top bar sends a mode just before opening it,
 // and this collapses the other part. Windows re-clips the panel to what is left.
-// The calendar opens from the island and hangs under it. While the bar runs, opening the
-// panel any other way (the dock's bell, Win+N) shows the notifications alone at their native
-// place above the dock; without the bar, both parts show as usual.
+// The calendar opens from the island and hangs under it; the notifications open from the bar's
+// bell and hang under it, at the top right. While the bar runs, opening the panel any other way
+// (Win+N) shows the notifications alone at their native place above the dock; without the bar,
+// both parts show as usual.
 // Event driven: nothing runs here until the panel opens or the bar sends a mode.
 //
 // These hosts also get "no client area animation" reported to them alone, which removes
@@ -256,8 +257,8 @@ double NotificationsMaxHeight(FrameworkElement const& root) {
     return inWindow > 0 && inWindow < room ? inWindow : room;
 }
 
-// While the bar runs, the calendar opens only from the island, so a panel opened any other way
-// (the dock's bell, Win+N) is the notifications alone, at their native place above the dock.
+// While the bar runs, the calendar opens only from the island and the bar's bell sends its own
+// mode, so a panel opened any other way (Win+N) is the notifications alone, at their native place.
 bool BarAlive() {
     HWND bar = FindWindowW(L"WindhawkTopBar", nullptr);
     return bar && !IsHungAppWindow(bar);

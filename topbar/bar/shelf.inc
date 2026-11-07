@@ -741,7 +741,7 @@ public:
         swprintf_s(cnt, n == 1 ? L"%d item" : L"%d items", n);
         p.Text(status_.empty() ? std::wstring(cnt) : status_, 110, 14, 254, 34, 11, status_.empty() ? kMuted : kAccent, TF_Right | TF_Ellipsis);
         auto chip = [&](int id, float l, const wchar_t* text, D2D1_COLOR_F tint) {
-            p.Fill(l, 14, l + 44, 34, 7, hover_ == id ? kCardHover : kCard);
+            p.Fill(l, 14, l + 44, 34, 7, hover_ == id ? kTileHover : kTile);
             p.Text(text, l, 14, l + 44, 34, 11, tint, TF_Center, 600);
             Hit(l, 14, l + 44, 34, id);
         };
@@ -766,7 +766,7 @@ public:
             const float top = 46 + r * (kRowH + kGap), bot = top + kRowH;
             const int rowId = 1000 + (int)it.id, rmId = 100000 + (int)it.id;
             const bool hot = hover_ == rowId || hover_ == rmId || hover_ == kPhoneIdBase + (int)it.id;
-            if (hot) p.Fill(26, top, 354, bot, 9, kCard);
+            if (hot) p.Fill(26, top, 354, bot, 9, kTile);
             Hit(26, top, 354, bot, rowId);
             const float a = it.missing ? 0.45f : 1.0f;
             DrawKindIcon(p, it, 34, top + 6, a);
@@ -776,7 +776,7 @@ public:
             p.Text(SizeLabel(it), 258, top, phone ? 302 : 322, bot, 11, kMuted, TF_Right | TF_Ellipsis);
             if (hot) {
                 const float cx = 337, cy = top + kRowH / 2;
-                p.Dot(cx, cy, 7, hover_ == rmId ? kCardHover : kCard);
+                p.Dot(cx, cy, 7, hover_ == rmId ? kTileRaised : kTileHover);  // On the row's tile.
                 p.Line(cx - 2.5f, cy - 2.5f, cx + 2.5f, cy + 2.5f, 1.3f, kFg);
                 p.Line(cx - 2.5f, cy + 2.5f, cx + 2.5f, cy - 2.5f, 1.3f, kFg);
                 Hit(cx - 10, cy - 10, cx + 10, cy + 10, rmId);
@@ -784,7 +784,7 @@ public:
             if (phone) {  // Send to phone; the row stays.
                 const int phId = kPhoneIdBase + (int)it.id;
                 const float cx = 315, cy = top + kRowH / 2;
-                p.Dot(cx, cy, 7, hover_ == phId ? kCardHover : kCard);
+                p.Dot(cx, cy, 7, hover_ == phId ? kTileRaised : kTileHover);
                 PhoneGlyph(p, cx, cy, kFg);
                 Hit(cx - 9, cy - 10, cx + 9, cy + 10, phId);
             }
@@ -1020,8 +1020,7 @@ private:
         Pg q(cc);
         const float dy = (1.0f - choice_.x) * 22.0f;  // Overshoot shows as a small lift
         const float t = 116 + dy, b = 174 + dy;
-        q.Fill(22, t, 358, b, 13, kCentreBg);
-        q.Fill(22, t, 358, b, 13, kCard);
+        q.Fill(22, t, 358, b, 13, kTile);  // Solid: it covers the list under it.
         q.Outline(22.5f, t + 0.5f, 357.5f, b - 0.5f, 13, 1, kHairline);
         const bool open = !offer_.empty();
         if (open) Hit(22, t, 358, b, kChoiceCard);
@@ -1034,7 +1033,7 @@ private:
             const float bt = t + 14, bb = b - 14;
             const bool hot = open && hover_ == id;
             if (primary) q.Fill(l, bt, r, bb, 9, kAccent, hot ? 1.0f : 0.9f);
-            else q.Fill(l, bt, r, bb, 9, hot ? kCardHover : kCard);
+            else q.Fill(l, bt, r, bb, 9, hot ? kTileRaised : kTileHover);  // On the card's tile.
             if (id == kChoiceSend) {
                 PhoneGlyph(q, l + 14, (bt + bb) / 2, primary ? kInk : kFg);
                 q.Text(text, l + 22, bt, r - 6, bb, 11, primary ? kInk : kFg, TF_Center | TF_Ellipsis, 600);
@@ -1144,7 +1143,7 @@ private:
     void DrawKindIcon(const Pg& p, ShelfItem& it, float x, float y, float alpha) {
         const bool chip = it.kind == SK::Text || it.kind == SK::Link;
         if (chip) {
-            p.Fill(x, y, x + 18, y + 18, 5, kCardHover, alpha);
+            p.Fill(x, y, x + 18, y + 18, 5, kTileHover, alpha);
             p.Text(it.kind == SK::Text ? L"T" : L"↗", x, y, x + 18, y + 18, 11, kFg, TF_Center, 700);
             return;
         }
