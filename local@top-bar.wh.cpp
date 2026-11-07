@@ -5757,6 +5757,7 @@ struct AlertItem {
 // Provided by the alerts module (topbar/alerts), which is listed after this file.
 void AlertsDrawOverlay(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* brush, float L, float R, float B, float s);
 void AlertsPublishGeometry();
+bool AlertsHoldsHover();  // The alert on show is a slider: hovering it must not expand the island over it.
 
 IState g_isState = IState::Collapsed;
 Spring g_cover;         // 0 island shown, 1 faded out under the native volume popup (P5b).
@@ -6003,6 +6004,7 @@ void IslandDwellTick() {
     g_dwelling = false;
     POINT p;
     GetCursorPos(&p);
+    if (g_isState == IState::Alert && AlertsHoldsHover()) return;  // A slider came up during the dwell.
     if (!g_covered && !g_fullscreen && PtInRect(&g_isBody, p)) SetExpanded(true);
 }
 
@@ -6143,7 +6145,8 @@ LRESULT CALLBACK IslandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 TrackMouseEvent(&t);
             }
             // Event-driven while collapsed: the pixels of the notch start the dwell, nothing polls.
-            if (!g_expanded && !g_covered && !g_dwelling && !g_fullscreen) {
+            // Not over a slider card: expanding would replace it with a dashboard under the pointer.
+            if (!g_expanded && !g_covered && !g_dwelling && !g_fullscreen && !(g_isState == IState::Alert && AlertsHoldsHover())) {
                 g_dwelling = true;
                 SetTimer(g_hwnd, kDwellTimer, kDwellMs, nullptr);
             }
@@ -6179,6 +6182,7 @@ LRESULT CALLBACK IslandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_LBUTTONUP:
             if (g_isState == IState::Alert) {
+                IslandPointer(PointerEvent::Up, lp, true);  // Ends a slider drag; other cards ignore it.
                 if (IModule* m = TopAlert()) m->OnClickAlert();
             } else {
                 IslandPointer(PointerEvent::Up, lp, true);
@@ -6336,7 +6340,7 @@ void IslandShutdown() {
 // workers (keyboard hook, Bluetooth, notification listener, registry watcher) only post. The module owns a
 // hidden top-level window: WM_DEVICECHANGE needs a top-level window, and the registered messages sent by
 // panel-split (toast shown) and tray-bridge (volume popup shown) are addressed to it by class name.
-// Not built here, by decision: Progress, Num Lock, privacy-dot tap, the 64-bit "DND off" helper.
+// Not built here, by decision: Progress, Num Lock, privacy-dot tap. DND off goes through QuietHoursSettings (levels.inc).
 
 namespace wfn = winrt::Windows::Foundation;
 namespace wun = winrt::Windows::UI::Notifications;
@@ -6374,7 +6378,11 @@ enum class AK { Caps, Battery, Bluetooth, Device, Dnd, Notification, Clipboard, 
 constexpr UINT WM_AL_LEVEL = WM_APP + 42;  // wParam: volume 0-100 (-1 unknown) | 0x10000 muted; lParam: brightness (-1 unknown).
 HANDLE g_alLevelRead = nullptr, g_alLevelSet = nullptr;  // Auto-reset: read both levels / apply the requested one.
 std::atomic<int> g_alSetVolume{-1}, g_alSetBright{-1};
+HANDLE g_alDndOff = nullptr;               // Auto-reset: turn Do Not Disturb off (on the level thread, it is MTA).
+constexpr UINT WM_AL_DNDFAIL = WM_APP + 43;  // That failed: open Settings instead.
 DWORD WINAPI AlLevelThread(void*);  // alerts/levels.inc
+// Level card size, DIP: normal, and while hovered (bigger, so it is easy to drag).
+constexpr float kAlLevelW = 280.0f, kAlLevelH = 44.0f, kAlLevelHoverW = 360.0f, kAlLevelHoverH = 64.0f;
 
 struct AItem {
     AK kind = AK::Caps;
@@ -6551,6 +6559,7 @@ public:
     void PublishGeometry();
     void FullscreenChanged();
     int Dots() const { return (mic_ ? 1 : 0) + (cam_ ? 1 : 0); }
+    bool HoldsHover() const { return IsLevel(); }
     void DrawOverlay(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* brush, float L, float R, float B, float s);
     LRESULT Wnd(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
@@ -6772,7 +6781,7 @@ void AlertsModule::OnDnd(int value) {
     it.kind = AK::Dnd;
     it.on = value != 0;
     it.title = value ? AlT(L"alert.dnd.on", L"Do Not Disturb on") : AlT(L"alert.dnd.off", L"Do Not Disturb off");
-    it.sub = value ? AlT(L"alert.dnd.tap", L"Tap to open settings") : L"";
+    it.sub = value ? AlT(L"alert.dnd.tapoff", L"Tap to turn off") : L"";
     it.ms = 3000;
     Enqueue(it);
 }
@@ -6938,7 +6947,8 @@ void AlertsModule::SetLevelAt(float x) {
 
 Size2 AlertsModule::Measure(View v) {
     if (v != View::Alert || !hasCur_) return {40.0f, kNotchH};
-    if (IsLevel()) return {280.0f + 2.0f * AlertsDotsReserve(), 44.0f};
+    if (IsLevel()) return hovered_ ? Size2{kAlLevelHoverW + 2.0f * AlertsDotsReserve(), kAlLevelHoverH}  // Bigger to drag.
+                                   : Size2{kAlLevelW + 2.0f * AlertsDotsReserve(), kAlLevelH};
     float w = 300.0f;
     switch (cur_.kind) {
         case AK::Caps: w = 210.0f; break;
@@ -6952,12 +6962,19 @@ Size2 AlertsModule::Measure(View v) {
 
 bool AlertsModule::OnPointer(const PointerEvent& e, View v) {
     if (v != View::Alert) return false;
-    if (IsLevel()) {  // Press or drag on the card sets the level; hovering holds it open.
+    if (IsLevel()) {  // Press or drag on the card sets the level; hovering holds it open and grows it.
         if (e.kind == PointerEvent::Down && e.left) { dragging_ = true; SetLevelAt(e.pt.x); }
         else if (e.kind == PointerEvent::Move && dragging_) SetLevelAt(e.pt.x);
         else if (e.kind == PointerEvent::Up) dragging_ = false;
-        else if (e.kind == PointerEvent::Leave) { dragging_ = false; hovered_ = false; }
-        if (e.kind == PointerEvent::Move) hovered_ = true;
+        else if (e.kind == PointerEvent::Leave) {
+            dragging_ = false;
+            if (hovered_) {
+                hovered_ = false;
+                cur_.remaining = cur_.ms;  // The dismiss timer starts over from leaving.
+                IslandRecompute();
+            }
+        }
+        if (e.kind == PointerEvent::Move && !hovered_) { hovered_ = true; IslandRecompute(); }
         return true;
     }
     if (e.kind == PointerEvent::Move && !hovered_) { hovered_ = true; IslandRecompute(); }
@@ -6974,27 +6991,36 @@ void AlertsModule::Draw(const DrawCtx& c) {
 
     if (IsLevel()) {  // Glyph, track with fill, percent.
         const bool vol = cur_.kind == AK::Volume;
-        const float cx = r.left + 24.0f * s, cy = (r.top + r.bottom) / 2.0f;
+        // Lay out in the body as it stands now, so the hover growth rides the island's size springs:
+        // g goes 0 to 1 as the body grows from the normal card to the hover card.
+        const float ew = std::min(r.right - r.left, std::max(g_isW.x, 1.0f));
+        const float eh = std::min(r.bottom - r.top, std::max(g_isH.x, 1.0f));
+        const float g = Clamp01((eh / s - kAlLevelH) / (kAlLevelHoverH - kAlLevelH));
+        const float left = (r.left + r.right) / 2.0f - ew / 2.0f, right = left + ew;
+        const float gs = s * (1.0f + 0.4f * g);  // Glyph scale.
+        const float lw = 1.4f * gs;
+        const float cx = left + (24.0f + 6.0f * g) * s, cy = r.top + eh / 2.0f;
         col(kFg);
         if (vol) {
-            D2D1_POINT_2F p[] = {{cx - 8 * s, cy - 3 * s}, {cx - 4 * s, cy - 3 * s}, {cx + 1 * s, cy - 7 * s}, {cx + 1 * s, cy + 7 * s}, {cx - 4 * s, cy + 3 * s}, {cx - 8 * s, cy + 3 * s}};
-            for (int i = 0; i < 6; i++) c.rt->DrawLine(p[i], p[(i + 1) % 6], c.brush, 1.4f * s);
+            D2D1_POINT_2F p[] = {{cx - 8 * gs, cy - 3 * gs}, {cx - 4 * gs, cy - 3 * gs}, {cx + 1 * gs, cy - 7 * gs}, {cx + 1 * gs, cy + 7 * gs}, {cx - 4 * gs, cy + 3 * gs}, {cx - 8 * gs, cy + 3 * gs}};
+            for (int i = 0; i < 6; i++) c.rt->DrawLine(p[i], p[(i + 1) % 6], c.brush, lw);
             if (cur_.on) {  // Muted: a cross instead of waves.
-                c.rt->DrawLine(D2D1::Point2F(cx + 4 * s, cy - 3 * s), D2D1::Point2F(cx + 10 * s, cy + 3 * s), c.brush, 1.4f * s);
-                c.rt->DrawLine(D2D1::Point2F(cx + 10 * s, cy - 3 * s), D2D1::Point2F(cx + 4 * s, cy + 3 * s), c.brush, 1.4f * s);
+                c.rt->DrawLine(D2D1::Point2F(cx + 4 * gs, cy - 3 * gs), D2D1::Point2F(cx + 10 * gs, cy + 3 * gs), c.brush, lw);
+                c.rt->DrawLine(D2D1::Point2F(cx + 10 * gs, cy - 3 * gs), D2D1::Point2F(cx + 4 * gs, cy + 3 * gs), c.brush, lw);
             } else if (cur_.level > 0) {
-                c.rt->DrawLine(D2D1::Point2F(cx + 5 * s, cy - 3 * s), D2D1::Point2F(cx + 5 * s, cy + 3 * s), c.brush, 1.4f * s);
-                if (cur_.level > 50) c.rt->DrawLine(D2D1::Point2F(cx + 9 * s, cy - 6 * s), D2D1::Point2F(cx + 9 * s, cy + 6 * s), c.brush, 1.4f * s);
+                c.rt->DrawLine(D2D1::Point2F(cx + 5 * gs, cy - 3 * gs), D2D1::Point2F(cx + 5 * gs, cy + 3 * gs), c.brush, lw);
+                if (cur_.level > 50) c.rt->DrawLine(D2D1::Point2F(cx + 9 * gs, cy - 6 * gs), D2D1::Point2F(cx + 9 * gs, cy + 6 * gs), c.brush, lw);
             }
         } else {
-            c.rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 3.5f * s, 3.5f * s), c.brush, 1.4f * s);
+            c.rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 3.5f * gs, 3.5f * gs), c.brush, lw);
             for (int i = 0; i < 8; i++) {
                 const float a = i * 3.14159265f / 4.0f, ca = std::cos(a), sa = std::sin(a);
-                c.rt->DrawLine(D2D1::Point2F(cx + ca * 6.0f * s, cy + sa * 6.0f * s), D2D1::Point2F(cx + ca * 8.5f * s, cy + sa * 8.5f * s), c.brush, 1.4f * s);
+                c.rt->DrawLine(D2D1::Point2F(cx + ca * 6.0f * gs, cy + sa * 6.0f * gs), D2D1::Point2F(cx + ca * 8.5f * gs, cy + sa * 8.5f * gs), c.brush, lw);
             }
         }
-        const float tl = r.left + 46.0f * s, tr = r.right - (52.0f + 12.0f * Dots()) * s, th = 6.0f * s;
-        trackL_ = tl - r.left;
+        const float tl = left + (46.0f + 14.0f * g) * s, th = (6.0f + 6.0f * g) * s;
+        const float tr = std::max(tl, right - (52.0f + 8.0f * g + 12.0f * Dots()) * s);  // Never inverted while the body is narrow.
+        trackL_ = tl - r.left;  // Pointer x is measured from the view's left edge, r.left.
         trackR_ = tr - r.left;
         const float frac = std::clamp(cur_.level / 100.0f, 0.0f, 1.0f);
         col(Rgb(255, 255, 255, 0x2e));
@@ -7004,10 +7030,11 @@ void AlertsModule::Draw(const DrawCtx& c) {
             c.rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(tl, cy - th / 2, tl + std::max(th, (tr - tl) * frac), cy + th / 2), th / 2, th / 2), c.brush);
         }
         TextOpts o;
-        o.maxW = 40.0f * s;
-        o.maxH = 18.0f * s;
+        o.maxW = (40.0f + 8.0f * g) * s;
+        o.maxH = (18.0f + 8.0f * g) * s;
+        o.size = g_text.DefaultSize() * (1.0f + 0.3f * g);
         col(kFg, 0.8f);
-        g_text.Draw(c.rt, std::to_wstring(cur_.level), tr + 10.0f * s, cy - 9.0f * s, c.brush, o);
+        g_text.Draw(c.rt, std::to_wstring(cur_.level), tr + 10.0f * s, cy - o.maxH / 2.0f, c.brush, o);
         return;
     }
 
@@ -7084,7 +7111,11 @@ void AlertsModule::OnClickAlert() {
         case AK::Battery: Launch(L"ms-settings:batterysaver"); break;
         case AK::Bluetooth: Launch(L"ms-settings:bluetooth"); break;
         case AK::Device: Launch(L"ms-settings:usb"); break;
-        case AK::Dnd: Launch(L"ms-settings:quietmomentshome"); break;  // No 64-bit helper: see tray-bridge notes.
+        case AK::Dnd:  // Turn it off (levels.inc, AlDndOff); Settings opens only if that fails.
+            if (!it.on) break;
+            if (g_alDndOff) SetEvent(g_alDndOff);
+            else Launch(L"ms-settings:quietmomentshome");
+            break;
         case AK::Clipboard: SendWinKey('V'); break;
         case AK::Notification:
             if (it.more) {
@@ -7512,6 +7543,7 @@ LRESULT AlertsModule::Wnd(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_AL_CAPS: OnCaps(lp != 0); return 0;
         case WM_AL_PRIVACY: SetTimer(hwnd, kAlPrivacy, 250, nullptr); return 0;
         case WM_AL_LEVEL: OnLevels(wp, lp); return 0;
+        case WM_AL_DNDFAIL: Launch(L"ms-settings:quietmomentshome"); return 0;
         case WM_POWERBROADCAST: OnPower(); return TRUE;
         case WM_CLIPBOARDUPDATE: OnClipboard(); return 0;
         case WM_DEVICECHANGE: OnDevice(wp, lp); return TRUE;
@@ -7535,6 +7567,7 @@ void AlertsModule::Start(Services& s) {
     g_alWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_alLevelRead = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_alLevelSet = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_alDndOff = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_alMsgToast = RegisterWindowMessageW(L"Windhawk_TopBar_ToastShown");
     g_alMsgOsd = RegisterWindowMessageW(L"Windhawk_TopBar_Osd");
     HINSTANCE inst = GetModuleHandleW(nullptr);
@@ -7609,7 +7642,8 @@ void AlertsModule::Stop() {
     if (g_alWake) CloseHandle(g_alWake);
     if (g_alLevelRead) CloseHandle(g_alLevelRead);
     if (g_alLevelSet) CloseHandle(g_alLevelSet);
-    g_alStop = g_alWake = g_alLevelRead = g_alLevelSet = nullptr;
+    if (g_alDndOff) CloseHandle(g_alDndOff);
+    g_alStop = g_alWake = g_alLevelRead = g_alLevelSet = g_alDndOff = nullptr;
 }
 
 IModule* AlertsModuleInstance() {
@@ -7623,6 +7657,9 @@ void AlertsDrawOverlay(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* brush, float
 }
 void AlertsPublishGeometry() {
     if (g_alMod) g_alMod->PublishGeometry();
+}
+bool AlertsHoldsHover() {
+    return g_alMod && g_alMod->HoldsHover();
 }
 void AlertsFullscreenChanged() {
     if (g_alMod) g_alMod->FullscreenChanged();
@@ -7721,11 +7758,46 @@ struct AlLevels {
     }
 };
 
+// ---- Do Not Disturb off: the QuietHoursSettings COM class (undocumented) ----
+// The object Settings and Quick Settings drive: CLSID_QuietHoursSettings, hosted out of process by
+// WpnUserService, interface IQuietHoursSettings (layout from Rafael Rivera's quiethours.idl, also used
+// by WinDndToggle and others). Only the first two methods are declared. The class is registered in the
+// 64-bit view only, so a 32-bit host asks for the 64-bit server; the interface's proxy is registered in
+// both views. Setting the user profile to Unrestricted is what turning DND off in Quick Settings does.
+struct IAlQuietHoursSettings : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE get_UserSelectedProfile(LPWSTR* profile) = 0;
+    virtual HRESULT STDMETHODCALLTYPE put_UserSelectedProfile(LPCWSTR profile) = 0;
+};
+constexpr GUID kAlClsidQuietHours = {0xf53321fa, 0x34f8, 0x4b7f, {0xb9, 0xa3, 0x36, 0x18, 0x77, 0xcb, 0x94, 0xcf}};
+constexpr GUID kAlIidQuietHours = {0x6bff4732, 0x81ec, 0x4ffb, {0xae, 0x67, 0xb6, 0xc1, 0xbc, 0x29, 0x63, 0x1f}};
+constexpr wchar_t kAlProfileOff[] = L"Microsoft.QuietHoursProfile.Unrestricted";
+
+bool AlDndOff() {
+    IAlQuietHoursSettings* qh = nullptr;
+    HRESULT hr = CoCreateInstance(kAlClsidQuietHours, nullptr, CLSCTX_LOCAL_SERVER | CLSCTX_ACTIVATE_64_BIT_SERVER, kAlIidQuietHours,
+                                  reinterpret_cast<void**>(&qh));
+    if (FAILED(hr)) hr = CoCreateInstance(kAlClsidQuietHours, nullptr, CLSCTX_LOCAL_SERVER, kAlIidQuietHours, reinterpret_cast<void**>(&qh));
+    if (FAILED(hr) || !qh) {
+        Wh_Log(L"alerts: QuietHoursSettings unavailable, 0x%08lX", (unsigned long)hr);
+        return false;
+    }
+    hr = qh->put_UserSelectedProfile(kAlProfileOff);
+    bool ok = SUCCEEDED(hr);
+    if (ok) {  // Read it back: a changed vtable would succeed and do something else.
+        LPWSTR now = nullptr;
+        ok = SUCCEEDED(qh->get_UserSelectedProfile(&now)) && now && !wcscmp(now, kAlProfileOff);
+        if (now) CoTaskMemFree(now);
+    }
+    Wh_Log(L"alerts: DND off via QuietHoursSettings: hr 0x%08lX, %s", (unsigned long)hr, ok ? L"verified" : L"not verified");
+    qh->Release();
+    return ok;
+}
+
 DWORD WINAPI AlLevelThread(void*) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     {
         AlLevels lv;
-        HANDLE waits[] = {g_alStop, g_alLevelRead, g_alLevelSet};
+        HANDLE waits[] = {g_alStop, g_alLevelRead, g_alLevelSet, g_alDndOff};
         auto post = [&] {
             bool mute = false;
             const int vol = lv.Volume(&mute);
@@ -7734,7 +7806,7 @@ DWORD WINAPI AlLevelThread(void*) {
         };
         post();  // Baseline, so the first key press can be told apart.
         for (;;) {
-            const DWORD w = WaitForMultipleObjects(3, waits, FALSE, INFINITE);
+            const DWORD w = WaitForMultipleObjects(4, waits, FALSE, INFINITE);
             if (w == WAIT_OBJECT_0 + 1) {
                 post();
                 // The popup can show before the new brightness is readable: look once more.
@@ -7750,6 +7822,9 @@ DWORD WINAPI AlLevelThread(void*) {
                     }
                 }
                 if (b >= 0) lv.SetBrightness(b);
+            } else if (w == WAIT_OBJECT_0 + 3) {
+                if (!AlDndOff())  // Settings is the fallback; opened from the UI thread.
+                    if (HWND h = g_alHwnd.load()) PostMessageW(h, WM_AL_DNDFAIL, 0, 0);
             } else {
                 break;
             }
