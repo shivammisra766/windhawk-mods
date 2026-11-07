@@ -1,6 +1,13 @@
 core/includes.inc
+core/com.inc
+core/anim.inc
 core/types.inc
 core/icons.inc
+core/geometry.inc
+core/layered.inc
+core/text.inc
+core/settings.inc
+core/loc.inc
 bar/readers.inc
 core/surface.inc
 bar/bubbles.inc

@@ -5,8 +5,21 @@
 // @version         2.1
 // @author          local
 // @include         windhawk.exe
-// @compilerOptions -lgdiplus -lgdi32 -luser32 -lshell32 -ladvapi32 -lole32 -lversion -lwininet -liphlpapi -luuid
+// @compilerOptions -lgdiplus -lgdi32 -luser32 -lshell32 -ladvapi32 -lole32 -lversion -lwininet -liphlpapi -luuid -ld2d1 -ldwrite -lwindowscodecs -ldwmapi
 // ==/WindhawkMod==
+// ==WindhawkModSettings==
+/*
+- fontFamily: ""
+  $name: Font
+  $description: Leave empty for Segoe UI Variable Text, then Segoe UI.
+- fontScale: 100
+  $name: Text size (percent)
+  $description: 50 to 200. Other values mean 100.
+- language: ""
+  $name: Language
+  $description: A code such as de, fr, hi, ja. Leave empty to follow Windows.
+*/
+// ==/WindhawkModSettings==
 #line 1 "core/includes.inc"
 
 // Runs as a tool mod in its own process. Nothing polls: the bar redraws on Windows
@@ -18,9 +31,16 @@
 #include <sddl.h>
 #include <wininet.h>
 #include <gdiplus.h>
+#include <d2d1.h>
+#include <dwrite.h>
+#include <wincodec.h>
+#include <dwmapi.h>
 #include <cmath>
 #include <cstdlib>
 #include <cwchar>
+#include <atomic>
+#include <unordered_map>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -31,10 +51,127 @@ extern "C" DWORD WINAPI NotifyIpInterfaceChange(USHORT family, void* callback, v
 extern "C" DWORD WINAPI CancelMibChangeNotify2(HANDLE handle);
 
 
-#line 1 "core/types.inc"
 namespace {
 
 using namespace Gdiplus;
+
+#line 1 "core/com.inc"
+
+// ---- Small COM helpers ----
+
+template <class T>
+class Com {
+public:
+    Com() = default;
+    Com(const Com& o) : p_(o.p_) { if (p_) p_->AddRef(); }
+    Com(Com&& o) noexcept : p_(o.p_) { o.p_ = nullptr; }
+    Com& operator=(Com o) { std::swap(p_, o.p_); return *this; }
+    ~Com() { Reset(); }
+    void Reset() { if (p_) { p_->Release(); p_ = nullptr; } }
+    T* Get() const { return p_; }
+    T* operator->() const { return p_; }
+    T** Put() { Reset(); return &p_; }
+    explicit operator bool() const { return p_ != nullptr; }
+private:
+    T* p_ = nullptr;
+};
+
+// Pixels kept on the CPU (premultiplied BGRA) with a Direct2D bitmap made on first use for
+// the current render target. Tray icons, the avatar and the app icon are all kept this way.
+struct Pixmap {
+    int w = 0, h = 0;
+    std::vector<DWORD> px;
+    Com<ID2D1Bitmap> bmp;
+    unsigned gen = 0;  // Render target generation the bitmap belongs to.
+};
+
+#line 1 "core/anim.inc"
+
+// ---- Springs and the frame clock ----
+
+// Damped spring in fixed 2 ms steps. Positions are unitless; eps and epsV decide when it has settled.
+struct Spring {
+    float x = 0, v = 0, target = 0;
+    float k = 320, c = 34;
+    float eps = 0.004f, epsV = 0.04f;
+    void Aim(float t, float stiffness, float damping) { target = t; k = stiffness; c = damping; }
+    void Snap(float t) { x = target = t; v = 0; }
+    bool Settled() const { return fabsf(x - target) < eps && fabsf(v) < epsV; }
+    void Step(double dt) {
+        while (dt > 0) {
+            const double h = dt < 0.002 ? dt : 0.002;
+            const double a = k * (target - x) - c * v;
+            v += (float)(a * h);
+            x += (float)(v * h);
+            dt -= h;
+        }
+        if (Settled()) Snap(target);
+    }
+};
+
+// Constants from the spec, to tune by eye.
+constexpr float kSpringExpandK = 380.0f, kSpringExpandC = 35.0f;
+constexpr float kSpringCollapseK = 260.0f, kSpringCollapseC = 32.0f;
+
+double QpcSeconds() {
+    static LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return (double)now.QuadPart / (double)freq.QuadPart;
+}
+
+// A thread that wakes only while something animates: it waits for the display's next frame
+// and posts one message per frame, never more than one unanswered. The UI thread never blocks.
+class FrameClock {
+public:
+    void Start(HWND hwnd, UINT message) {
+        hwnd_ = hwnd;
+        message_ = message;
+        event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        thread_ = CreateThread(nullptr, 0, Run, this, 0, nullptr);
+    }
+    void Stop() {
+        stop_ = true;
+        if (event_) SetEvent(event_);
+        if (thread_) {
+            WaitForSingleObject(thread_, 2000);
+            CloseHandle(thread_);
+            thread_ = nullptr;
+        }
+        if (event_) { CloseHandle(event_); event_ = nullptr; }
+    }
+    void Wake() {  // Start posting frames.
+        active_ = true;
+        if (event_) SetEvent(event_);
+    }
+    void Sleep() { active_ = false; }  // Called from the UI thread when nothing is animating.
+    void Acked() { pending_ = false; }
+    bool Active() const { return active_; }
+private:
+    static DWORD WINAPI Run(void* self) {
+        auto* c = static_cast<FrameClock*>(self);
+        while (!c->stop_) {
+            WaitForSingleObject(c->event_, INFINITE);
+            while (c->active_ && !c->stop_) {
+                const double t0 = QpcSeconds();
+                const HRESULT hr = DwmFlush();
+                // DwmFlush can fail or return at once, for example on the lock screen: never spin.
+                if (FAILED(hr) || QpcSeconds() - t0 < 0.002) ::Sleep(16);
+                if (!c->pending_.exchange(true)) PostMessageW(c->hwnd_, c->message_, 0, 0);
+            }
+        }
+        return 0;
+    }
+    HWND hwnd_ = nullptr;
+    UINT message_ = 0;
+    HANDLE event_ = nullptr;
+    HANDLE thread_ = nullptr;
+    std::atomic<bool> active_{false};
+    std::atomic<bool> pending_{false};
+    std::atomic<bool> stop_{false};
+};
+
+#line 1 "core/types.inc"
 
 
 constexpr wchar_t kClassName[] = L"WindhawkTopBar";
@@ -42,8 +179,11 @@ constexpr UINT WM_APPBAR_CB = WM_APP + 1;
 constexpr UINT WM_REFRESH_NET = WM_APP + 3;
 constexpr UINT WM_REFRESH_FOREGROUND = WM_APP + 4;
 constexpr UINT WM_PROFILE_DONE = WM_APP + 5;  // From start-menu-pop. wParam 1: Start is still open.
+constexpr UINT WM_REFRESH_TITLE = WM_APP + 6;
+constexpr UINT WM_APP_FRAME = WM_APP + 10;     // From the frame clock thread: one per display frame while animating.
+constexpr UINT WM_APP_SETTINGS = WM_APP + 11;  // From the settings callback, which runs on another thread.
 constexpr UINT_PTR kClockTimer = 1;
-constexpr UINT_PTR kAnimTimer = 2;
+constexpr UINT_PTR kTitleTimer = 2;  // Coalesces title changes.
 constexpr UINT_PTR kPanelTimer = 3;
 constexpr UINT_PTR kFullscreenTimer = 4;
 constexpr UINT_PTR kReopenTimer = 5;
@@ -145,6 +285,11 @@ RECT g_pillRect{};
 
 HWINEVENTHOOK g_foregroundHook = nullptr;
 HWINEVENTHOOK g_titleHook = nullptr;
+DWORD g_titlePid = 0;
+bool g_titlePending = false;
+FrameClock g_clock;
+Spring g_pillSpring;
+double g_lastFrame = 0;
 HANDLE g_netNotify = nullptr;
 HPOWERNOTIFY g_powerA = nullptr;
 HPOWERNOTIFY g_powerB = nullptr;
@@ -402,6 +547,538 @@ void DrawIcon(Graphics& g, IconId id, float cx, float cy, float h, const Color& 
 }
 
 
+#line 1 "core/geometry.inc"
+
+// ---- SVG path data to Direct2D geometry ----
+// Geometries belong to the factory, so they are made once and shared by every render target.
+
+// Lets the arc converter and the parser write to a geometry sink one figure at a time.
+struct GeoSink {
+    ID2D1GeometrySink* s;
+    bool open = false;
+    float cx = 0, cy = 0;
+    void Ensure() {
+        if (!open) {
+            s->BeginFigure(D2D1::Point2F(cx, cy), D2D1_FIGURE_BEGIN_FILLED);
+            open = true;
+        }
+    }
+    void Close(bool closed) {
+        if (open) {
+            s->EndFigure(closed ? D2D1_FIGURE_END_CLOSED : D2D1_FIGURE_END_OPEN);
+            open = false;
+        }
+    }
+    void Move(float x, float y) { Close(false); cx = x; cy = y; }
+    void Line(float, float, float x1, float y1) {
+        Ensure();
+        s->AddLine(D2D1::Point2F(x1, y1));
+        cx = x1; cy = y1;
+    }
+    void Bezier(float, float, float c1x, float c1y, float c2x, float c2y, float x1, float y1) {
+        Ensure();
+        s->AddBezier(D2D1::BezierSegment(D2D1::Point2F(c1x, c1y), D2D1::Point2F(c2x, c2y), D2D1::Point2F(x1, y1)));
+        cx = x1; cy = y1;
+    }
+};
+
+struct SvgReader {
+    const char* p;
+    void Skip() {
+        while (*p == ' ' || *p == ',' || *p == '\n' || *p == '\r' || *p == '\t') p++;
+    }
+    float Num() {
+        Skip();
+        char* end = nullptr;
+        float v = strtof(p, &end);
+        p = end;
+        return v;
+    }
+    float Flag() {
+        Skip();
+        return *p++ == '1' ? 1.0f : 0.0f;
+    }
+};
+
+// SVG elliptical arc as cubic Beziers (endpoint to centre conversion from the SVG spec).
+void ArcToBeziers(GeoSink& out, float x0, float y0, float rx, float ry, float rot, bool large, bool sweep, float x1,
+                  float y1) {
+    if (rx == 0 || ry == 0) {
+        out.Line(x0, y0, x1, y1);
+        return;
+    }
+    const double pi = 3.14159265358979323846;
+    double phi = rot * pi / 180.0, c = cos(phi), s = sin(phi);
+    double dx = (x0 - x1) / 2.0, dy = (y0 - y1) / 2.0;
+    double xp = c * dx + s * dy, yp = -s * dx + c * dy;
+    double a = fabs(rx), b = fabs(ry);
+    double l = xp * xp / (a * a) + yp * yp / (b * b);
+    if (l > 1) {
+        a *= sqrt(l);
+        b *= sqrt(l);
+    }
+    double num = a * a * b * b - a * a * yp * yp - b * b * xp * xp;
+    double den = a * a * yp * yp + b * b * xp * xp;
+    double k = den == 0 ? 0 : sqrt(fmax(0.0, num / den)) * (large == sweep ? -1 : 1);
+    double cxp = k * a * yp / b, cyp = -k * b * xp / a;
+    double cx = c * cxp - s * cyp + (x0 + x1) / 2.0, cy = s * cxp + c * cyp + (y0 + y1) / 2.0;
+    double t1 = atan2((yp - cyp) / b, (xp - cxp) / a);
+    double t2 = atan2((-yp - cyp) / b, (-xp - cxp) / a);
+    double delta = t2 - t1;
+    if (sweep && delta < 0) delta += 2 * pi;
+    if (!sweep && delta > 0) delta -= 2 * pi;
+    int segments = (int)ceil(fabs(delta) / (pi / 2.0) - 1e-6);
+    if (segments < 1) segments = 1;
+    double step = delta / segments, h = 4.0 / 3.0 * tan(step / 4.0);
+    double px = x0, py = y0;
+    for (int i = 0; i < segments; i++) {
+        double e1 = t1 + i * step, e2 = e1 + step;
+        double c1x = cos(e1) - h * sin(e1), c1y = sin(e1) + h * cos(e1);
+        double c2x = cos(e2) + h * sin(e2), c2y = sin(e2) - h * cos(e2);
+        auto mapX = [&](double u, double v) { return (float)(cx + c * a * u - s * b * v); };
+        auto mapY = [&](double u, double v) { return (float)(cy + s * a * u + c * b * v); };
+        float ex = mapX(cos(e2), sin(e2)), ey = mapY(cos(e2), sin(e2));
+        out.Bezier((float)px, (float)py, mapX(c1x, c1y), mapY(c1x, c1y), mapX(c2x, c2y), mapY(c2x, c2y), ex, ey);
+        px = ex;
+        py = ey;
+    }
+}
+
+Com<ID2D1PathGeometry> ParseSvgPath(ID2D1Factory* factory, const char* d) {
+    Com<ID2D1PathGeometry> geometry;
+    if (FAILED(factory->CreatePathGeometry(geometry.Put()))) return {};
+    Com<ID2D1GeometrySink> sink;
+    if (FAILED(geometry->Open(sink.Put()))) return {};
+    sink->SetFillMode(D2D1_FILL_MODE_WINDING);
+    GeoSink out{sink.Get()};
+    SvgReader r{d};
+    float x = 0, y = 0, sx = 0, sy = 0, cx = 0, cy = 0;
+    char cmd = 0, prev = 0;
+    for (;;) {
+        r.Skip();
+        if (!*r.p) break;
+        if ((*r.p >= 'a' && *r.p <= 'z') || (*r.p >= 'A' && *r.p <= 'Z')) {
+            cmd = *r.p++;
+        }
+        const bool rel = cmd >= 'a';
+        const float bx = rel ? x : 0, by = rel ? y : 0;
+        bool done = false;
+        switch (cmd | 0x20) {
+            case 'm': {
+                x = bx + r.Num();
+                y = by + r.Num();
+                sx = x;
+                sy = y;
+                out.Move(x, y);
+                cmd = rel ? 'l' : 'L';
+                prev = 'm';
+                continue;
+            }
+            case 'l': {
+                float nx = bx + r.Num(), ny = by + r.Num();
+                out.Line(x, y, nx, ny);
+                x = nx;
+                y = ny;
+                break;
+            }
+            case 'h': {
+                float nx = bx + r.Num();
+                out.Line(x, y, nx, y);
+                x = nx;
+                break;
+            }
+            case 'v': {
+                float ny = by + r.Num();
+                out.Line(x, y, x, ny);
+                y = ny;
+                break;
+            }
+            case 'c': {
+                float x1 = bx + r.Num(), y1 = by + r.Num();
+                float x2 = bx + r.Num(), y2 = by + r.Num();
+                float nx = bx + r.Num(), ny = by + r.Num();
+                out.Bezier(x, y, x1, y1, x2, y2, nx, ny);
+                cx = x2;
+                cy = y2;
+                x = nx;
+                y = ny;
+                prev = 'c';
+                continue;
+            }
+            case 's': {
+                float x1 = prev == 'c' ? 2 * x - cx : x, y1 = prev == 'c' ? 2 * y - cy : y;
+                float x2 = bx + r.Num(), y2 = by + r.Num();
+                float nx = bx + r.Num(), ny = by + r.Num();
+                out.Bezier(x, y, x1, y1, x2, y2, nx, ny);
+                cx = x2;
+                cy = y2;
+                x = nx;
+                y = ny;
+                prev = 'c';
+                continue;
+            }
+            case 'q': {
+                float qx = bx + r.Num(), qy = by + r.Num();
+                float nx = bx + r.Num(), ny = by + r.Num();
+                out.Bezier(x, y, x + 2.0f / 3.0f * (qx - x), y + 2.0f / 3.0f * (qy - y),
+                           nx + 2.0f / 3.0f * (qx - nx), ny + 2.0f / 3.0f * (qy - ny), nx, ny);
+                x = nx;
+                y = ny;
+                break;
+            }
+            case 'a': {
+                float rx = r.Num(), ry = r.Num(), rot = r.Num();
+                bool large = r.Flag() != 0, sweep = r.Flag() != 0;
+                float nx = bx + r.Num(), ny = by + r.Num();
+                ArcToBeziers(out, x, y, rx, ry, rot, large, sweep, nx, ny);
+                x = nx;
+                y = ny;
+                break;
+            }
+            case 'z': {
+                out.Close(true);
+                x = sx;
+                y = sy;
+                out.cx = sx;
+                out.cy = sy;
+                prev = 'z';
+                continue;
+            }
+            default:
+                done = true;  // Unknown command: keep what was parsed.
+        }
+        if (done) break;
+        prev = cmd | 0x20;
+    }
+    out.Close(false);
+    sink->Close();
+    return geometry;
+}
+
+// The icon table's parts as geometries, parsed on first use.
+class IconGeometries {
+public:
+    void Init(ID2D1Factory* factory) {
+        factory_ = factory;
+        D2D1_STROKE_STYLE_PROPERTIES props = D2D1::StrokeStyleProperties(
+            D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND, 10.0f,
+            D2D1_DASH_STYLE_SOLID, 0.0f);
+        factory->CreateStrokeStyle(props, nullptr, 0, stroke_.Put());
+    }
+    void Release() { geos_.clear(); stroke_.Reset(); }
+    static float Width(IconId id, float h) { return kIcons[id].w / kIcons[id].h * h; }
+
+    // Centre (cx, cy), height h. The brush supplies the colour and opacity.
+    void Draw(ID2D1RenderTarget* rt, ID2D1Brush* brush, IconId id, float cx, float cy, float h) {
+        const IconDef& def = kIcons[id];
+        const float k = h / def.h;
+        D2D1_MATRIX_3X2_F saved;
+        rt->GetTransform(&saved);
+        rt->SetTransform(D2D1::Matrix3x2F::Scale(k, k) *
+                         D2D1::Matrix3x2F::Translation(cx - def.w * k / 2.0f, cy - h / 2.0f) * saved);
+        for (int i = 0; i < def.count; i++) {
+            ID2D1PathGeometry* g = Part(id, i);
+            if (!g) continue;
+            if (def.parts[i].fill) rt->FillGeometry(g, brush);
+            if (def.parts[i].stroke > 0) rt->DrawGeometry(g, brush, def.parts[i].stroke, stroke_.Get());
+        }
+        rt->SetTransform(saved);
+    }
+
+private:
+    ID2D1PathGeometry* Part(int icon, int part) {
+        int index = 0;
+        for (int i = 0; i < icon; i++) index += kIcons[i].count;
+        index += part;
+        if ((int)geos_.size() <= index) geos_.resize(index + 1);
+        if (!geos_[index]) geos_[index] = ParseSvgPath(factory_, kIcons[icon].parts[part].d);
+        return geos_[index].Get();
+    }
+    ID2D1Factory* factory_ = nullptr;
+    Com<ID2D1StrokeStyle> stroke_;
+    std::vector<Com<ID2D1PathGeometry>> geos_;
+};
+
+#line 1 "core/layered.inc"
+
+// ---- LayeredSurface: a retained premultiplied DIB drawn with Direct2D and pushed to a layered window ----
+
+// One software DC render target, kept for the life of the surface. Drawing is limited to a dirty
+// rectangle, and only that rectangle is handed to UpdateLayeredWindowIndirect.
+class LayeredSurface {
+public:
+    ~LayeredSurface() { Destroy(); }
+
+    // Sizes the DIB. Contents are lost (all transparent) when the size changes.
+    bool Resize(ID2D1Factory* factory, int w, int h) {
+        if (w <= 0 || h <= 0) return false;
+        if (mem_ && w == w_ && h == h_ && rt_) return true;
+        Destroy();
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = w;
+        bi.bmiHeader.biHeight = -h;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        HDC screen = GetDC(nullptr);
+        mem_ = CreateCompatibleDC(screen);
+        dib_ = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits_, nullptr, 0);
+        ReleaseDC(nullptr, screen);
+        if (!mem_ || !dib_) {
+            Destroy();
+            return false;
+        }
+        old_ = SelectObject(mem_, dib_);
+        w_ = w;
+        h_ = h;
+        // The software target keeps the working set small: the default one loads the GPU driver.
+        D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+            D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+            0, 0, D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE);
+        if (FAILED(factory->CreateDCRenderTarget(&props, rt_.Put()))) {
+            Destroy();
+            return false;
+        }
+        rt_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);  // ClearType is invalid with transparency
+        ++generation_;
+        return true;
+    }
+
+    // Starts drawing: everything outside `dirty` is left alone, everything inside is cleared.
+    ID2D1DCRenderTarget* Begin(const RECT& dirty) {
+        if (!rt_) return nullptr;
+        RECT all{0, 0, w_, h_};
+        if (FAILED(rt_->BindDC(mem_, &all))) return nullptr;
+        rt_->BeginDraw();
+        rt_->PushAxisAlignedClip(D2D1::RectF((float)dirty.left, (float)dirty.top, (float)dirty.right, (float)dirty.bottom),
+                                 D2D1_ANTIALIAS_MODE_ALIASED);
+        rt_->Clear(D2D1::ColorF(0, 0.0f));
+        return rt_.Get();
+    }
+
+    // Returns false if the target was lost and has to be rebuilt by the next Resize.
+    bool End() {
+        rt_->PopAxisAlignedClip();
+        const HRESULT hr = rt_->EndDraw();
+        if (hr == D2DERR_RECREATE_TARGET) {
+            rt_.Reset();
+            return false;
+        }
+        return true;
+    }
+
+    // `pos` is the window's top left on screen.
+    void Present(HWND hwnd, POINT pos, const RECT& dirty, bool whole) {
+        if (!mem_) return;
+        HDC screen = GetDC(nullptr);
+        POINT src{0, 0};
+        SIZE size{w_, h_};
+        BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        RECT rc = dirty;
+        UPDATELAYEREDWINDOWINFO info{};
+        info.cbSize = sizeof(info);
+        info.hdcDst = screen;
+        info.pptDst = &pos;
+        info.psize = &size;
+        info.hdcSrc = mem_;
+        info.pptSrc = &src;
+        info.pblend = &blend;
+        info.dwFlags = ULW_ALPHA;
+        info.prcDirty = whole ? nullptr : &rc;
+        UpdateLayeredWindowIndirect(hwnd, &info);
+        ReleaseDC(nullptr, screen);
+    }
+
+    ID2D1DCRenderTarget* Target() const { return rt_.Get(); }
+    unsigned Generation() const { return generation_; }
+    int Width() const { return w_; }
+    int Height() const { return h_; }
+
+    void Destroy() {
+        rt_.Reset();
+        if (mem_) {
+            if (old_) SelectObject(mem_, old_);
+            DeleteDC(mem_);
+        }
+        if (dib_) DeleteObject(dib_);
+        mem_ = nullptr;
+        dib_ = nullptr;
+        old_ = nullptr;
+        bits_ = nullptr;
+        w_ = h_ = 0;
+    }
+
+private:
+    HDC mem_ = nullptr;
+    HBITMAP dib_ = nullptr;
+    HGDIOBJ old_ = nullptr;
+    void* bits_ = nullptr;
+    int w_ = 0, h_ = 0;
+    unsigned generation_ = 0;
+    Com<ID2D1DCRenderTarget> rt_;
+};
+
+#line 1 "core/text.inc"
+
+// ---- Text: DirectWrite layouts, cached ----
+
+struct TextOpts {
+    const wchar_t* family = nullptr;  // null: the bar's font
+    float size = 0;                   // px, 0: the bar's size
+    float maxW = 1e6f;
+    float maxH = 1e6f;
+    bool ellipsis = false;
+    bool center = false;              // centred both ways inside maxW x maxH
+};
+
+class TextService {
+public:
+    bool Init() {
+        return SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                                             reinterpret_cast<IUnknown**>(factory_.Put())));
+    }
+    // The first installed family of: the user's choice, Segoe UI Variable Text, Segoe UI.
+    void SetFont(const std::wstring& preferred, float sizePx) {
+        family_ = PickFamily(preferred);
+        size_ = sizePx;
+        cache_.clear();
+    }
+    float DefaultSize() const { return size_; }
+
+    Com<IDWriteTextLayout> Layout(const std::wstring& text, const TextOpts& o = {}) {
+        if (!factory_ || text.empty()) return {};
+        const wchar_t* family = o.family ? o.family : family_.c_str();
+        const float size = o.size > 0 ? o.size : size_;
+        wchar_t head[160];
+        swprintf_s(head, L"%ls|%.2f|%.1f|%.1f|%d%d|", family, size, o.maxW, o.maxH, o.ellipsis, o.center);
+        const std::wstring key = std::wstring(head) + text;
+        auto it = cache_.find(key);
+        if (it != cache_.end()) return it->second;
+        if (cache_.size() > 200) cache_.clear();
+        Com<IDWriteTextFormat> fmt;
+        if (FAILED(factory_->CreateTextFormat(family, nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                                              DWRITE_FONT_STRETCH_NORMAL, size, L"", fmt.Put()))) {
+            return {};
+        }
+        Com<IDWriteTextLayout> layout;
+        if (FAILED(factory_->CreateTextLayout(text.c_str(), (UINT32)text.size(), fmt.Get(), o.maxW, o.maxH,
+                                              layout.Put()))) {
+            return {};
+        }
+        layout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        if (o.center) {
+            layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+            layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        } else if (o.maxH < 1e5f) {
+            layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        }
+        if (o.ellipsis) {
+            Com<IDWriteInlineObject> sign;
+            if (SUCCEEDED(factory_->CreateEllipsisTrimmingSign(layout.Get(), sign.Put()))) {
+                DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
+                layout->SetTrimming(&trimming, sign.Get());
+            }
+        }
+        cache_[key] = layout;
+        return layout;
+    }
+
+    // Width including trailing spaces, as the GDI+ build measured it.
+    float Measure(const std::wstring& text) {
+        Com<IDWriteTextLayout> layout = Layout(text);
+        if (!layout) return 0;
+        DWRITE_TEXT_METRICS m{};
+        layout->GetMetrics(&m);
+        return m.widthIncludingTrailingWhitespace;
+    }
+
+    void Draw(ID2D1RenderTarget* rt, const std::wstring& text, float x, float y, ID2D1Brush* brush,
+              const TextOpts& o = {}) {
+        Com<IDWriteTextLayout> layout = Layout(text, o);
+        if (layout) rt->DrawTextLayout(D2D1::Point2F(x, y), layout.Get(), brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+    }
+
+private:
+    std::wstring PickFamily(const std::wstring& preferred) {
+        Com<IDWriteFontCollection> fonts;
+        if (!factory_ || FAILED(factory_->GetSystemFontCollection(fonts.Put(), FALSE))) return L"Segoe UI";
+        auto has = [&](const wchar_t* name) {
+            UINT32 index = 0;
+            BOOL exists = FALSE;
+            return SUCCEEDED(fonts->FindFamilyName(name, &index, &exists)) && exists;
+        };
+        if (!preferred.empty() && has(preferred.c_str())) return preferred;
+        if (has(L"Segoe UI Variable Text")) return L"Segoe UI Variable Text";
+        return L"Segoe UI";
+    }
+    Com<IDWriteFactory> factory_;
+    std::wstring family_ = L"Segoe UI";
+    float size_ = 13;
+    std::unordered_map<std::wstring, Com<IDWriteTextLayout>> cache_;
+};
+
+#line 1 "core/settings.inc"
+
+// ---- Settings: one writer, the UI thread ----
+// WhTool_ModSettingsChanged runs on another thread and only posts WM_APP_SETTINGS. The UI thread then
+// calls LoadSettings. An unset value reads as empty or zero, and that means "use the default".
+
+struct Settings {
+    std::wstring fontFamily;  // empty: Segoe UI Variable Text, then Segoe UI
+    int fontScale = 100;      // percent of the usual text size
+    std::wstring language;    // empty: follow Windows
+};
+
+Settings g_settings;
+
+Settings LoadSettings() {
+    Settings s;
+    if (PCWSTR v = Wh_GetStringSetting(L"fontFamily")) { s.fontFamily = v; Wh_FreeStringSetting(v); }
+    if (PCWSTR v = Wh_GetStringSetting(L"language")) { s.language = v; Wh_FreeStringSetting(v); }
+    const int scale = Wh_GetIntSetting(L"fontScale");
+    s.fontScale = scale >= 50 && scale <= 200 ? scale : 100;
+    return s;
+}
+
+#line 1 "core/loc.inc"
+
+// ---- Loc: strings per language, generated from strings.tsv by build-bar.ps1 ----
+
+constexpr int kLocLangCount = 12;
+const wchar_t* const kLocLangs[kLocLangCount] = { L"en", L"hi", L"zh", L"ja", L"ko", L"de", L"es", L"fr", L"pt", L"ru", L"ar", L"it" };
+struct LocEntry { const wchar_t* key; const wchar_t* text[kLocLangCount]; };
+const LocEntry kLoc[] = {
+    { L"window.title", { L"Top bar", L"", L"", L"", L"", L"", L"", L"", L"", L"", L"", L"" } },
+};
+
+// Language of the current settings: the chosen one, else the Windows display language, else English.
+const wchar_t* Loc(const wchar_t* key) {
+    static std::wstring cachedFor;
+    static int column = 0;
+    std::wstring want = g_settings.language;
+    if (want.empty()) {
+        wchar_t name[LOCALE_NAME_MAX_LENGTH] = {};
+        GetUserDefaultLocaleName(name, LOCALE_NAME_MAX_LENGTH);
+        want = name;
+    }
+    if (want != cachedFor) {
+        cachedFor = want;
+        column = 0;
+        for (int i = 1; i < kLocLangCount; i++) {
+            const size_t n = wcslen(kLocLangs[i]);
+            if (!_wcsnicmp(want.c_str(), kLocLangs[i], n)) { column = i; break; }
+        }
+    }
+    for (const LocEntry& e : kLoc) {
+        if (!wcscmp(e.key, key)) {
+            if (e.text[column] && e.text[column][0]) return e.text[column];
+            return e.text[0];  // English fallback
+        }
+    }
+    return key;
+}
+
 #line 1 "bar/readers.inc"
 // ---- State readers ----
 
@@ -511,6 +1188,12 @@ std::wstring AppInfo(HWND hwnd, std::wstring* outPath) {
     std::wstring result;
     if (QueryFullProcessImageNameW(proc, 0, path, &size)) {
         *outPath = path;
+        static std::unordered_map<std::wstring, std::wstring> names;  // Version info is read from disk: once per file.
+        auto cached = names.find(path);
+        if (cached != names.end()) {
+            CloseHandle(proc);
+            return cached->second;
+        }
         DWORD handle = 0;
         DWORD len = GetFileVersionInfoSizeW(path, &handle);
         if (len) {
@@ -538,6 +1221,7 @@ std::wstring AppInfo(HWND hwnd, std::wstring* outPath) {
                 result.resize(dot);
             }
         }
+        names[path] = result;
     }
     CloseHandle(proc);
     return result;
@@ -1377,7 +2061,26 @@ void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG object, LON
         UpdateFullscreen();
         PostMessageW(g_hwnd, WM_REFRESH_FOREGROUND, 0, 0);
     } else if (event == EVENT_OBJECT_NAMECHANGE && hwnd == GetForegroundWindow()) {
-        PostMessageW(g_hwnd, WM_REFRESH_FOREGROUND, 0, 0);
+        PostMessageW(g_hwnd, WM_REFRESH_TITLE, 0, 0);
+    }
+}
+
+// Name changes are only watched for the foreground window's process, so the rest of the desktop
+// does not wake this thread. Re-hooked on every foreground change.
+void RehookTitle() {
+    DWORD pid = 0;
+    if (HWND fg = GetForegroundWindow()) GetWindowThreadProcessId(fg, &pid);
+    if (pid == g_titlePid && g_titleHook) {
+        return;
+    }
+    if (g_titleHook) {
+        UnhookWinEvent(g_titleHook);
+        g_titleHook = nullptr;
+    }
+    g_titlePid = pid;
+    if (pid) {
+        g_titleHook = SetWinEventHook(EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE, nullptr, OnWinEvent, pid, 0,
+                                      WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     }
 }
 
@@ -1408,19 +2111,26 @@ void SetPillTarget(bool expanded) {
         return;
     }
     g_pillTarget = expanded;
-    g_pillFrom = g_pillT;
-    g_pillStart = GetTickCount64();
-    SetTimer(g_hwnd, kAnimTimer, 15, nullptr);
+    if (expanded) {
+        g_pillSpring.Aim(1.0f, kSpringExpandK, kSpringExpandC);
+    } else {
+        g_pillSpring.Aim(0.0f, kSpringCollapseK, kSpringCollapseC);
+    }
+    g_clock.Wake();
 }
 
+// One display frame: the spring steps by the real time since the last one (QPC, at most 50 ms).
 void StepPill() {
-    const float x = fmin(1.0f, (float)(GetTickCount64() - g_pillStart) / kPillAnimMs);
-    const float eased = 1.0f - (1.0f - x) * (1.0f - x) * (1.0f - x);
-    const float target = g_pillTarget ? 1.0f : 0.0f;
-    g_pillT = g_pillFrom + (target - g_pillFrom) * eased;
-    if (x >= 1.0f) {
-        g_pillT = target;
-        KillTimer(g_hwnd, kAnimTimer);
+    g_clock.Acked();
+    const double now = QpcSeconds();
+    double dt = g_lastFrame ? now - g_lastFrame : 1.0 / 60.0;
+    if (dt > 0.05) dt = 0.05;
+    g_lastFrame = now;
+    g_pillSpring.Step(dt);
+    g_pillT = fminf(fmaxf(g_pillSpring.x, 0.0f), 1.0f);
+    if (g_pillSpring.Settled()) {
+        g_clock.Sleep();
+        g_lastFrame = 0;
     }
     Paint();
     if (g_tracking) {
@@ -1558,7 +2268,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == kClockTimer) {
                 ArmClock();
                 Paint();
-            } else if (wp == kAnimTimer) {
+            } else if (wp == kTitleTimer) {
+                KillTimer(hwnd, kTitleTimer);
+                g_titlePending = false;
+                ReadForeground();
+                Paint();
                 StepPill();
             } else if (wp == kPanelTimer) {
                 StepPanelFollow();
@@ -1630,7 +2344,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ReadNetwork();
             Paint();
             return 0;
+        case WM_APP_FRAME:
+            StepPill();
+            return 0;
+        case WM_APP_SETTINGS:
+            g_settings = LoadSettings();
+            Paint();
+            return 0;
+        case WM_REFRESH_TITLE:
+            if (!g_titlePending) {
+                g_titlePending = true;  // A busy title (a spinner in a terminal) costs one read per 100 ms.
+                SetTimer(hwnd, kTitleTimer, 100, nullptr);
+            }
+            return 0;
         case WM_REFRESH_FOREGROUND:
+            RehookTitle();
             ReadForeground();
             Paint();
             return 0;
@@ -1683,6 +2411,8 @@ DWORD WINAPI BarThread(void*) {
     ChangeWindowMessageFilterEx(g_hwnd, WM_PROFILE_DONE, MSGFLT_ALLOW, nullptr);
     ChangeWindowMessageFilterEx(g_hwnd, WM_COPYDATA, MSGFLT_ALLOW, nullptr);
 
+    g_settings = LoadSettings();
+    g_clock.Start(g_hwnd, WM_APP_FRAME);
     ReadAccent();
     LoadAvatar();
     ReadBattery();
@@ -1694,8 +2424,7 @@ DWORD WINAPI BarThread(void*) {
     NotifyIpInterfaceChange(0, reinterpret_cast<void*>(OnNetChange), nullptr, FALSE, &g_netNotify);
     g_foregroundHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, OnWinEvent, 0, 0,
                                        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    g_titleHook = SetWinEventHook(EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE, nullptr, OnWinEvent, 0, 0,
-                                  WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    RehookTitle();
 
     RegisterBar();
     ArmClock();
@@ -1711,6 +2440,7 @@ DWORD WINAPI BarThread(void*) {
         DispatchMessageW(&msg);
     }
 
+    g_clock.Stop();
     if (g_foregroundHook) UnhookWinEvent(g_foregroundHook);
     if (g_titleHook) UnhookWinEvent(g_titleHook);
     if (g_netNotify) CancelMibChangeNotify2(g_netNotify);
@@ -1742,7 +2472,11 @@ BOOL WhTool_ModInit() {
     return g_thread != nullptr;
 }
 
-void WhTool_ModSettingsChanged() {}
+void WhTool_ModSettingsChanged() {
+    if (g_hwnd) {
+        PostMessageW(g_hwnd, WM_APP_SETTINGS, 0, 0);  // Read on the UI thread, which is the only writer.
+    }
+}
 
 void WhTool_ModUninit() {
     if (g_hwnd) {

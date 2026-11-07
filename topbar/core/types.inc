@@ -1,6 +1,3 @@
-namespace {
-
-using namespace Gdiplus;
 
 
 constexpr wchar_t kClassName[] = L"WindhawkTopBar";
@@ -8,8 +5,11 @@ constexpr UINT WM_APPBAR_CB = WM_APP + 1;
 constexpr UINT WM_REFRESH_NET = WM_APP + 3;
 constexpr UINT WM_REFRESH_FOREGROUND = WM_APP + 4;
 constexpr UINT WM_PROFILE_DONE = WM_APP + 5;  // From start-menu-pop. wParam 1: Start is still open.
+constexpr UINT WM_REFRESH_TITLE = WM_APP + 6;
+constexpr UINT WM_APP_FRAME = WM_APP + 10;     // From the frame clock thread: one per display frame while animating.
+constexpr UINT WM_APP_SETTINGS = WM_APP + 11;  // From the settings callback, which runs on another thread.
 constexpr UINT_PTR kClockTimer = 1;
-constexpr UINT_PTR kAnimTimer = 2;
+constexpr UINT_PTR kTitleTimer = 2;  // Coalesces title changes.
 constexpr UINT_PTR kPanelTimer = 3;
 constexpr UINT_PTR kFullscreenTimer = 4;
 constexpr UINT_PTR kReopenTimer = 5;
@@ -111,6 +111,11 @@ RECT g_pillRect{};
 
 HWINEVENTHOOK g_foregroundHook = nullptr;
 HWINEVENTHOOK g_titleHook = nullptr;
+DWORD g_titlePid = 0;
+bool g_titlePending = false;
+FrameClock g_clock;
+Spring g_pillSpring;
+double g_lastFrame = 0;
 HANDLE g_netNotify = nullptr;
 HPOWERNOTIFY g_powerA = nullptr;
 HPOWERNOTIFY g_powerB = nullptr;

@@ -4,7 +4,7 @@ $s = $PSScriptRoot
 $id = 'local@top-bar'; $ver = '2.1'; $serial = '300021'
 $utf8 = New-Object Text.UTF8Encoding($false)
 # One library list, used for the generated @compilerOptions and for the clang call.
-$libs = @('-lgdiplus','-lgdi32','-luser32','-lshell32','-ladvapi32','-lole32','-lversion','-lwininet','-liphlpapi','-luuid')
+$libs = @('-lgdiplus','-lgdi32','-luser32','-lshell32','-ladvapi32','-lole32','-lversion','-lwininet','-liphlpapi','-luuid','-ld2d1','-ldwrite','-lwindowscodecs','-ldwmapi')
 
 # Unity build: topbar\manifest.txt lists the files, each preceded by a #line so errors name the real file.
 $src = "$s\topbar"
@@ -63,6 +63,25 @@ foreach ($n in $names) {
 $table = "enum IconId { $($enum -join ', ') };`r`nstruct IconPart { bool fill; float stroke; const char* d; };`r`nstruct IconDef { float w; float h; int count; IconPart parts[8]; };`r`nconst IconDef kIcons[] = {`r`n$($defs -join "`r`n")`r`n};"
 if ($core.IndexOf('//@@ICONS@@') -lt 0) { throw 'icon marker not found' }
 $core = $core.Replace('//@@ICONS@@', $table)
+
+# Strings: topbar\strings.tsv (first column the key, then one column per language, English first) becomes the Loc table.
+function CppStr($v) { 'L"' + $v.Replace('\', '\\').Replace('"', '\"') + '"' }
+$rows = New-Object Collections.ArrayList
+$langs = $null
+foreach ($line in [IO.File]::ReadAllLines("$src\strings.tsv", $utf8)) {
+  if (-not $line.Trim()) { continue }
+  if ($line.StartsWith('#')) { $langs = $line.Substring(1).Trim() -split "`t" | Select-Object -Skip 1; continue }
+  $c = $line -split "`t"
+  [void]$rows.Add(@{ key = $c[0]; text = @(for ($i = 1; $i -le $langs.Count; $i++) { if ($i -lt $c.Count) { $c[$i] } else { '' } }) })
+}
+if (-not $langs -or $langs[0] -ne 'en') { throw 'strings.tsv needs a header line starting with # key<TAB>en' }
+$n = $langs.Count
+$loc = "constexpr int kLocLangCount = $n;`r`nconst wchar_t* const kLocLangs[kLocLangCount] = { $(($langs | ForEach-Object { CppStr $_ }) -join ', ') };`r`n"
+$loc += "struct LocEntry { const wchar_t* key; const wchar_t* text[kLocLangCount]; };`r`nconst LocEntry kLoc[] = {`r`n"
+foreach ($r in $rows) { $loc += "    { $(CppStr $r.key), { $(($r.text | ForEach-Object { CppStr $_ }) -join ', ') } },`r`n" }
+$loc += '};'
+if ($core.IndexOf('//@@STRINGS@@') -lt 0) { throw 'strings marker not found' }
+$core = $core.Replace('//@@STRINGS@@', $loc)
 
 # Windhawk's standard tool-mod scaffold, vendored in topbar\scaffold.inc.
 $scaffold = "#line 1 `"scaffold.inc`"`n" + [IO.File]::ReadAllText("$src\scaffold.inc", $utf8)

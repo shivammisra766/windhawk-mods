@@ -7,3 +7,16 @@
 // @include         windhawk.exe
 // @compilerOptions -lgdiplus -lgdi32 -luser32 -lshell32 -ladvapi32 -lole32 -lversion -lwininet -liphlpapi
 // ==/WindhawkMod==
+// ==WindhawkModSettings==
+/*
+- fontFamily: ""
+  $name: Font
+  $description: Leave empty for Segoe UI Variable Text, then Segoe UI.
+- fontScale: 100
+  $name: Text size (percent)
+  $description: 50 to 200. Other values mean 100.
+- language: ""
+  $name: Language
+  $description: A code such as de, fr, hi, ja. Leave empty to follow Windows.
+*/
+// ==/WindhawkModSettings==

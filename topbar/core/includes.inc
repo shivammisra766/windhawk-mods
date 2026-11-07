@@ -8,9 +8,16 @@
 #include <sddl.h>
 #include <wininet.h>
 #include <gdiplus.h>
+#include <d2d1.h>
+#include <dwrite.h>
+#include <wincodec.h>
+#include <dwmapi.h>
 #include <cmath>
 #include <cstdlib>
 #include <cwchar>
+#include <atomic>
+#include <unordered_map>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -20,3 +27,7 @@ extern "C" DWORD WINAPI NotifyIpInterfaceChange(USHORT family, void* callback, v
                                                 BOOLEAN initialNotification, HANDLE* handle);
 extern "C" DWORD WINAPI CancelMibChangeNotify2(HANDLE handle);
 
+
+namespace {
+
+using namespace Gdiplus;

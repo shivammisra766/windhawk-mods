@@ -106,6 +106,12 @@ std::wstring AppInfo(HWND hwnd, std::wstring* outPath) {
     std::wstring result;
     if (QueryFullProcessImageNameW(proc, 0, path, &size)) {
         *outPath = path;
+        static std::unordered_map<std::wstring, std::wstring> names;  // Version info is read from disk: once per file.
+        auto cached = names.find(path);
+        if (cached != names.end()) {
+            CloseHandle(proc);
+            return cached->second;
+        }
         DWORD handle = 0;
         DWORD len = GetFileVersionInfoSizeW(path, &handle);
         if (len) {
@@ -133,6 +139,7 @@ std::wstring AppInfo(HWND hwnd, std::wstring* outPath) {
                 result.resize(dot);
             }
         }
+        names[path] = result;
     }
     CloseHandle(proc);
     return result;

@@ -27,7 +27,26 @@ void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG object, LON
         UpdateFullscreen();
         PostMessageW(g_hwnd, WM_REFRESH_FOREGROUND, 0, 0);
     } else if (event == EVENT_OBJECT_NAMECHANGE && hwnd == GetForegroundWindow()) {
-        PostMessageW(g_hwnd, WM_REFRESH_FOREGROUND, 0, 0);
+        PostMessageW(g_hwnd, WM_REFRESH_TITLE, 0, 0);
+    }
+}
+
+// Name changes are only watched for the foreground window's process, so the rest of the desktop
+// does not wake this thread. Re-hooked on every foreground change.
+void RehookTitle() {
+    DWORD pid = 0;
+    if (HWND fg = GetForegroundWindow()) GetWindowThreadProcessId(fg, &pid);
+    if (pid == g_titlePid && g_titleHook) {
+        return;
+    }
+    if (g_titleHook) {
+        UnhookWinEvent(g_titleHook);
+        g_titleHook = nullptr;
+    }
+    g_titlePid = pid;
+    if (pid) {
+        g_titleHook = SetWinEventHook(EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE, nullptr, OnWinEvent, pid, 0,
+                                      WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     }
 }
 
@@ -58,19 +77,26 @@ void SetPillTarget(bool expanded) {
         return;
     }
     g_pillTarget = expanded;
-    g_pillFrom = g_pillT;
-    g_pillStart = GetTickCount64();
-    SetTimer(g_hwnd, kAnimTimer, 15, nullptr);
+    if (expanded) {
+        g_pillSpring.Aim(1.0f, kSpringExpandK, kSpringExpandC);
+    } else {
+        g_pillSpring.Aim(0.0f, kSpringCollapseK, kSpringCollapseC);
+    }
+    g_clock.Wake();
 }
 
+// One display frame: the spring steps by the real time since the last one (QPC, at most 50 ms).
 void StepPill() {
-    const float x = fmin(1.0f, (float)(GetTickCount64() - g_pillStart) / kPillAnimMs);
-    const float eased = 1.0f - (1.0f - x) * (1.0f - x) * (1.0f - x);
-    const float target = g_pillTarget ? 1.0f : 0.0f;
-    g_pillT = g_pillFrom + (target - g_pillFrom) * eased;
-    if (x >= 1.0f) {
-        g_pillT = target;
-        KillTimer(g_hwnd, kAnimTimer);
+    g_clock.Acked();
+    const double now = QpcSeconds();
+    double dt = g_lastFrame ? now - g_lastFrame : 1.0 / 60.0;
+    if (dt > 0.05) dt = 0.05;
+    g_lastFrame = now;
+    g_pillSpring.Step(dt);
+    g_pillT = fminf(fmaxf(g_pillSpring.x, 0.0f), 1.0f);
+    if (g_pillSpring.Settled()) {
+        g_clock.Sleep();
+        g_lastFrame = 0;
     }
     Paint();
     if (g_tracking) {
@@ -208,7 +234,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == kClockTimer) {
                 ArmClock();
                 Paint();
-            } else if (wp == kAnimTimer) {
+            } else if (wp == kTitleTimer) {
+                KillTimer(hwnd, kTitleTimer);
+                g_titlePending = false;
+                ReadForeground();
+                Paint();
                 StepPill();
             } else if (wp == kPanelTimer) {
                 StepPanelFollow();
@@ -280,7 +310,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ReadNetwork();
             Paint();
             return 0;
+        case WM_APP_FRAME:
+            StepPill();
+            return 0;
+        case WM_APP_SETTINGS:
+            g_settings = LoadSettings();
+            Paint();
+            return 0;
+        case WM_REFRESH_TITLE:
+            if (!g_titlePending) {
+                g_titlePending = true;  // A busy title (a spinner in a terminal) costs one read per 100 ms.
+                SetTimer(hwnd, kTitleTimer, 100, nullptr);
+            }
+            return 0;
         case WM_REFRESH_FOREGROUND:
+            RehookTitle();
             ReadForeground();
             Paint();
             return 0;
@@ -333,6 +377,8 @@ DWORD WINAPI BarThread(void*) {
     ChangeWindowMessageFilterEx(g_hwnd, WM_PROFILE_DONE, MSGFLT_ALLOW, nullptr);
     ChangeWindowMessageFilterEx(g_hwnd, WM_COPYDATA, MSGFLT_ALLOW, nullptr);
 
+    g_settings = LoadSettings();
+    g_clock.Start(g_hwnd, WM_APP_FRAME);
     ReadAccent();
     LoadAvatar();
     ReadBattery();
@@ -344,8 +390,7 @@ DWORD WINAPI BarThread(void*) {
     NotifyIpInterfaceChange(0, reinterpret_cast<void*>(OnNetChange), nullptr, FALSE, &g_netNotify);
     g_foregroundHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, OnWinEvent, 0, 0,
                                        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-    g_titleHook = SetWinEventHook(EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE, nullptr, OnWinEvent, 0, 0,
-                                  WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    RehookTitle();
 
     RegisterBar();
     ArmClock();
@@ -361,6 +406,7 @@ DWORD WINAPI BarThread(void*) {
         DispatchMessageW(&msg);
     }
 
+    g_clock.Stop();
     if (g_foregroundHook) UnhookWinEvent(g_foregroundHook);
     if (g_titleHook) UnhookWinEvent(g_titleHook);
     if (g_netNotify) CancelMibChangeNotify2(g_netNotify);

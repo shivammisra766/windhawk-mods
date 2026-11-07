@@ -5,7 +5,11 @@ BOOL WhTool_ModInit() {
     return g_thread != nullptr;
 }
 
-void WhTool_ModSettingsChanged() {}
+void WhTool_ModSettingsChanged() {
+    if (g_hwnd) {
+        PostMessageW(g_hwnd, WM_APP_SETTINGS, 0, 0);  // Read on the UI thread, which is the only writer.
+    }
+}
 
 void WhTool_ModUninit() {
     if (g_hwnd) {
