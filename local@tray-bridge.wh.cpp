@@ -2,7 +2,7 @@
 // @id              tray-bridge
 // @name            Tray bridge
 // @description     Passes tray icon updates to the top bar, and places the volume and brightness popup over its centre bubble
-// @version         1.8
+// @version         1.9
 // @author          local
 // @include         explorer.exe
 // @architecture    x86-64
@@ -266,8 +266,10 @@ void Replay(HWND bar) {
 
 DWORD WINAPI SenderThread(void*) {
     HANDLE waits[] = {g_stopEvent, g_queueEvent, g_replayEvent};
-    const DWORD count = g_replayEvent ? 3 : 2;
     for (;;) {
+        // Only the Explorer that owns the taskbar answers a replay: the event is auto-reset, so a folder-window
+        // Explorer (which also loads this mod, with an empty table) would otherwise swallow it.
+        const DWORD count = (g_replayEvent && g_tray) ? 3 : 2;
         const DWORD wait = WaitForMultipleObjects(count, waits, FALSE, INFINITE);
         if (wait == WAIT_OBJECT_0 + 2) {
             g_lastBar = FindWindowW(L"WindhawkTopBar", nullptr);
