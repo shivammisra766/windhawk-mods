@@ -86,6 +86,7 @@ void UpdateFullscreen() {
         return;
     }
     g_fullscreen = fullscreen;
+    AlertsFullscreenChanged();
     if (g_hidden) {
         return;  // Nothing is shown; the state is kept for when the bar comes back.
     }

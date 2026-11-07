@@ -1,13 +1,23 @@
 // ==WindhawkMod==
 // @id              tray-bridge
 // @name            Tray bridge
-// @description     Passes tray icon updates to the top bar, which shows the icons
-// @version         1.3
+// @description     Passes tray icon updates to the top bar, and places the volume and brightness popup over its centre bubble
+// @version         1.4
 // @author          local
 // @include         explorer.exe
 // @architecture    x86-64
 // @compilerOptions -luser32
 // ==/WindhawkMod==
+// ==WindhawkModSettings==
+/*
+- osdOverride: 1
+  $name: Place the volume popup over the bar
+  $description: 1 moves the popup onto the bar's centre bubble. 0 only logs the rectangles it asks for.
+- osdUnits: 0
+  $name: Popup rectangle units
+  $description: 0 means device independent pixels (the logged rect divided by the bar's scale), 1 means physical pixels.
+*/
+// ==/WindhawkModSettings==
 
 // Apps register tray icons by sending the taskbar a WM_COPYDATA message. This only looks at
 // those messages on their way past and copies them to the top bar: the taskbar itself carries
@@ -15,6 +25,7 @@
 // before the app is able to destroy it.
 
 #include <windows.h>
+#include <windhawk_utils.h>
 #include <cwchar>
 
 namespace {
@@ -147,11 +158,84 @@ DWORD WINAPI SetupThread(void*) {
     return 0;
 }
 
+
+// ---- Volume and brightness popup ----
+// Windows.Internal.HardwareConfirmator.dll asks HardwareConfirmatorHost::GetPositionRect where to put the
+// popup. When the bar is up, the answer is the bar's centre bubble. The bar publishes the rectangle (screen
+// pixels) as TopBarCentreLeft/Top/Right/Bottom on its window and is told with a registered message that
+// the popup is being shown. If the symbol is missing the hook is simply absent and the registry position
+// (PositionIndex=3, top centre) applies. Every call is logged so the units can be checked.
+struct FRect { float x, y, w, h; };
+using GetPositionRect_t = FRect* (*)(void* self, FRect* result, const FRect* input);
+GetPositionRect_t g_originalGetPositionRect = nullptr;
+UINT g_osdMessage = 0;
+int g_osdCalls = 0;
+
+FRect* GetPositionRect_Hook(void* self, FRect* result, const FRect* input) {
+    FRect* ret = g_originalGetPositionRect(self, result, input);
+    FRect* out = ret ? ret : result;
+    const bool override_ = Wh_GetIntSetting(L"osdOverride") != 0;
+    const bool pixels = Wh_GetIntSetting(L"osdUnits") == 1;
+    HWND bar = FindWindowW(L"WindhawkTopBar", nullptr);
+    HWND alerts = FindWindowW(L"WindhawkTopBarAlerts", nullptr);
+    float scale = 1.0f;
+    bool placed = false;
+    if (out) {
+        const FRect before = *out;
+        const FRect in = input ? *input : FRect{};
+        if (override_ && bar && IsWindowVisible(bar) && !IsHungAppWindow(bar)) {
+            const int l = (int)(INT_PTR)GetPropW(bar, L"TopBarCentreLeft");
+            const int t = (int)(INT_PTR)GetPropW(bar, L"TopBarCentreTop");
+            const int r = (int)(INT_PTR)GetPropW(bar, L"TopBarCentreRight");
+            const int b = (int)(INT_PTR)GetPropW(bar, L"TopBarCentreBottom");
+            if (r > l && b > t) {
+                // Only for the bar's own monitor; the input is the display rect the popup was going to use.
+                if (!pixels) scale = GetDpiForWindow(bar) / 96.0f;
+                out->x = l / scale;
+                out->y = t / scale;
+                out->w = (r - l) / scale;
+                out->h = (b - t) / scale;
+                placed = true;
+            }
+        }
+        if (g_osdCalls++ < 60) {
+            Wh_Log(L"GetPositionRect in=(%.1f,%.1f,%.1f,%.1f) orig=(%.1f,%.1f,%.1f,%.1f) out=(%.1f,%.1f,%.1f,%.1f) scale=%.2f placed=%d",
+                   in.x, in.y, in.w, in.h, before.x, before.y, before.w, before.h, out->x, out->y, out->w, out->h, scale, placed);
+        }
+    }
+    if (alerts) PostMessageW(alerts, g_osdMessage, 1, placed ? 1 : 0);
+    return ret;
+}
+
+DWORD WINAPI OsdThread(void*) {
+    // The DLL may not be loaded yet: wait for it, then hook once. Nothing runs after that.
+    for (int i = 0; i < 600; i++) {
+        HMODULE mod = GetModuleHandleW(L"Windows.Internal.HardwareConfirmator.dll");
+        if (mod) {
+            WindhawkUtils::SYMBOL_HOOK hooks[] = {
+                {{L"private: struct winrt::Windows::Foundation::Rect __cdecl winrt::Windows::Internal::HardwareConfirmator::implementation::HardwareConfirmatorHost::GetPositionRect(struct winrt::Windows::Foundation::Rect const &)"},
+                 reinterpret_cast<void**>(&g_originalGetPositionRect),
+                 reinterpret_cast<void*>(GetPositionRect_Hook), true},
+            };
+            const bool ok = WindhawkUtils::HookSymbols(mod, hooks, 1);
+            Wh_Log(L"HardwareConfirmator loaded, GetPositionRect hook %s", ok && g_originalGetPositionRect ? L"set" : L"NOT set");
+            if (g_originalGetPositionRect) Wh_ApplyHookOperations();
+            return 0;
+        }
+        if (WaitForSingleObject(g_stopEvent, 1000) == WAIT_OBJECT_0) return 0;
+    }
+    Wh_Log(L"HardwareConfirmator never loaded; popup keeps its registry position");
+    return 0;
+}
+HANDLE g_osdThread = nullptr;
+
 }  // namespace
 
 BOOL Wh_ModInit() {
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_setupThread = CreateThread(nullptr, 0, SetupThread, nullptr, 0, nullptr);
+    g_osdMessage = RegisterWindowMessageW(L"Windhawk_TopBar_Osd");
+    g_osdThread = CreateThread(nullptr, 0, OsdThread, nullptr, 0, nullptr);
     return TRUE;
 }
 
@@ -163,6 +247,11 @@ void Wh_ModUninit() {
         WaitForSingleObject(g_setupThread, 5000);
         CloseHandle(g_setupThread);
         g_setupThread = nullptr;
+    }
+    if (g_osdThread) {
+        WaitForSingleObject(g_osdThread, 5000);
+        CloseHandle(g_osdThread);
+        g_osdThread = nullptr;
     }
     if (g_stopEvent) {
         CloseHandle(g_stopEvent);

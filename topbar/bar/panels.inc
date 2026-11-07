@@ -87,7 +87,10 @@ void PlacePanel(HWND hwnd) {
 
 // The region settles shortly after a panel opens or switches mode, and the drop
 // runs during that time, so follow the panel at frame rate, briefly.
+ULONGLONG g_panelDeadline = 0;  // The follow timer never runs past this (a Win+N that was ignored).
+
 void FollowPanel() {
+    g_panelDeadline = GetTickCount64() + 5000;
     g_panelTicks = 26;
     SetTimer(g_hwnd, kPanelTimer, 16, nullptr);
 }
@@ -105,6 +108,12 @@ void SendPanelMode(WPARAM mode) {
 
 void StepPanelFollow() {
     HWND fg = GetForegroundWindow();
+    if (GetTickCount64() > g_panelDeadline) {
+        KillTimer(g_hwnd, kPanelTimer);
+        RemovePropW(g_hwnd, L"TopBarPanelHideTick");
+        g_panelCold = false;
+        return;
+    }
     if (g_panelCold && g_panelTicks <= 1) {
         g_panelTicks = 26;  // A host starting from nothing can take far longer than usual.
     }
@@ -113,6 +122,7 @@ void StepPanelFollow() {
         // so reopen once, now that it can be set beforehand.
         g_panelCold = false;
         g_panelResend = 0;
+        RemovePropW(g_hwnd, L"TopBarPanelHideTick");  // The reopen is the one to show.
         SendWinKey('N');
         g_reopenStage = 0;
         g_reopenTries = 15;
@@ -152,6 +162,8 @@ void TogglePanel(WPARAM mode) {
         return;
     }
     g_panelCold = !g_notificationPanel || !IsWindow(g_notificationPanel);
+    // P7: the cold first cycle is not shown (panel-split replaces the clip with an empty one until the reopen).
+    if (g_panelCold) SetPropW(g_hwnd, L"TopBarPanelHideTick", reinterpret_cast<HANDLE>((UINT_PTR)GetTickCount()));
     g_panelResend = 6;
     SendPanelMode(mode);
     // This panel opens wherever it was left, so put it in place first. The clip only updates

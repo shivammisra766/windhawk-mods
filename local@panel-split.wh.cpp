@@ -1,13 +1,13 @@
 // ==WindhawkMod==
 // @id              panel-split
 // @name            Panel split
-// @description     Lets the top bar open the native notifications or calendar on their own
-// @version         1.9
+// @description     Lets the top bar open the native notifications or calendar on their own, hides toasts for the bar's island, and hides a cold first panel open
+// @version         1.10
 // @author          local
 // @include         ShellExperienceHost.exe
 // @include         ShellHost.exe
 // @architecture    x86-64
-// @compilerOptions -lole32 -loleaut32 -lruntimeobject -lshcore -lwindowsapp -luser32
+// @compilerOptions -lole32 -loleaut32 -lruntimeobject -lshcore -lwindowsapp -luser32 -lgdi32
 // ==/WindhawkMod==
 
 // Both are parts of one native panel. The top bar sends a mode just before opening it,
@@ -95,10 +95,74 @@ bool QuickSettingsPosition(HWND hwnd, const RECT& box, int* x, int* y) {
     return true;
 }
 
+// ---- Toasts: island only ----
+// A toast is a CoreWindow in this host whose title says "New notification". While the bar is alive,
+// answering, flagged TopBarToastsOk and refreshing TopBarToastsTick, the toast is placed off screen
+// (it keeps its life cycle: timeout, sound, move to the bell) and the bar is told with a registered
+// message so it reads the new notification. Any doubt shows the toast normally: no bar, a hung bar,
+// a stale tick, the flag cleared (fullscreen, or no listener permission).
+const wchar_t* const kToastTitles[] = {
+    L"New notification", L"Neue Benachrichtigung", L"Nouvelle notification", L"Nueva notificaci",
+    L"Nuova notifica", L"Nova notifica", L"Nieuwe melding", L"Nowe powiadomienie", L"Yeni bildirim",
+    L"Новое уведомление", L"Нове сповіщення", L"新しい通知", L"新通知", L"새 알림", L"إعلام جديد", L"नई सूचना",
+    L"Ny avisering", L"Ny meddelelse", L"Uusi ilmoitus", L"Nová oznámení", L"Új értesítés", L"Notificare nouă",
+};
+constexpr DWORD kToastTickMaxMs = 45000;
+UINT g_toastMessage = 0;
+int g_toastLogs = 0;
+
+bool IsToastWindow(HWND hwnd) {
+    wchar_t cls[64] = {};
+    GetClassNameW(hwnd, cls, 64);
+    if (wcscmp(cls, L"Windows.UI.Core.CoreWindow")) return false;
+    wchar_t title[128] = {};
+    GetWindowTextW(hwnd, title, 128);
+    if (!title[0]) return false;
+    for (const wchar_t* t : kToastTitles) {
+        if (wcsstr(title, t)) return true;
+    }
+    return false;
+}
+
+bool BarWantsToastsHidden(HWND bar) {
+    if (!bar || IsHungAppWindow(bar)) return false;
+    if (!GetPropW(bar, L"TopBarToastsOk")) return false;
+    const DWORD tick = (DWORD)(UINT_PTR)GetPropW(bar, L"TopBarToastsTick");
+    return GetTickCount() - tick < kToastTickMaxMs;
+}
+
+// ---- Cold first open of the panel ----
+// The bar sets TopBarPanelHideTick before a first open (host not yet warm) and clears it when it
+// reopens. Until then the panel's clip is replaced by an empty one, so the first cycle is not seen.
+constexpr DWORD kPanelHideMaxMs = 2500;
+bool PanelHiddenByBar(HWND hwnd) {
+    wchar_t cls[64] = {};
+    GetClassNameW(hwnd, cls, 64);
+    if (wcscmp(cls, L"Windows.UI.Core.CoreWindow")) return false;
+    HWND bar = FindWindowW(L"WindhawkTopBar", nullptr);
+    if (!bar) return false;
+    const DWORD tick = (DWORD)(UINT_PTR)GetPropW(bar, L"TopBarPanelHideTick");
+    if (!tick) return false;
+    if (GetTickCount() - tick >= kPanelHideMaxMs) return false;
+    return !IsToastWindow(hwnd);
+}
+
 using SetWindowPos_t = decltype(&SetWindowPos);
 SetWindowPos_t g_originalSetWindowPos = nullptr;
 
 BOOL WINAPI SetWindowPos_Hook(HWND hwnd, HWND after, int x, int y, int cx, int cy, UINT flags) {
+    if (!(flags & SWP_HIDEWINDOW) && IsToastWindow(hwnd)) {
+        HWND bar = FindWindowW(L"WindhawkTopBar", nullptr);
+        const bool hide = BarWantsToastsHidden(bar);
+        if (g_toastLogs++ < 20) Wh_Log(L"toast window %p pos (%d,%d) flags %x hide=%d", hwnd, x, y, flags, hide);
+        if (hide) {
+            x = -32000;
+            y = -32000;
+            flags &= ~SWP_NOMOVE;
+        }
+        if (HWND alerts = FindWindowW(L"WindhawkTopBarAlerts", nullptr)) PostMessageW(alerts, g_toastMessage, 0, 0);
+        return g_originalSetWindowPos(hwnd, after, x, y, cx, cy, flags);
+    }
     if (!(flags & SWP_NOMOVE) && IsQuickSettings(hwnd)) {
         RECT box;
         const int kind = GetWindowRgnBox(hwnd, &box);
@@ -114,6 +178,14 @@ SetWindowRgn_t g_originalSetWindowRgn = nullptr;
 
 // The clip arrives just after the show. If its size changed, the position has to follow.
 int WINAPI SetWindowRgn_Hook(HWND hwnd, HRGN region, BOOL redraw) {
+    if (region && PanelHiddenByBar(hwnd)) {
+        if (HRGN empty = CreateRectRgn(0, 0, 0, 0)) {
+            DeleteObject(region);
+            region = empty;
+            Wh_Log(L"cold panel clip hidden");
+            return g_originalSetWindowRgn(hwnd, region, redraw);
+        }
+    }
     const int result = g_originalSetWindowRgn(hwnd, region, redraw);
     if (result && region && IsQuickSettings(hwnd)) {
         RECT box, r;
@@ -307,6 +379,7 @@ BOOL Wh_ModInit() {
     Wh_SetFunctionHook(reinterpret_cast<void*>(SetWindowRgn), reinterpret_cast<void*>(SetWindowRgn_Hook),
                        reinterpret_cast<void**>(&g_originalSetWindowRgn));
     g_message = RegisterWindowMessageW(L"Windhawk_TopBar_PanelMode");
+    g_toastMessage = RegisterWindowMessageW(L"Windhawk_TopBar_ToastShown");
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_setupThread = CreateThread(nullptr, 0, SetupThread, nullptr, 0, nullptr);
     return TRUE;

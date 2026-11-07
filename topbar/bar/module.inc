@@ -117,13 +117,16 @@ void DrawCentredText(const DrawCtx& c, const std::wstring& text, D2D1_RECT_F r, 
     g_text.Draw(c.rt, text, r.left, r.top, c.brush, o);
 }
 
+void AlertsFullscreenChanged();  // topbar/alerts/alerts.inc
+float AlertsDotsReserve();  // Extra pill width (DIP, both sides) while a privacy dot is shown.
+
 // The collapsed content: date and time.
 class ClockModule : public IModule {
 public:
     const wchar_t* Id() const override { return L"clock"; }
     Size2 Measure(View) override {
         const float size = g_settings.dateAbove ? g_text.DefaultSize() * 0.85f : 0.0f;  // Two lines need to be smaller.
-        return {ToDip(StableWidth(ClockText(), size)) + 2 * kPillPadX, kNotchH};
+        return {ToDip(StableWidth(ClockText(), size)) + 2 * kPillPadX + AlertsDotsReserve(), kNotchH};
     }
     void Draw(const DrawCtx& c) override {
         DrawCentredText(c, ClockText(), c.rect, g_settings.dateAbove ? g_text.DefaultSize() * 0.85f : 0.0f);
@@ -131,4 +134,3 @@ public:
 };
 
 ClockModule g_clockModule;
-DemoAlertModule g_demoAlert;

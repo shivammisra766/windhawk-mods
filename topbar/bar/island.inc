@@ -21,7 +21,12 @@ struct AlertItem {
     ULONGLONG seq;
 };
 
+// Provided by the alerts module (topbar/alerts), which is listed after this file.
+void AlertsDrawOverlay(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* brush, float L, float R, float B, float s);
+void AlertsPublishGeometry();
+
 IState g_isState = IState::Collapsed;
+Spring g_cover;         // 0 island shown, 1 faded out under the native volume popup (P5b).
 Spring g_isW, g_isH;    // Body size, pixels.
 Spring g_wing;          // 0 bell and calendar parked, 1 out.
 Spring g_mix;           // Cross-fade between g_viewPrev and g_viewCur.
@@ -92,7 +97,7 @@ void AimIfChanged(Spring& sp, float target, float k, float c) {
 }
 
 bool IslandSettled() {
-    return g_isW.Settled() && g_isH.Settled() && g_wing.Settled() && g_mix.Settled();
+    return g_isW.Settled() && g_isH.Settled() && g_wing.Settled() && g_mix.Settled() && g_cover.Settled();
 }
 
 // Derives everything from the inputs: alerts, hover, tab, panel. Called when an input changes, never per frame.
@@ -108,6 +113,7 @@ void IslandRecompute() {
     IState state = IState::Collapsed;
     if (g_expanded && !dashes.empty()) state = IState::Expanded;
     else if (!g_alerts.empty()) state = IState::Alert;
+    if (g_covered && state == IState::Alert) state = IState::Collapsed;  // Alerts wait under the popup.
     ViewSel want{PillModule(), View::Pill};
     if (state == IState::Expanded) want = {dashes[g_tab], View::Dashboard};
     else if (state == IState::Alert) want = {TopAlert(), View::Alert};
@@ -147,6 +153,7 @@ void IslandRecompute() {
     }
     g_curSize = size;
     g_isState = state;
+    AimIfChanged(g_cover, (g_covered && state != IState::Expanded) ? 1.0f : 0.0f, 900.0f, 60.0f);  // About 80 ms.
 
     // Where the body will stand once settled, for the pointer tests.
     const float cx = (g_isMon.left + g_isMon.right) / 2.0f;
@@ -168,6 +175,7 @@ void IslandRecompute() {
         g_clock.Wake();
     }
     RequestPaint();
+    AlertsPublishGeometry();
 }
 
 void IslandRescale() {  // DPI changed: sizes are pixels, so start over from the new scale.
@@ -181,6 +189,17 @@ void IslandMoved() {  // The bar moved (monitor, work area): the notch follows r
 }
 
 bool ShelfHoldsOpen();  // shelf.inc: a drag is over the bar or the island, or just left it.
+// The native volume or brightness popup is up: fade the island out, pause hover and alerts. If it is
+// already expanded it stays (the popup sits above it).
+void SetCovered(bool covered) {
+    if (g_covered == covered) return;
+    g_covered = covered;
+    if (covered && g_dwelling) {
+        g_dwelling = false;
+        KillTimer(g_hwnd, kDwellTimer);
+    }
+    IslandRecompute();
+}
 
 void SetExpanded(bool expanded) {
     if (g_expanded == expanded) return;
@@ -350,6 +369,7 @@ void IslandPaint() {
         }
     }
     rt->PopAxisAlignedClip();
+    AlertsDrawOverlay(rt, brush, L, R, B, s);
 
     if (!g_isSurface.End()) {
         g_isBrush.Reset();
@@ -360,7 +380,8 @@ void IslandPaint() {
     const int x0 = (g_isMon.left + g_isMon.right) / 2 - stageW / 2;
     g_isCropX = cl;
     g_isBody = {x0 + (LONG)L, g_isMon.top, x0 + (LONG)R, g_isMon.top + (LONG)B};
-    g_isSurface.PresentCrop(g_isHwnd, POINT{x0 + cl, g_isMon.top}, POINT{cl, 0}, SIZE{cr - cl, cb});
+    g_isSurface.PresentCrop(g_isHwnd, POINT{x0 + cl, g_isMon.top}, POINT{cl, 0}, SIZE{cr - cl, cb},
+                            (BYTE)(255.0f * (1.0f - Clamp01(g_cover.x)) + 0.5f));
     if (!IsWindowVisible(g_isHwnd)) ShowWindow(g_isHwnd, SW_SHOWNOACTIVATE);
 }
 

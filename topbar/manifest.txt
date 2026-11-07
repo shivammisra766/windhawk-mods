@@ -21,5 +21,6 @@ bar/panels.inc
 bar/tray.inc
 bar/profile.inc
 bar/island.inc
+alerts/alerts.inc
 bar/window.inc
 bar/tail.inc

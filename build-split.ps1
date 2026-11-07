@@ -1,5 +1,5 @@
 $s = $PSScriptRoot
-$id = 'local@panel-split'; $ver = '1.9'; $serial = '400010'
+$id = 'local@panel-split'; $ver = '1.10'; $serial = '400011'
 $utf8 = New-Object Text.UTF8Encoding($false)
 $t = [IO.File]::ReadAllText("$s\$id.wh.cpp", $utf8)
 $comp = 'C:\Program Files\Windhawk\Compiler'
@@ -11,7 +11,7 @@ if (Test-Path $dll) { Remove-Item $dll }
 $cargs = @('-std=c++23','-O2','-shared','-DUNICODE','-D_UNICODE','-DWINVER=0x0A00','-D_WIN32_WINNT=0x0A00','-D_WIN32_IE=0x0A00','-DNTDDI_VERSION=0x0A000008','-D__USE_MINGW_ANSI_STDIO=0','-DWH_MOD',
   ('"-DWH_MOD_ID=L\"' + $id + '\""'), ('"-DWH_MOD_VERSION=L\"' + $ver + '\""'), ('"' + $lib + '"'),
   '-x','c++','-','-include','windhawk_api.h','-target','x86_64-w64-mingw32','-Wl,--export-all-symbols','-o',('"' + $dll + '"'),
-  '-lole32','-loleaut32','-lruntimeobject','-lshcore','-lwindowsapp','-luser32') -join ' '
+  '-lole32','-loleaut32','-lruntimeobject','-lshcore','-lwindowsapp','-luser32','-lgdi32') -join ' '
 $psi = New-Object Diagnostics.ProcessStartInfo
 $psi.FileName = "$comp\bin\clang++.exe"; $psi.Arguments = $cargs; $psi.WorkingDirectory = $comp
 $psi.UseShellExecute = $false; $psi.RedirectStandardInput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardOutput = $true
