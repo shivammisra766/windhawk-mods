@@ -67,6 +67,7 @@ constexpr float kPanelGap = 8.0f;
 constexpr float kPanelEdge = 8.0f;
 constexpr float kPanelDrop = 10.0f;
 constexpr DWORD kPanelAnchorMs = 1500;
+constexpr DWORD kPanelDropMs = 140;  // The bar's drop; the lift only belongs to its start.
 
 bool IsQuickSettings(HWND hwnd) {
     wchar_t cls[64] = {};
@@ -74,8 +75,15 @@ bool IsQuickSettings(HWND hwnd) {
     return !wcscmp(cls, L"ControlCenterWindow");
 }
 
+DWORD g_quickShowTick = 0;  // When Quick Settings last opened.
+
 // Works out the position under the bar from the panel's clip region. The anchor is what
 // the bar left on its window when an icon was clicked.
+//
+// The lift that starts the bar's drop is only for an opening: a clip that changes later (a page,
+// a list filling in) used to lift the panel again for good. And the top never goes above the work
+// area, under the bar: the lift is taller than the gap, and Quick Settings sizes its content and
+// clip to the room it has, which is the likely cause of its cut-off tiles.
 bool QuickSettingsPosition(HWND hwnd, const RECT& box, int* x, int* y) {
     HWND bar = FindWindowW(L"WindhawkTopBar", nullptr);
     if (!bar || !IsWindowVisible(bar)) {
@@ -84,11 +92,13 @@ bool QuickSettingsPosition(HWND hwnd, const RECT& box, int* x, int* y) {
     RECT barRect;
     GetWindowRect(bar, &barRect);
     const float s = GetDpiForWindow(bar) / 96.0f;
-    *y = barRect.bottom + (int)(kPanelGap * s + 0.5f) - box.top - (int)(kPanelDrop * s);
+    MONITORINFO mi{sizeof(mi)};
+    GetMonitorInfoW(MonitorFromWindow(bar, MONITOR_DEFAULTTOPRIMARY), &mi);
+    const bool opening = GetTickCount() - g_quickShowTick < kPanelDropMs;
+    *y = barRect.bottom + (int)(kPanelGap * s + 0.5f) - box.top - (opening ? (int)(kPanelDrop * s) : 0);
+    if (*y + box.top < mi.rcWork.top) *y = mi.rcWork.top - box.top;
     const DWORD tick = (DWORD)(UINT_PTR)GetPropW(bar, L"TopBarAnchorTick");
     if (GetTickCount() - tick < kPanelAnchorMs) {
-        MONITORINFO mi{sizeof(mi)};
-        GetMonitorInfoW(MonitorFromWindow(bar, MONITOR_DEFAULTTOPRIMARY), &mi);
         const int edge = (int)(kPanelEdge * s + 0.5f);
         int px = (int)(INT_PTR)GetPropW(bar, L"TopBarAnchorX") - (box.left + box.right) / 2;
         if (px + box.right > mi.rcMonitor.right - edge) px = mi.rcMonitor.right - edge - box.right;
@@ -165,6 +175,9 @@ BOOL WINAPI SetWindowPos_Hook(HWND hwnd, HWND after, int x, int y, int cx, int c
         return g_originalSetWindowPos(hwnd, after, x, y, cx, cy, flags);
     }
     if (!(flags & SWP_NOMOVE) && IsQuickSettings(hwnd)) {
+        if ((flags & SWP_SHOWWINDOW) || !IsWindowVisible(hwnd)) {
+            g_quickShowTick = GetTickCount();
+        }
         RECT box;
         const int kind = GetWindowRgnBox(hwnd, &box);
         if (kind != ERROR && kind != NULLREGION) {

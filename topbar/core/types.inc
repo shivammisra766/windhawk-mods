@@ -24,6 +24,7 @@ constexpr UINT_PTR kAlertTimer = 11;   // Next alert deadline.
 constexpr UINT_PTR kFollowTimer = 13;  // Follow-mouse: which monitor the island is on. Exists only in that mode.
 constexpr int kHotkeyId = 1;  // Ctrl+Alt+D
 constexpr UINT_PTR kDropTimer = 14;     // Dwell before a drag over the bar opens the shelf.
+constexpr UINT_PTR kSearchCloseTimer = 15;  // Closes Windows Search left open behind another app.
 constexpr UINT_PTR kModuleTimerBase = 100;  // Module timers: base + slot.
 
 // From the tray-bridge mod in Explorer, which declares the same layout.
@@ -172,9 +173,8 @@ bool g_profileOpen = false;
 bool g_profileAtDown = false;
 UINT g_profileMessage = 0;
 bool g_panelCold = false;
-HWND g_quickReturnTo = nullptr;
-int g_quickCloseStage = 0;
 bool g_quickHadFocus = false;
+bool g_searchHadFocus = false;
 PCWSTR g_quickPendingUri = nullptr;
 int g_quickReopenTries = 0;
 bool g_quickReopenSettled = false;
