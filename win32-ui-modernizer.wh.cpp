@@ -18517,7 +18517,7 @@ static DWORD MenuAcrylicTintColor(bool dark)
     // of almost anything, dark ink is not, so the light surface keeps more of
     // itself -- the same reason the tooltip pair is not symmetric either.
     // These two are the tuning knobs for how translucent a menu reads.
-    constexpr DWORD kDarkTintAlpha = 0xC4;   // Terminal's 77% (user's theme)
+    constexpr DWORD kDarkTintAlpha = 0xB3;   // 70%: Terminal's look, 5% more see-through (user's choice)
     constexpr DWORD kLightTintAlpha = 0xCC;  // 80%
     const COLORREF solid = dark ? RGB(0, 0, 0) : WinUiFloatingSurfaceColor(dark);  // Terminal's black
     const DWORD alpha = dark ? kDarkTintAlpha : kLightTintAlpha;
