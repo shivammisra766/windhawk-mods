@@ -1,0 +1,9 @@
+// ==WindhawkMod==
+// @id              top-bar
+// @name            Top bar
+// @description     Top bar in the Seelen toolbar style with a built-in pill
+// @version         2.1
+// @author          local
+// @include         windhawk.exe
+// @compilerOptions -lgdiplus -lgdi32 -luser32 -lshell32 -ladvapi32 -lole32 -lversion -lwininet -liphlpapi
+// ==/WindhawkMod==

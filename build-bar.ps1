@@ -1,7 +1,21 @@
+param([ValidateSet('both','32','64')][string]$Arch = 'both', [switch]$CheckOnly)
 $s = $PSScriptRoot
+# Version and serial live on this line only; the header, the DLL name and the defines take them from here.
 $id = 'local@top-bar'; $ver = '2.1'; $serial = '300021'
 $utf8 = New-Object Text.UTF8Encoding($false)
-$core = [IO.File]::ReadAllText("$s\topbar-core.cpp", $utf8)
+# One library list, used for the generated @compilerOptions and for the clang call.
+$libs = @('-lgdiplus','-lgdi32','-luser32','-lshell32','-ladvapi32','-lole32','-lversion','-lwininet','-liphlpapi','-luuid')
+
+# Unity build: topbar\manifest.txt lists the files, each preceded by a #line so errors name the real file.
+$src = "$s\topbar"
+$pieces = New-Object Collections.ArrayList
+foreach ($f in (Get-Content "$src\manifest.txt" | Where-Object { $_.Trim() })) {
+  [void]$pieces.Add("#line 1 `"$($f.Replace([string][char]92, '/'))`"`n" + [IO.File]::ReadAllText("$src\$f", $utf8))
+}
+$header = [IO.File]::ReadAllText("$src\mod-header.txt", $utf8)
+$header = $header -replace '(?m)^// @version .*$', "// @version         $ver"
+$header = $header -replace '(?m)^// @compilerOptions .*$', "// @compilerOptions $($libs -join ' ')"
+$core = $header + ($pieces -join "`n")
 
 # Turn the SVGs in icons\ (the same sets Seelen's react-icons names come from) into a C++ table.
 $names = 'wifi','offline','bluetooth','settings','bell','calendar','batfull','bathigh','batmed','batlow','batwarn','bolt'
@@ -50,37 +64,38 @@ $table = "enum IconId { $($enum -join ', ') };`r`nstruct IconPart { bool fill; f
 if ($core.IndexOf('//@@ICONS@@') -lt 0) { throw 'icon marker not found' }
 $core = $core.Replace('//@@ICONS@@', $table)
 
-# Windhawk's standard tool-mod scaffold, taken from the island mod, which uses it unchanged.
-$island = [IO.File]::ReadAllText('C:\ProgramData\Windhawk\ModsSource\dynamic-island-for-windows.wh.cpp', $utf8)
-$marker = 'Windhawk tool mod implementation'
-$at = $island.IndexOf($marker)
-if ($at -lt 0) { throw 'scaffold not found' }
-$lineStart = $island.LastIndexOf("`n", $at) + 1
-$scaffold = $island.Substring($lineStart)
+# Windhawk's standard tool-mod scaffold, vendored in topbar\scaffold.inc.
+$scaffold = "#line 1 `"scaffold.inc`"`n" + [IO.File]::ReadAllText("$src\scaffold.inc", $utf8)
 if ($scaffold -notmatch 'WhTool_ModInit\(\)' -or $scaffold -notmatch 'Wh_ModAfterInit') { throw 'scaffold looks wrong' }
 $t = $core + "`r`n" + $scaffold
 [IO.File]::WriteAllText("$s\$id.wh.cpp", $t, $utf8)
 
 # windhawk.exe is 32-bit, so tool mods load from Mods\32. Build both, like the working tool mods.
+# -CheckOnly stops at a syntax check and writes no DLL; -Arch 32 or 64 builds one architecture.
 $comp = 'C:\Program Files\Windhawk\Compiler'
-foreach ($arch in @(@{ dir = '32'; target = 'i686-w64-mingw32' }, @{ dir = '64'; target = 'x86_64-w64-mingw32' })) {
-  $outDir = "$s\build\$($arch.dir)"
+$archs = @(@{ dir = '32'; target = 'i686-w64-mingw32' }, @{ dir = '64'; target = 'x86_64-w64-mingw32' }) | Where-Object { $Arch -eq 'both' -or $Arch -eq $_.dir }
+$failed = $false
+foreach ($a in $archs) {
+  $outDir = "$s\build\$($a.dir)"
   New-Item -ItemType Directory -Force $outDir | Out-Null
-  $lib = "C:\Program Files\Windhawk\Engine\1.7.3\$($arch.dir)\windhawk.lib"
+  $lib = "C:\Program Files\Windhawk\Engine\1.7.3\$($a.dir)\windhawk.lib"
   $dll = "$outDir\$($id)_$($ver)_$serial.dll"
-  if (Test-Path $dll) { Remove-Item $dll }
-  $cargs = @('-std=c++23','-O2','-shared','-DUNICODE','-D_UNICODE','-DWINVER=0x0A00','-D_WIN32_WINNT=0x0A00','-D_WIN32_IE=0x0A00','-DNTDDI_VERSION=0x0A000008','-D__USE_MINGW_ANSI_STDIO=0','-DWH_MOD',
-    ('"-DWH_MOD_ID=L\"' + $id + '\""'), ('"-DWH_MOD_VERSION=L\"' + $ver + '\""'), ('"' + $lib + '"'),
-    '-x','c++','-','-include','windhawk_api.h','-target',$arch.target,'-Wl,--export-all-symbols','-o',('"' + $dll + '"'),
-    '-lgdiplus','-lgdi32','-luser32','-lshell32','-ladvapi32','-lole32','-lversion','-lwininet','-liphlpapi','-luuid') -join ' '
+  if (-not $CheckOnly -and (Test-Path $dll)) { Remove-Item $dll }
+  $cargs = @('-std=c++23','-O2','-DUNICODE','-D_UNICODE','-DWINVER=0x0A00','-D_WIN32_WINNT=0x0A00','-D_WIN32_IE=0x0A00','-DNTDDI_VERSION=0x0A000008','-D__USE_MINGW_ANSI_STDIO=0','-DWH_MOD',
+    ('"-DWH_MOD_ID=L\"' + $id + '\""'), ('"-DWH_MOD_VERSION=L\"' + $ver + '\""'),
+    '-x','c++','-','-include','windhawk_api.h','-target',$a.target)
+  if ($CheckOnly) { $cargs += '-fsyntax-only' }
+  else { $cargs += @('-shared', ('"' + $lib + '"'), '-Wl,--export-all-symbols', '-o', ('"' + $dll + '"')) + $libs }
   $psi = New-Object Diagnostics.ProcessStartInfo
-  $psi.FileName = "$comp\bin\clang++.exe"; $psi.Arguments = $cargs; $psi.WorkingDirectory = $comp
+  $psi.FileName = "$comp\bin\clang++.exe"; $psi.Arguments = ($cargs -join ' '); $psi.WorkingDirectory = $comp
   $psi.UseShellExecute = $false; $psi.RedirectStandardInput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardOutput = $true
   $p = [Diagnostics.Process]::Start($psi)
   $errTask = $p.StandardError.ReadToEndAsync(); $outTask = $p.StandardOutput.ReadToEndAsync()
   $bytes = $utf8.GetBytes($t); $p.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length); $p.StandardInput.Close()
   $p.WaitForExit()
-  "$($arch.dir)-bit clang exit: $($p.ExitCode)"
-  $e = $errTask.Result; if ($e) { $e.Substring(0, [Math]::Min(3500, $e.Length)) }
-  if (Test-Path $dll) { "built: $([math]::Round((Get-Item $dll).Length/1KB)) KB" } else { 'no dll produced' }
+  "$($a.dir)-bit clang exit: $($p.ExitCode)"
+  if ($p.ExitCode -ne 0) { $failed = $true }
+  $e = $errTask.Result; if ($e) { $e.Substring(0, [Math]::Min(6000, $e.Length)) }
+  if ($CheckOnly) { 'check only, nothing written' } elseif (Test-Path $dll) { "built: $([math]::Round((Get-Item $dll).Length/1KB)) KB" } else { 'no dll produced' }
 }
+if ($failed) { exit 1 }

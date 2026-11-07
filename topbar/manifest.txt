@@ -1,0 +1,12 @@
+core/includes.inc
+core/types.inc
+core/icons.inc
+bar/readers.inc
+core/surface.inc
+bar/bubbles.inc
+bar/placement.inc
+bar/panels.inc
+bar/tray.inc
+bar/profile.inc
+bar/window.inc
+bar/tail.inc
