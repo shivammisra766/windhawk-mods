@@ -16,12 +16,9 @@ RECT g_dirty{};
 bool g_dirtyAny = false;
 bool g_dirtyWhole = false;
 bool g_paintPending = false;
-RECT g_bubbleRect[5]{};  // As last painted: left, (centre: the island's own window), right, bell, calendar.
+constexpr int kBubbles = 3;
+RECT g_bubbleRect[kBubbles]{};  // As last painted: left, (centre: the island's own window), right.
 bool g_isDirty = false;  // The island needs drawing (see island.inc).
-float g_wingT = 0.0f;    // Bell and calendar travel: 0 parked under the notch, 1 at their place.
-float g_wingX[2]{};      // Their place (bar pixels, left edge), valid when g_wingOk.
-bool g_wingOk[2]{};      // False when the title or tray leave no room for the button.
-float g_wingSize = 0;
 float IslandMaxExpandedW();  // DIP, island.inc
 
 enum class CmdKind { Hover, Text, Icon, Avatar, Person, Pixmap, Tray };
@@ -39,8 +36,8 @@ struct Cmd {
 };
 
 std::vector<Cmd> g_cmds;
-D2D1_RECT_F g_bubbles[5]{};  // 0 left, 1 unused, 2 right, 3 bell, 4 calendar
-bool g_hasBubble[5]{};
+D2D1_RECT_F g_bubbles[kBubbles]{};  // 0 left, 1 unused, 2 right
+bool g_hasBubble[kBubbles]{};
 float g_bubbleRadius = 0;
 
 bool EmptyRect(const RECT& r) { return r.right <= r.left || r.bottom <= r.top; }
@@ -221,10 +218,9 @@ void Layout(int W, int H) {
     float drawnRight = left + slot;
     left += slot + gap;
 
-    // The left bubble stops where the bell will stand when the island is fully open, so nothing reflows.
-    const float btn = roundf(kWingSize * s);
+    // The left bubble stops short of the island at its widest, so nothing reflows when it opens.
     const float expHalf = IslandMaxExpandedW() * s / 2.0f + kNotchShoulder * s;
-    const float limit = (W / 2.0f - expHalf) - margin - gap - btn - gap - bpad;
+    const float limit = (W / 2.0f - expHalf) - kBubbleClear * s - bpad;
     auto textItem = [&](const std::wstring& str) {
         const float w = g_text.Measure(str);
         if (left + pad + w < limit) {
@@ -257,36 +253,6 @@ void Layout(int W, int H) {
     }
     g_bubbles[0] = D2D1::RectF(margin, by, drawnRight + bpad, by + bubbleH);
     g_hasBubble[0] = true;
-
-    // Bell and calendar run out from under the notch to stand beside the side bubbles.
-    g_wingSize = btn;
-    const float parked = W / 2.0f - btn / 2.0f;
-    const float wy = floorf((H - btn) / 2.0f);
-    g_wingX[0] = roundf(g_bubbles[0].right + gap);
-    g_wingX[1] = roundf(g_bubbles[2].left - gap - btn);
-    g_wingOk[0] = g_wingX[0] + btn + gap <= W / 2.0f - expHalf;
-    g_wingOk[1] = g_wingX[1] >= W / 2.0f + expHalf + gap;
-    static bool logged[2];
-    for (int i = 0; i < 2; i++) {
-        if (g_wingOk[i] == logged[i]) {
-            logged[i] = !g_wingOk[i];
-            if (!g_wingOk[i]) Wh_Log(L"No room for the %ls button beside the island", i ? L"calendar" : L"bell");
-        }
-    }
-    if (g_wingT > 0.01f) {
-        const float t = g_wingT;
-        for (int i = 0; i < 2; i++) {
-            if (!g_wingOk[i]) continue;
-            const float x = parked + (g_wingX[i] - parked) * t;
-            const int slot = 3 + i;
-            g_bubbles[slot] = D2D1::RectF(x, wy, x + btn, wy + btn);
-            g_hasBubble[slot] = true;
-            if (t > 0.6f) {
-                addHit(x, wy, btn, btn, btn / 2.0f, i ? Action::Calendar : Action::Notifications, i ? H_calendar : H_bell);
-            }
-            iconCmd(i ? I_calendar : I_bell, x + btn / 2.0f, wy + btn / 2.0f, (i ? 14.0f : 16.0f) * s);
-        }
-    }
 }
 
 ID2D1Bitmap* BitmapOf(ID2D1RenderTarget* rt, Pixmap& p) {
@@ -306,11 +272,10 @@ void DrawFrame(ID2D1RenderTarget* rt) {
         brush->SetColor(c);
     };
 
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < kBubbles; i++) {
         if (!g_hasBubble[i]) continue;
-        const float radius = i < 3 ? g_bubbleRadius : g_wingSize / 2.0f;
         color(kSideBg);
-        rt->FillRoundedRectangle(D2D1::RoundedRect(g_bubbles[i], radius, radius), brush);
+        rt->FillRoundedRectangle(D2D1::RoundedRect(g_bubbles[i], g_bubbleRadius, g_bubbleRadius), brush);
     }
 
     for (const Cmd& c : g_cmds) {
@@ -402,7 +367,7 @@ void Paint() {
 
     // Whatever moved or resized: old and new place both need drawing.
     RECT dirty = whole ? RECT{0, 0, W, H} : g_dirty;
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < kBubbles; i++) {
         RECT now{};
         if (g_hasBubble[i]) {
             now = {(LONG)floorf(g_bubbles[i].left) - 1, (LONG)floorf(g_bubbles[i].top) - 1,

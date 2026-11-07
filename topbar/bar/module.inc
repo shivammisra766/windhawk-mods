@@ -120,10 +120,23 @@ void DrawCentredText(const DrawCtx& c, const std::wstring& text, D2D1_RECT_F r, 
 void AlertsFullscreenChanged();  // topbar/alerts/alerts.inc
 float AlertsDotsReserve();  // Extra pill width (DIP, both sides) while a privacy dot is shown.
 
-// The collapsed content: date and time.
+void IslandOpenCalendar();  // island.inc: the native calendar, under the island.
+
+// The collapsed content: date and time. A click opens the calendar.
 class ClockModule : public IModule {
 public:
     const wchar_t* Id() const override { return L"clock"; }
+    bool OnPointer(const PointerEvent& e, View v) override {
+        if (v != View::Pill) return false;
+        if (e.kind == PointerEvent::Leave) down_ = false;
+        if (!e.left) return false;
+        if (e.kind == PointerEvent::Down) down_ = true;
+        if (e.kind == PointerEvent::Up && down_) {
+            down_ = false;
+            IslandOpenCalendar();
+        }
+        return true;
+    }
     Size2 Measure(View) override {
         const float size = g_settings.dateAbove ? g_text.DefaultSize() * 0.85f : 0.0f;  // Two lines need to be smaller.
         return {ToDip(StableWidth(ClockText(), size)) + 2 * kPillPadX + AlertsDotsReserve(), kNotchH};
@@ -131,6 +144,8 @@ public:
     void Draw(const DrawCtx& c) override {
         DrawCentredText(c, ClockText(), c.rect, g_settings.dateAbove ? g_text.DefaultSize() * 0.85f : 0.0f);
     }
+private:
+    bool down_ = false;
 };
 
 ClockModule g_clockModule;

@@ -12,7 +12,9 @@
 
 // Both are parts of one native panel. The top bar sends a mode just before opening it,
 // and this collapses the other part. Windows re-clips the panel to what is left.
-// Opening the panel any other way, such as Win+N, shows both parts as usual.
+// The calendar opens from the island and hangs under it. While the bar runs, opening the
+// panel any other way (the dock's bell, Win+N) shows the notifications alone at their native
+// place above the dock; without the bar, both parts show as usual.
 // Event driven: nothing runs here until the panel opens or the bar sends a mode.
 //
 // These hosts also get "no client area animation" reported to them alone, which removes
@@ -37,6 +39,7 @@ namespace {
 constexpr WPARAM kModeBoth = 0;
 constexpr WPARAM kModeNotifications = 1;
 constexpr WPARAM kModeCalendar = 2;
+constexpr WPARAM kModeNative = 3;  // Internal: what kModeBoth becomes while the bar runs.
 constexpr WPARAM kAttach = 10;
 constexpr WPARAM kDetach = 11;
 
@@ -240,17 +243,36 @@ double NotificationsMaxHeight(FrameworkElement const& root) {
     return inWindow > 0 && inWindow < room ? inWindow : room;
 }
 
+// While the bar runs, the calendar opens only from the island, so a panel opened any other way
+// (the dock's bell, Win+N) is the notifications alone, at their native place above the dock.
+bool BarAlive() {
+    HWND bar = FindWindowW(L"WindhawkTopBar", nullptr);
+    return bar && !IsHungAppWindow(bar);
+}
+
 // Runs on the XAML thread that owns the current window.
-void ApplyMode(WPARAM mode) {
+void ApplyMode(WPARAM mode, bool forBar = true) {
     auto window = Window::Current();
     if (!window) {
         return;
+    }
+    if (mode == kModeBoth && forBar && BarAlive()) {
+        mode = kModeNative;
     }
     auto root = window.Content().try_as<FrameworkElement>();
     auto notifications = FindNamed(root, L"NotificationCenterGrid");
     auto calendar = FindNamed(root, L"CalendarCenterGrid");
     if (notifications) {
         notifications.Visibility(mode == kModeCalendar ? Visibility::Collapsed : Visibility::Visible);
+        if (mode == kModeNative) {
+            // Native place: the window's bottom is above the dock, so keep the card there at its
+            // content's height instead of stretching over the calendar's room. No lift, no cap.
+            notifications.VerticalAlignment(VerticalAlignment::Bottom);
+            notifications.ClearValue(FrameworkElement::MaxHeightProperty());
+            notifications.Translation({0.0f, 0.0f, 0.0f});
+            if (calendar) calendar.Visibility(Visibility::Collapsed);
+            return;
+        }
         // Alone, the card would stretch over the calendar's room and past the screen's bottom.
         // Windows works out the clip from the window's bottom up, so the card stays at the bottom,
         // where it fits its content and scrolls once it fills the room under the bar.
@@ -266,7 +288,7 @@ void ApplyMode(WPARAM mode) {
         notifications.Translation({0.0f, mode == kModeNotifications ? kNotificationsLift : 0.0f, 0.0f});
     }
     if (calendar) {
-        calendar.Visibility(mode == kModeNotifications ? Visibility::Collapsed : Visibility::Visible);
+        calendar.Visibility(mode == kModeNotifications || mode == kModeNative ? Visibility::Collapsed : Visibility::Visible);
     }
 }
 
@@ -292,6 +314,10 @@ void Attach() {
             }
         });
     t_attached = true;
+    // Hooked while already open (a first open from the dock): lay it out now, not at the next open.
+    if (window.Visible()) {
+        ApplyMode(g_mode);
+    }
 }
 
 void Detach() {
@@ -301,7 +327,7 @@ void Detach() {
     if (auto window = Window::Current()) {
         window.VisibilityChanged(t_visibilityToken);
     }
-    ApplyMode(kModeBoth);
+    ApplyMode(kModeBoth, false);  // Unloading: back to Windows' own layout.
     t_attached = false;
 }
 
