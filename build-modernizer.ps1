@@ -1,7 +1,7 @@
 ﻿# Local build of the repo mod win32-ui-modernizer with the user's theme: dark menus use Start's #101010 at 86%.
 # Keeps the mod id, so Windhawk settings stay; a repo update would overwrite it (re-apply the two lines in MenuAcrylicTintColor).
 $s = $PSScriptRoot
-$id = 'win32-ui-modernizer'; $ver = '1.0.4'; $serial = '997776'
+$id = 'win32-ui-modernizer'; $ver = '1.0.4'; $serial = '997777'
 $comp = 'C:\Program Files\Windhawk\Compiler'
 $utf8 = New-Object Text.UTF8Encoding($false)
 $t = [IO.File]::ReadAllText("$s\$id.wh.cpp", $utf8)
