@@ -287,6 +287,7 @@ constexpr UINT_PTR kWingTimer = 12;    // End of the hold that keeps bell and ca
 constexpr UINT_PTR kFollowTimer = 13;  // Follow-mouse: which monitor the island is on. Exists only in that mode.
 constexpr int kHotkeyId = 1;  // Ctrl+Alt+D
 constexpr UINT_PTR kDropTimer = 14;     // Dwell before a drag over the bar opens the shelf.
+constexpr UINT_PTR kSearchCloseTimer = 15;  // Closes Windows Search left open behind another app.
 constexpr UINT_PTR kModuleTimerBase = 100;  // Module timers: base + slot.
 
 // From the tray-bridge mod in Explorer, which declares the same layout.
@@ -428,9 +429,8 @@ bool g_profileOpen = false;
 bool g_profileAtDown = false;
 UINT g_profileMessage = 0;
 bool g_panelCold = false;
-HWND g_quickReturnTo = nullptr;
-int g_quickCloseStage = 0;
 bool g_quickHadFocus = false;
+bool g_searchHadFocus = false;
 PCWSTR g_quickPendingUri = nullptr;
 int g_quickReopenTries = 0;
 bool g_quickReopenSettled = false;
@@ -5376,6 +5376,12 @@ void PlacePanel(HWND hwnd) {
         const float t = 1.0f - (float)elapsed / kPanelDropMs;
         y -= (int)(kPanelDrop * s * t * t * t);
     }
+    // The drop (10) is taller than the gap (8), so it used to lift Quick Settings' top above the
+    // work area, under the bar. Quick Settings sizes its content and clip to the room it has, so
+    // that is the likely cause of its cut-off tiles. Its top now never goes above the bar's bottom.
+    if (IsQuickSettingsWindow(hwnd) && y + box.top < mi.rcWork.top) {
+        y = mi.rcWork.top - box.top;
+    }
     if (x != r.left || y != r.top) {
         SetWindowPos(hwnd, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
     }
@@ -5538,48 +5544,204 @@ bool HasClass(HWND hwnd, PCWSTR name) {
     return !wcscmp(cls, name);
 }
 
+// ---- Closing Quick Settings and Search when the user moves to another app ----
 // Opened from the bar, Quick Settings can appear without focus, and then doesn't close when the
-// user moves to another app. Win+A closes it, though it may first only bring it into focus.
-// Focus then goes back to the app the user moved to.
+// user moves to another app. Search stays open behind the app too, and the Escape that
+// start-menu-pop posts to it is not acted on once it has lost focus. Both close on their own
+// shortcut (Win+A, Win+S), though a press may first only bring the panel into focus, so it is
+// pressed until the panel is gone. Focus then goes back to the app the user moved to.
 //
-// Only once the bar has opened it or seen it focused: its window can count as visible while
-// closed, and Win+A on a closed one would open it, dismissing whatever just took focus.
-void StartQuickClose(HWND movedTo) {
-    if (!g_quickHadFocus) {
+// What used to keep them open:
+// - The press went out 120 ms after the first focus change. During Alt+Tab that is the switcher,
+//   with Alt still held, so Win+Alt+A reached nobody; clicking a dock icon passes the taskbar
+//   first. The close was then marked done, and the real app's focus change was ignored.
+// - Windows ignores the shortcut for a moment after the panel loses focus (see kQuickReopenTimer).
+// - IsWindowVisible stays true for a closed shell window that is only cloaked.
+// So: wait until focus has settled on a real window with no key or button held, check the panel
+// is really up, and retry a few times.
+//
+// Only once the bar has opened the panel or seen it focused: Win+A or Win+S on a closed one
+// would open it, dismissing whatever just took focus.
+
+bool PathOfWindowHas(HWND hwnd, PCWSTR exe) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!proc) {
+        return false;
+    }
+    wchar_t path[MAX_PATH] = {};
+    DWORD size = MAX_PATH;
+    const bool ok = QueryFullProcessImageNameW(proc, 0, path, &size) && wcsstr(path, exe);
+    CloseHandle(proc);
+    return ok;
+}
+
+bool IsSearchWindow(HWND hwnd) {
+    wchar_t cls[64] = {};
+    GetClassNameW(hwnd, cls, 64);
+    return !wcscmp(cls, L"Windows.UI.Core.CoreWindow") && PathOfWindowHas(hwnd, L"\\SearchHost.exe");
+}
+
+bool IsStartMenuWindow(HWND hwnd) {
+    return PathOfWindowHas(hwnd, L"\\StartMenuExperienceHost.exe");
+}
+
+// Closed shell panels are often only cloaked, so visible alone doesn't mean open.
+bool ShellWindowShown(HWND hwnd) {
+    if (!hwnd || !IsWindowVisible(hwnd)) {
+        return false;
+    }
+    DWORD cloaked = 0;
+    return !(SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked);
+}
+
+bool QuickSettingsShown() {
+    return ShellWindowShown(FindWindowW(L"ControlCenterWindow", nullptr));
+}
+
+bool SearchShown() {
+    HWND hwnd = nullptr;
+    while ((hwnd = FindWindowExW(nullptr, hwnd, L"Windows.UI.Core.CoreWindow", nullptr))) {
+        if (PathOfWindowHas(hwnd, L"\\SearchHost.exe") && ShellWindowShown(hwnd)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// A held key would turn the shortcut into another one (Alt+Tab still down), and a held button
+// means a click or drag is still in progress.
+bool UserInputHeld() {
+    static const int kKeys[] = {VK_MENU, VK_CONTROL, VK_SHIFT, VK_LWIN, VK_RWIN, VK_LBUTTON, VK_RBUTTON, VK_MBUTTON};
+    for (int k : kKeys) {
+        if (GetAsyncKeyState(k) & 0x8000) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Focus passes through these on the way to an app (Alt+Tab, Win+Tab).
+bool IsTransientForeground(HWND hwnd) {
+    wchar_t cls[64] = {};
+    GetClassNameW(hwnd, cls, 64);
+    return !wcscmp(cls, L"XamlExplorerHostIslandWindow") || !wcscmp(cls, L"MultitaskingViewFrame") ||
+           !wcscmp(cls, L"TaskSwitcherWnd") || !wcscmp(cls, L"ForegroundStaging");
+}
+
+struct PanelCloser {
+    UINT_PTR timer;
+    WORD key;
+    bool (*shown)();
+    bool (*owns)(HWND);  // The panel's own windows, and any that work as a pair with it.
+    bool* hadFocus;
+    bool closing = false;
+    int waits = 0;
+    int presses = 0;
+    HWND returnTo = nullptr;
+};
+
+bool QuickOwns(HWND hwnd) { return IsQuickSettingsWindow(hwnd); }
+bool SearchOwns(HWND hwnd) { return IsSearchWindow(hwnd) || IsStartMenuWindow(hwnd); }  // Start and Search work as a pair.
+
+PanelCloser g_quickCloser{kQuickCloseTimer, 'A', QuickSettingsShown, QuickOwns, &g_quickHadFocus};
+PanelCloser g_searchCloser{kSearchCloseTimer, 'S', SearchShown, SearchOwns, &g_searchHadFocus};
+
+constexpr UINT kCloseSettleMs = 350;  // After the last focus change; longer than Windows ignores the shortcut.
+constexpr UINT kClosePollMs = 75;
+constexpr int kCloseMaxWaits = 60;    // About 4.5 s of held keys or a switcher still up.
+constexpr int kCloseMaxPresses = 4;
+
+// Each focus change starts the wait again, so it runs once focus has settled.
+void StartPanelClose(PanelCloser& c, HWND movedTo) {
+    if (!*c.hadFocus || c.closing) {
         return;
     }
-    g_quickHadFocus = false;
-    HWND quick = FindWindowW(L"ControlCenterWindow", nullptr);
-    if (quick && IsWindowVisible(quick)) {
-        g_quickReturnTo = movedTo;
-        g_quickCloseStage = 0;
-        SetTimer(g_hwnd, kQuickCloseTimer, 120, nullptr);
+    c.returnTo = movedTo;
+    c.waits = 0;
+    SetTimer(g_hwnd, c.timer, kCloseSettleMs, nullptr);
+}
+
+void CancelPanelClose(PanelCloser& c) {
+    if (!c.closing) {
+        KillTimer(g_hwnd, c.timer);
     }
 }
 
-void StepQuickClose() {
-    HWND quick = FindWindowW(L"ControlCenterWindow", nullptr);
+void FinishPanelClose(PanelCloser& c) {
+    KillTimer(g_hwnd, c.timer);
+    c.closing = false;
+    *c.hadFocus = false;
     HWND fg = GetForegroundWindow();
-    const bool focused = fg && IsQuickSettingsWindow(fg);
-    if (g_quickCloseStage == 0) {
-        if (focused || !quick || !IsWindowVisible(quick)) {
-            KillTimer(g_hwnd, kQuickCloseTimer);  // The user went back to it, or it closed itself.
+    if (c.presses > 0 && c.returnTo && IsWindow(c.returnTo) && fg != c.returnTo && !(fg && c.owns(fg))) {
+        SetForegroundWindow(c.returnTo);
+    }
+    c.presses = 0;
+}
+
+void StepPanelClose(PanelCloser& c) {
+    HWND fg = GetForegroundWindow();
+    if (!c.closing) {
+        if (fg && c.owns(fg)) {
+            KillTimer(g_hwnd, c.timer);  // The user went back to it.
             return;
         }
-        g_quickCloseStage = 1;
-        SendWinKey('A');
+        if (!c.shown()) {
+            KillTimer(g_hwnd, c.timer);  // It closed itself.
+            *c.hadFocus = false;
+            return;
+        }
+        if ((UserInputHeld() || !fg || IsTransientForeground(fg)) && ++c.waits < kCloseMaxWaits) {
+            SetTimer(g_hwnd, c.timer, kClosePollMs, nullptr);
+            return;
+        }
+        if (fg && fg != g_hwnd && fg != g_isHwnd) {
+            c.returnTo = fg;  // Where focus really ended up.
+        }
+        c.closing = true;
+        c.presses = 0;
+        c.waits = 0;
+    }
+    if (!c.shown()) {
+        FinishPanelClose(c);
         return;
     }
-    if (g_quickCloseStage == 1 && focused) {
-        // That only brought it into focus. This one closes it.
-        g_quickCloseStage = 2;
-        SendWinKey('A');
+    if (c.presses >= kCloseMaxPresses) {
+        FinishPanelClose(c);  // Give up rather than keep pressing a shortcut.
         return;
     }
-    KillTimer(g_hwnd, kQuickCloseTimer);
-    g_quickHadFocus = false;
-    if (g_quickReturnTo && IsWindow(g_quickReturnTo) && fg != g_quickReturnTo) {
-        SetForegroundWindow(g_quickReturnTo);
+    if (UserInputHeld() && ++c.waits < kCloseMaxWaits) {
+        SetTimer(g_hwnd, c.timer, kClosePollMs, nullptr);
+        return;
+    }
+    c.presses++;
+    SendWinKey(c.key);
+    SetTimer(g_hwnd, c.timer, 250, nullptr);
+}
+
+void StartQuickClose(HWND movedTo) { StartPanelClose(g_quickCloser, movedTo); }
+void StepQuickClose() { StepPanelClose(g_quickCloser); }
+void StepSearchClose() { StepPanelClose(g_searchCloser); }
+
+// From the foreground hook.
+void OnForegroundForPanels(HWND hwnd) {
+    if (hwnd == g_hwnd || hwnd == g_isHwnd) {
+        return;
+    }
+    if (IsQuickSettingsWindow(hwnd)) {
+        g_quickHadFocus = true;
+        CancelPanelClose(g_quickCloser);
+    } else {
+        StartPanelClose(g_quickCloser, hwnd);
+    }
+    if (IsSearchWindow(hwnd)) {
+        g_searchHadFocus = true;
+        CancelPanelClose(g_searchCloser);
+    } else if (IsStartMenuWindow(hwnd)) {
+        CancelPanelClose(g_searchCloser);  // Start and Search hand focus between them.
+    } else {
+        StartPanelClose(g_searchCloser, hwnd);
     }
 }
 
@@ -7765,11 +7927,7 @@ void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG object, LON
         return;
     }
     if (event == EVENT_SYSTEM_FOREGROUND) {
-        if (IsQuickSettingsWindow(hwnd)) {
-            g_quickHadFocus = true;
-        } else if (hwnd != g_hwnd) {
-            StartQuickClose(hwnd);
-        }
+        OnForegroundForPanels(hwnd);  // Closes Quick Settings or Search left behind by an app switch.
         if (IsShellExperienceWindow(hwnd) || IsQuickSettingsWindow(hwnd)) {
             if (GetTickCount64() - g_anchorTick >= kPanelAnchorMs) {
                 g_quickPage = Action::None;  // Opened from the keyboard, not from an icon.
@@ -8112,6 +8270,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SetTimer(hwnd, kReopenTimer, 500, nullptr);
             } else if (wp == kQuickCloseTimer) {
                 StepQuickClose();
+            } else if (wp == kSearchCloseTimer) {
+                StepSearchClose();
             } else if (wp == kQuickReopenTimer) {
                 HWND fg = GetForegroundWindow();
                 if (fg && IsQuickSettingsWindow(fg) && --g_quickReopenTries > 0) {

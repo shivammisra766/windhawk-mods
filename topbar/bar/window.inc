@@ -3,11 +3,7 @@ void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG object, LON
         return;
     }
     if (event == EVENT_SYSTEM_FOREGROUND) {
-        if (IsQuickSettingsWindow(hwnd)) {
-            g_quickHadFocus = true;
-        } else if (hwnd != g_hwnd) {
-            StartQuickClose(hwnd);
-        }
+        OnForegroundForPanels(hwnd);  // Closes Quick Settings or Search left behind by an app switch.
         if (IsShellExperienceWindow(hwnd) || IsQuickSettingsWindow(hwnd)) {
             if (GetTickCount64() - g_anchorTick >= kPanelAnchorMs) {
                 g_quickPage = Action::None;  // Opened from the keyboard, not from an icon.
@@ -350,6 +346,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SetTimer(hwnd, kReopenTimer, 500, nullptr);
             } else if (wp == kQuickCloseTimer) {
                 StepQuickClose();
+            } else if (wp == kSearchCloseTimer) {
+                StepSearchClose();
             } else if (wp == kQuickReopenTimer) {
                 HWND fg = GetForegroundWindow();
                 if (fg && IsQuickSettingsWindow(fg) && --g_quickReopenTries > 0) {
