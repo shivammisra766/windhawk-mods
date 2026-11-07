@@ -1,8 +1,8 @@
-// ==WindhawkMod==
+﻿// ==WindhawkMod==
 // @id              panel-split
 // @name            Panel split
 // @description     Lets the top bar open the native notifications or calendar on their own, hides toasts for the bar's island, and hides a cold first panel open
-// @version         1.12
+// @version         1.13
 // @author          local
 // @include         ShellExperienceHost.exe
 // @include         ShellHost.exe
@@ -117,8 +117,8 @@ bool QuickSettingsPosition(HWND hwnd, const RECT& box, int* x, int* y) {
 const wchar_t* const kToastTitles[] = {
     L"New notification", L"Neue Benachrichtigung", L"Nouvelle notification", L"Nueva notificaci",
     L"Nuova notifica", L"Nova notifica", L"Nieuwe melding", L"Nowe powiadomienie", L"Yeni bildirim",
-    L"Новое уведомление", L"Нове сповіщення", L"新しい通知", L"新通知", L"새 알림", L"إعلام جديد", L"नई सूचना",
-    L"Ny avisering", L"Ny meddelelse", L"Uusi ilmoitus", L"Nová oznámení", L"Új értesítés", L"Notificare nouă",
+    L"ÐÐ¾Ð²Ð¾Ðµ ÑƒÐ²ÐµÐ´Ð¾Ð¼Ð»ÐµÐ½Ð¸Ðµ", L"ÐÐ¾Ð²Ðµ ÑÐ¿Ð¾Ð²Ñ–Ñ‰ÐµÐ½Ð½Ñ", L"æ–°ã—ã„é€šçŸ¥", L"æ–°é€šçŸ¥", L"ìƒˆ ì•Œë¦¼", L"Ø¥Ø¹Ù„Ø§Ù… Ø¬Ø¯ÙŠØ¯", L"à¤¨à¤ˆ à¤¸à¥‚à¤šà¤¨à¤¾",
+    L"Ny avisering", L"Ny meddelelse", L"Uusi ilmoitus", L"NovÃ¡ oznÃ¡menÃ­", L"Ãšj Ã©rtesÃ­tÃ©s", L"Notificare nouÄƒ",
 };
 constexpr DWORD kToastTickMaxMs = 45000;
 UINT g_toastMessage = 0;

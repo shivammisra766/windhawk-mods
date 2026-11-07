@@ -2,7 +2,7 @@
 // @id              tray-bridge
 // @name            Tray bridge
 // @description     Passes tray icon updates to the top bar, and places the volume and brightness popup over its centre bubble
-// @version         1.7
+// @version         1.8
 // @author          local
 // @include         explorer.exe
 // @architecture    x86-64
