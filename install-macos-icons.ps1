@@ -17,7 +17,8 @@ What it does
      (shell:AppsFolder\<AUMID>, our .ico) in -ShortcutDir for you to pin. With
      -AddToStartMenu they are also copied to Start Menu\Programs\macOS Icons.
      No existing shortcut is touched unless -LnkFallback is given.
-  6. -LnkFallback: also sets IconLocation on existing Start/desktop/dock
+  6. File Explorer shortcuts get the Finder icon via IconLocation (explorer.exe is
+     never redirected). -LnkFallback: also sets IconLocation on existing Start/desktop/dock
      shortcuts of mapped Win32 apps (originals saved in lnk-backup.csv). Not
      needed when the mod works; it is a belt-and-braces option.
 
@@ -27,6 +28,7 @@ Explorer/dock/Start to drop cached icons, sign out or restart Explorer yourself.
 #>
 param(
     [string]$ThemeDir    = 'D:\backups\windhawk-2026-11-06\icon-theme-macos',
+    [string]$ThemeIni    = 'theme.ini',   # or theme-minimal.ini; themePaths[n] gets the .ini path
     [string]$ShortcutDir = 'D:\backups\windhawk-2026-11-06\macos-shortcuts',
     [string]$MapFile     = (Join-Path $PSScriptRoot 'macos-icons\icon-map.psd1'),
     [switch]$AddToStartMenu,
@@ -38,7 +40,9 @@ $ErrorActionPreference = 'Stop'
 
 $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run elevated (Start-Process powershell -Verb RunAs).' }
-if (-not (Test-Path (Join-Path $ThemeDir 'theme.ini'))) { throw "No theme.ini in $ThemeDir - run macos-icons\build-macos-icons.ps1 first." }
+$ThemePath = Join-Path $ThemeDir $ThemeIni
+if (-not (Test-Path $ThemePath)) { throw "No $ThemeIni in $ThemeDir - run macos-icons\build-macos-icons.ps1 first." }
+if (Select-String -LiteralPath $ThemePath -Pattern '^[^;]*\\explorer\.exe=' -Quiet) { throw 'theme redirects explorer.exe - that crash-looped Explorer on 2026-11-08; rebuild.' }
 $map = Import-PowerShellDataFile $MapFile
 
 $modKeyPath = 'SOFTWARE\Windhawk\Engine\Mods\icon-resource-redirect'
@@ -65,7 +69,7 @@ Save-State
 $names = $setKey.GetValueNames()
 $existing = @($names | Where-Object { $_ -match '^themePaths\[(\d+)\]$' } | ForEach-Object {
     [pscustomobject]@{ Name = $_; Index = [int]$Matches[1]; Value = [string]$setKey.GetValue($_) } } | Sort-Object Index)
-if ($existing | Where-Object { $_.Value -ieq $ThemeDir }) {
+if ($existing | Where-Object { $_.Value -ieq $ThemePath -or $_.Value -ieq $ThemeDir }) {
     Write-Host 'Theme path already configured.'
 } else {
     # Use the first empty slot; the mod stops reading at the first empty entry.
@@ -79,8 +83,8 @@ if ($existing | Where-Object { $_.Value -ieq $ThemeDir }) {
     $old  = $setKey.GetValue($name, $null)
     $state.RegistryValues += [ordered]@{ Name = $name; Existed = ($null -ne $old); Old = $old }
     Save-State
-    $setKey.SetValue($name, $ThemeDir, 'String')
-    Write-Host "Set $name = $ThemeDir"
+    $setKey.SetValue($name, $ThemePath, 'String')
+    Write-Host "Set $name = $ThemePath"
 }
 
 # --- 3. ACL for AppContainer readers ---------------------------------------
@@ -139,10 +143,30 @@ foreach ($p in $map.Packaged) {
 }
 Save-State
 
-# --- 6. optional: IconLocation on existing Win32 shortcuts -----------------
+# --- 6. shortcut icons -----------------------------------------------------
+# Always: LnkIcons (File Explorer - explorer.exe must not be redirected), only on
+# shortcuts whose IconLocation is still the stock one. -LnkFallback: also mapped Win32 apps.
+$csv = Join-Path $backup 'lnk-backup.csv'
+$state.LnkBackup = $csv; Save-State
+$lnkDirs = @("$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar",
+             [Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('CommonPrograms'),
+             [Environment]::GetFolderPath('DesktopDirectory'), [Environment]::GetFolderPath('CommonDesktopDirectory')) | Select-Object -Unique
+$lnkRows = [System.Collections.Generic.List[object]]::new()
+foreach ($li in $map.LnkIcons) {
+    $ico = Join-Path $ThemeDir "ico\$($li.Svg).ico"
+    if (-not (Test-Path $ico)) { Write-Warning "no icon for $($li.Name)"; continue }
+    foreach ($d in $lnkDirs) {
+        foreach ($f in Get-ChildItem -LiteralPath $d -Filter $li.Match -Recurse -ErrorAction SilentlyContinue) {
+            $l = $wsh.CreateShortcut($f.FullName)
+            if ($l.IconLocation -ine $li.IconLocation) { Write-Host "left alone (custom icon): $($f.FullName)"; continue }
+            $lnkRows.Add([pscustomobject]@{ Path = $f.FullName; IconLocation = $l.IconLocation; LastWriteTimeUtc = $f.LastWriteTimeUtc.ToString('o') })
+            $lnkRows | Export-Csv -NoTypeInformation -Encoding UTF8 $csv   # saved before each change
+            $l.IconLocation = "$ico,0"; $l.Save()
+            Write-Host "icon set: $($f.FullName)"
+        }
+    }
+}
 if ($LnkFallback) {
-    $csv = Join-Path $backup 'lnk-backup.csv'
-    $state.LnkBackup = $csv; Save-State
     $exeToIco = @{}
     foreach ($t in $map.Win32) {
         $exp = [Environment]::ExpandEnvironmentVariables($t.Path)
@@ -150,10 +174,7 @@ if ($LnkFallback) {
             foreach ($f in @(Get-ChildItem -Path $exp -ErrorAction SilentlyContinue)) { $exeToIco[$f.FullName.ToUpper()] = Join-Path $ThemeDir "ico\$($t.Svg).ico" }
         }
     }
-    $dirs = @("$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar",
-              [Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('CommonPrograms'),
-              [Environment]::GetFolderPath('DesktopDirectory'), [Environment]::GetFolderPath('CommonDesktopDirectory'))
-    $rows = foreach ($d in $dirs | Select-Object -Unique) {
+    foreach ($d in $lnkDirs) {
         foreach ($f in Get-ChildItem -LiteralPath $d -Filter *.lnk -Recurse -ErrorAction SilentlyContinue) {
             if ($state.Shortcuts -contains $f.FullName) { continue }
             $l = $wsh.CreateShortcut($f.FullName)
@@ -162,15 +183,14 @@ if ($LnkFallback) {
             if (-not $exeToIco.ContainsKey($key)) { continue }
             # Shortcuts pointing at a secondary icon (e.g. Sticky Notes -> joticon.exe,5) keep theirs.
             if ($l.IconLocation -match ',(\d+)$' -and [int]$Matches[1] -gt 1) { continue }
-            $row = [pscustomobject]@{ Path = $f.FullName; IconLocation = $l.IconLocation; LastWriteTimeUtc = $f.LastWriteTimeUtc.ToString('o') }
+            $lnkRows.Add([pscustomobject]@{ Path = $f.FullName; IconLocation = $l.IconLocation; LastWriteTimeUtc = $f.LastWriteTimeUtc.ToString('o') })
+            $lnkRows | Export-Csv -NoTypeInformation -Encoding UTF8 $csv
             $l.IconLocation = "$($exeToIco[$key]),0"
             $l.Save()
-            $row
         }
     }
-    $rows | Export-Csv -NoTypeInformation -Encoding UTF8 $csv
-    Write-Host "Changed IconLocation on $(@($rows).Count) shortcut(s); originals in $csv"
 }
+Write-Host "Changed IconLocation on $($lnkRows.Count) shortcut(s); originals in $csv"
 
 if ($RefreshIconCache) { & "$env:SystemRoot\System32\ie4uinit.exe" -show }
 

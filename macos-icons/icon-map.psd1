@@ -13,7 +13,6 @@
 #   with our .ico; nothing existing is changed.
 @{
     Win32 = @(
-        @{ Name = 'File Explorer';  Svg = 'file-manager';        Path = '%SystemRoot%\explorer.exe';                                         Indexes = @(0) }
         @{ Name = 'Edge';           Svg = 'microsoft-edge';      Path = '%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe';        Indexes = @(0) }
         @{ Name = 'Edge (pin .ico)';Svg = 'microsoft-edge';      Path = '%LOCALAPPDATA%\Microsoft\Edge\User Data\*\Edge Profile.ico';       Indexes = @(0) }
         @{ Name = 'Brave';          Svg = 'brave';               Path = '%ProgramFiles%\BraveSoftware\Brave-Browser\Application\brave.exe'; Indexes = @(0) }
@@ -47,6 +46,17 @@
         @{ Name = 'Character Map';  Svg = 'accessories-character-map'; Path = '%SystemRoot%\System32\charmap.exe';                          Indexes = @(0) }
         @{ Name = 'Command Prompt'; Svg = 'terminal';            Path = '%SystemRoot%\System32\cmd.exe';                                    Indexes = @(0) }
     )
+    # Never redirect explorer.exe itself: it is the shell's own module, so every
+    # icon/string/menu explorer loads from itself would go through the redirect
+    # (2026-11-08: explorer crash loop with explorer.exe in theme.ini).
+    # File Explorer gets its icon through its shortcuts instead (IconLocation,
+    # originals backed up by the install script).
+    LnkIcons = @(
+        @{ Name = 'File Explorer'; Svg = 'file-manager'; Match = 'File Explorer.lnk'; IconLocation = '%windir%\explorer.exe,0' }
+    )
+    # Small, low-risk subset for the first test (theme-minimal.ini): apps that are
+    # not running inside explorer and not shell modules.
+    Minimal = @('VS Code', 'Mattermost', 'VLC')
     Packaged = @(
         @{ Name = 'Microsoft Store';  Svg = 'softwarecenter';       Aumid = 'Microsoft.WindowsStore_8wekyb3d8bbwe!App' }
         @{ Name = 'Terminal';         Svg = 'terminal';             Aumid = 'Microsoft.WindowsTerminal_8wekyb3d8bbwe!App' }

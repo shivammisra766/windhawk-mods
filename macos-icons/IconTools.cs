@@ -108,14 +108,14 @@ public static class MacIconTools
     }
 
     // Returns the image entries (sizes ascending) for one source PNG.
-    // Sizes <= 48 are stored as DIBs (widest compatibility), larger ones as PNG.
+    // Like Windows' own icons and the macOSx theme: 32bpp DIBs below 256, PNG only at 256.
     public static List<KeyValuePair<int, byte[]>> MakeEntries(string pngPath, int[] sizes)
     {
         var list = new List<KeyValuePair<int, byte[]>>();
         using (var src = Image.FromFile(pngPath))
             foreach (int s in sizes)
                 using (var b = Resize(src, s))
-                    list.Add(new KeyValuePair<int, byte[]>(s, s <= 48 ? DibEntry(b) : PngEntry(b)));
+                    list.Add(new KeyValuePair<int, byte[]>(s, s < 256 ? DibEntry(b) : PngEntry(b)));
         return list;
     }
 
@@ -158,20 +158,71 @@ public static class MacIconTools
         return list;
     }
 
-    // Copies stubDll to dllPath and writes the .ico as RT_ICON entries plus one
-    // RT_GROUP_ICON per requested group name ("#123" = integer id), all sharing the images.
-    public static void WriteResourceDll(string stubDll, string icoPath, string[] groupNames, string dllPath)
+    [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern IntPtr FindResourceEx(IntPtr h, IntPtr type, IntPtr name, ushort lang);
+    [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern IntPtr FindResourceEx(IntPtr h, IntPtr type, string name, ushort lang);
+    [DllImport("kernel32", SetLastError = true)]
+    static extern IntPtr LoadResource(IntPtr h, IntPtr res);
+    [DllImport("kernel32", SetLastError = true)]
+    static extern IntPtr LockResource(IntPtr g);
+    [DllImport("kernel32", SetLastError = true)]
+    static extern uint SizeofResource(IntPtr h, IntPtr res);
+    delegate bool EnumResLangProc(IntPtr hModule, IntPtr type, IntPtr name, ushort lang, IntPtr param);
+    [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool EnumResourceLanguages(IntPtr hModule, IntPtr type, IntPtr name, EnumResLangProc proc, IntPtr param);
+    [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool EnumResourceLanguages(IntPtr hModule, IntPtr type, string name, EnumResLangProc proc, IntPtr param);
+
+    // Language id and entry sizes of one icon group of an existing PE ("#123" = integer id).
+    // Returns null if the group does not exist. Result[0] = lang, the rest = sizes.
+    public static int[] GetGroupInfo(string path, string groupName)
+    {
+        IntPtr h = LoadLibraryEx(path, IntPtr.Zero, LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+        if (h == IntPtr.Zero) return null;
+        try
+        {
+            bool isId = groupName.StartsWith("#");
+            IntPtr idPtr = isId ? (IntPtr)int.Parse(groupName.Substring(1)) : IntPtr.Zero;
+            ushort lang = 0; bool found = false;
+            EnumResLangProc cb = (m, t, n, l, p) => { if (!found) { lang = l; found = true; } return true; };
+            if (isId) EnumResourceLanguages(h, RT_GROUP_ICON, idPtr, cb, IntPtr.Zero);
+            else EnumResourceLanguages(h, RT_GROUP_ICON, groupName, cb, IntPtr.Zero);
+            if (!found) return null;
+            IntPtr res = isId ? FindResourceEx(h, RT_GROUP_ICON, idPtr, lang) : FindResourceEx(h, RT_GROUP_ICON, groupName, lang);
+            if (res == IntPtr.Zero) return null;
+            uint len = SizeofResource(h, res);
+            IntPtr p0 = LockResource(LoadResource(h, res));
+            var buf = new byte[len];
+            Marshal.Copy(p0, buf, 0, (int)len);
+            int count = BitConverter.ToUInt16(buf, 4);
+            var result = new List<int> { lang };
+            for (int i = 0; i < count && 6 + i * 14 + 14 <= len; i++)
+            {
+                int w = buf[6 + i * 14];
+                result.Add(w == 0 ? 256 : w);
+            }
+            return result.ToArray();
+        }
+        finally { FreeLibrary(h); }
+    }
+
+    // Writes one RT_ICON per size (rendered from pngPath) plus one RT_GROUP_ICON per
+    // requested group ("#123" = integer id) in the given language, all sharing the images.
+    public static void WriteResourceDll(string stubDll, string pngPath, int[] sizes, string[] groupNames, int[] langs, string dllPath)
     {
         File.Copy(stubDll, dllPath, true);
-        var e = ReadIco(icoPath);
+        var e = MakeEntries(pngPath, sizes);
         IntPtr h = BeginUpdateResource(dllPath, false);
         if (h == IntPtr.Zero) throw new System.ComponentModel.Win32Exception();
         bool ok = false;
         try
         {
-            for (int i = 0; i < e.Count; i++)
-                if (!UpdateResource(h, RT_ICON, (IntPtr)(i + 1), 0, e[i].Value, (uint)e[i].Value.Length))
-                    throw new System.ComponentModel.Win32Exception();
+            var usedLangs = new HashSet<int>(langs);
+            foreach (int lg in usedLangs)
+                for (int i = 0; i < e.Count; i++)
+                    if (!UpdateResource(h, RT_ICON, (IntPtr)(i + 1), (ushort)lg, e[i].Value, (uint)e[i].Value.Length))
+                        throw new System.ComponentModel.Win32Exception();
             byte[] grp;
             using (var ms = new MemoryStream())
             using (var w = new BinaryWriter(ms))
@@ -186,11 +237,12 @@ public static class MacIconTools
                 }
                 grp = ms.ToArray();
             }
-            foreach (var name in groupNames)
+            for (int gi = 0; gi < groupNames.Length; gi++)
             {
+                string name = groupNames[gi]; ushort lg = (ushort)langs[gi];
                 bool r = name.StartsWith("#")
-                    ? UpdateResource(h, RT_GROUP_ICON, (IntPtr)int.Parse(name.Substring(1)), 0, grp, (uint)grp.Length)
-                    : UpdateResource(h, RT_GROUP_ICON, name, 0, grp, (uint)grp.Length);
+                    ? UpdateResource(h, RT_GROUP_ICON, (IntPtr)int.Parse(name.Substring(1)), lg, grp, (uint)grp.Length)
+                    : UpdateResource(h, RT_GROUP_ICON, name, lg, grp, (uint)grp.Length);
                 if (!r) throw new System.ComponentModel.Win32Exception();
             }
             ok = true;
