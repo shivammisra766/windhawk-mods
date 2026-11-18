@@ -1,9 +1,9 @@
-$s = $PSScriptRoot
-$id = 'local@start-menu-pop'; $ver = '2.4'
+﻿$s = $PSScriptRoot
+$id = 'local@start-menu-pop'; $ver = '2.5'
 $comp = 'C:\Program Files\Windhawk\Compiler'
 $lib = 'C:\Program Files\Windhawk\Engine\1.7.3\64\windhawk.lib'
 New-Item -ItemType Directory -Force "$s\build\64" | Out-Null
-$dll = "$s\build\64\$($id)_$($ver)_200018.dll"
+$dll = "$s\build\64\$($id)_$($ver)_200019.dll"
 if (Test-Path $dll) { Remove-Item $dll }
 $utf8 = New-Object Text.UTF8Encoding($false)
 $t = [IO.File]::ReadAllText("$s\$id.wh.cpp", $utf8)

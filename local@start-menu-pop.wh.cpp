@@ -2,7 +2,7 @@
 // @id              start-menu-pop
 // @name            Start menu pop
 // @description     Pops Start out of the dock, and eases the search page into place
-// @version         2.4
+// @version         2.5
 // @author          local
 // @include         StartMenuExperienceHost.exe
 // @include         SearchHost.exe
