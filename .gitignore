@@ -2,3 +2,7 @@ build/
 *.dll
 *-result.txt
 
+
+*.exe
+*.pdb
+*.dmp
