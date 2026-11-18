@@ -167,6 +167,7 @@ void SetPinned(bool pin) {
     g_pinned = pin;
     Wh_SetIntValue(L"pinned", pin ? 1 : 0);
     if (pin) SetExpanded(true);  // Does nothing while covered or in fullscreen; the pin still stands.
+    IslandRecompute();  // Starts or stops the zone poll, which only an unpinned island needs.
 }
 
 void ShowBarMenu() {

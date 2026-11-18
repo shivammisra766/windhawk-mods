@@ -26,6 +26,7 @@ void OnTrayMessage(const BarTrayMessage& m) {
     }
     HWND hwnd = reinterpret_cast<HWND>((UINT_PTR)m.hwnd);
     TrayIcon* icon = FindTrayIcon(m, hwnd);
+    bool drawn = true;  // A tooltip or callback update changes nothing on screen: no repaint for it.
     if (m.message == NIM_DELETE) {
         if (icon) {
             delete icon->pix;
@@ -39,6 +40,8 @@ void OnTrayMessage(const BarTrayMessage& m) {
             g_tray.emplace_back();
             icon = &g_tray.back();
             icon->uid = ++g_trayUid;
+        } else {
+            drawn = false;
         }
         if (hwnd) {
             icon->hwnd = hwnd;
@@ -56,19 +59,23 @@ void OnTrayMessage(const BarTrayMessage& m) {
             icon->callback = m.callback;
         }
         if ((m.flags & NIF_STATE) && (m.stateMask & NIS_HIDDEN)) {
-            icon->hidden = (m.state & NIS_HIDDEN) != 0;
+            const bool hidden = (m.state & NIS_HIDDEN) != 0;
+            if (hidden != icon->hidden) drawn = true;
+            icon->hidden = hidden;
         }
         if ((m.flags & NIF_ICON) && m.icon) {
             if (Pixmap* bitmap = PixmapFromIcon(reinterpret_cast<HICON>((UINT_PTR)m.icon))) {
                 delete icon->pix;
                 icon->pix = bitmap;
+                drawn = true;
             }
         }
     } else {
         return;
     }
+    const size_t before = g_tray.size();
     RemoveDeadTrayIcons();
-    InvalidateAll();
+    if (drawn || g_tray.size() != before) InvalidateAll();
 }
 
 // Passes a click to the app in the form it asked for, as the taskbar would.

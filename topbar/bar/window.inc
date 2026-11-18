@@ -91,9 +91,10 @@ void FollowTick() {
 }
 
 // The monitor choice changed (settings) or a display was added or removed.
+// With one display there is nowhere to follow to, so the poll only runs with two or more.
 void ApplyMonitor() {
     PlaceBar();
-    if (g_settings.monitor == -1) SetTimer(g_hwnd, kFollowTimer, 250, nullptr);
+    if (g_settings.monitor == -1 && GetSystemMetrics(SM_CMONITORS) > 1) SetTimer(g_hwnd, kFollowTimer, 250, nullptr);
     else KillTimer(g_hwnd, kFollowTimer);
 }
 
@@ -380,10 +381,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ArmClock();
             InvalidateAll();
             return 0;
-        case WM_REFRESH_NET:
+        case WM_REFRESH_NET: {
+            const bool before = g_connected;  // Interface changes (addresses, metrics) mostly leave this as it was.
             ReadNetwork();
-            InvalidateAll();
+            if (g_connected != before) InvalidateAll();
             return 0;
+        }
         case WM_APP_FRAME:
             StepFrame();
             return 0;

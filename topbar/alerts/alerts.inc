@@ -19,6 +19,7 @@ constexpr UINT_PTR kAlTick = 1, kAlHeartbeat = 2, kAlClipboard = 3, kAlOsd = 4, 
 std::atomic<HWND> g_alHwnd{nullptr};
 HANDLE g_alStop = nullptr;
 HANDLE g_alWake = nullptr;  // Auto-reset: a toast appeared, read the notification list.
+HANDLE g_alBtWake = nullptr;  // Auto-reset: a Bluetooth battery job was queued.
 UINT g_alMsgToast = 0, g_alMsgOsd = 0;
 std::atomic<bool> g_alHookSeen{false};
 wunm::UserNotificationListener g_alListener{nullptr};
@@ -1058,6 +1059,7 @@ DWORD WINAPI AlBtThread(void*) {
                     if (dup) return;
                     m.btJobs_.push_back({id, AlBtAddress(id), le, 0, now + 300});
                 }
+                SetEvent(g_alBtWake);
                 g_services.Post([id, name] {
                     AItem it;
                     it.kind = AK::Bluetooth;
@@ -1104,7 +1106,20 @@ DWORD WINAPI AlBtThread(void*) {
         auto w1 = make(wbt::BluetoothDevice::GetDeviceSelectorFromConnectionStatus(wbt::BluetoothConnectionStatus::Connected), false);
         auto w2 = make(wbt::BluetoothLEDevice::GetDeviceSelectorFromConnectionStatus(wbt::BluetoothConnectionStatus::Connected), true);
         // One loop serves the battery retries (6 tries, 1.5 s apart: the level appears late) and waits on the stop event.
-        while (WaitForSingleObject(g_alStop, 250) == WAIT_TIMEOUT) {
+        // With nothing queued it sleeps until a job is; a timeout only runs up to the next due retry.
+        HANDLE waits[2] = {g_alStop, g_alBtWake};
+        DWORD timeout = INFINITE;
+        auto nextTimeout = [&m] {
+            std::lock_guard lock(m.btLock_);
+            if (m.btJobs_.empty()) return (DWORD)INFINITE;
+            ULONGLONG due = m.btJobs_[0].next;
+            for (const AlBtJob& j : m.btJobs_) due = std::min(due, j.next);
+            const ULONGLONG t = GetTickCount64();
+            return due > t ? (DWORD)std::min<ULONGLONG>(due - t, 60000) : (DWORD)0;
+        };
+        for (;;) {
+            const DWORD w = WaitForMultipleObjects(2, waits, FALSE, timeout);
+            if (w == WAIT_OBJECT_0 || w == WAIT_FAILED) break;
             AlBtJob job{};
             bool have = false;
             const ULONGLONG now = GetTickCount64();
@@ -1114,7 +1129,7 @@ DWORD WINAPI AlBtThread(void*) {
                     if (m.btJobs_[i].next <= now) { job = m.btJobs_[i]; m.btJobs_.erase(m.btJobs_.begin() + i); have = true; break; }
                 }
             }
-            if (!have) continue;
+            if (!have) { timeout = nextTimeout(); continue; }
             int pct = AlBtBatteryClassic(job.addr);
             if (pct < 0 && job.le) pct = AlBtBatteryGatt(job.id.c_str());
             if (pct >= 0) {
@@ -1126,6 +1141,7 @@ DWORD WINAPI AlBtThread(void*) {
                 std::lock_guard lock(m.btLock_);
                 m.btJobs_.push_back(job);
             }
+            timeout = nextTimeout();
         }
         w1.Stop();
         w2.Stop();
@@ -1289,6 +1305,7 @@ void AlertsModule::Start(Services& s) {
     g_alMod = this;
     g_alStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_alWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_alBtWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_alLevelRead = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_alLevelSet = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_alDndOff = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -1364,10 +1381,11 @@ void AlertsModule::Stop() {
     UnregisterClassW(kAlertsClass, GetModuleHandleW(nullptr));
     if (g_alStop) CloseHandle(g_alStop);
     if (g_alWake) CloseHandle(g_alWake);
+    if (g_alBtWake) CloseHandle(g_alBtWake);
     if (g_alLevelRead) CloseHandle(g_alLevelRead);
     if (g_alLevelSet) CloseHandle(g_alLevelSet);
     if (g_alDndOff) CloseHandle(g_alDndOff);
-    g_alStop = g_alWake = g_alLevelRead = g_alLevelSet = g_alDndOff = nullptr;
+    g_alStop = g_alWake = g_alBtWake = g_alLevelRead = g_alLevelSet = g_alDndOff = nullptr;
 }
 
 IModule* AlertsModuleInstance() {

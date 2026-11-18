@@ -157,7 +157,9 @@ void IslandRecompute() {
     const float cx = (g_isMon.left + g_isMon.right) / 2.0f;
     g_isTarget = {(LONG)roundf(cx - tw / 2.0f), g_isMon.top, (LONG)roundf(cx + tw / 2.0f), g_isMon.top + (LONG)roundf(th)};
 
-    if (state == IState::Expanded) SetTimer(g_hwnd, kZoneTimer, kZonePollMs, nullptr);
+    // Pinned, the zone check can never close it, so it does not poll; unpinning starts the leave from then.
+    if (g_pinned) g_leaveSince = 0;
+    if (state == IState::Expanded && !g_pinned) SetTimer(g_hwnd, kZoneTimer, kZonePollMs, nullptr);
     else KillTimer(g_hwnd, kZoneTimer);
 
     ULONGLONG next = 0;
