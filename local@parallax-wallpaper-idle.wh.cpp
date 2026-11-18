@@ -1,8 +1,8 @@
 // ==WindhawkMod==
-// @id              parallax-wallpaper
-// @name            Parallax Wallpaper
-// @description     Smooth mouse-reactive wallpaper with optional perspective, four motion presets, independent multi-monitor support, and HDR-aware rendering
-// @version         0.9.2
+// @id              parallax-wallpaper-idle
+// @name            Parallax Wallpaper (idle-efficient fork)
+// @description     Local fork of parallax-wallpaper 0.9.2: no timers while nothing moves, raw-input wake, pauses behind maximized windows
+// @version         0.9.2.1
 // @author          HaVeN80
 // @github          https://github.com/haven80
 // @license         MIT
@@ -150,13 +150,17 @@ Automatic frame rate follows the highest detected display refresh rate, capped
 at 240 Hz. This is a requested rate, not a guarantee of FPS or hardware frame
 synchronization; Windows' compositor controls presentation. A high-resolution
 waitable timer is used without changing the global timer resolution. When motion
-settles, identical frames are not redrawn and pointer polling drops to at most
-30 Hz, or 10 Hz while every monitor is paused. Memory usage grows with the total
-display resolution.
+settles, identical frames are not redrawn; half a second after the pointer stops,
+the frame timer stops entirely and the mod waits for the next mouse movement
+(raw input). Memory usage grows with the total display resolution.
 
-The fullscreen pause checks the foreground application every 250 ms and pauses
-only the monitors it completely covers. It does not inspect every background
-window. Desktop attachment supports the classic WorkerW layout and the layered
+The fullscreen pause follows the foreground application through window events
+(foreground changes, moves and resizes, minimize and cloak) and pauses only the
+monitors it completely covers. With **Pause behind maximized windows** it also
+pauses monitors whose work area the foreground window covers or on which it is
+maximized, so app bars that reserve part of the screen do not keep a hidden
+wallpaper animating. While every monitor is paused, no timer runs at all. It
+does not inspect every background window. Desktop attachment supports the classic WorkerW layout and the layered
 Windows 11 layout. This undocumented Explorer mechanism can change in Windows
 updates; unrecognized layouts are left untouched.
 
@@ -229,6 +233,9 @@ updates; unrecognized layouts are left untouched.
 - pauseFullscreen: true
   $name: Pause for fullscreen applications
   $description: Pauses monitors completely covered by the foreground application.
+- pauseMaximized: true
+  $name: Pause behind maximized windows
+  $description: Also pauses monitors whose work area (the screen minus taskbars and app bars) is covered by the foreground window, or on which it is maximized.
 - monitors:
   - - monitor: ""
       $name: Monitor
@@ -308,6 +315,7 @@ updates; unrecognized layouts are left untouched.
 #include <shobjidl.h>
 #include <windows.h>
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -367,6 +375,35 @@ ULONGLONG g_nextMaintenance = 0;
 double g_lastTick = 0;
 uint64_t g_nextPaneSerial = 1;
 
+// Idle scheduling (local fork). The frame timer runs only while something
+// moves or a render is pending; otherwise the thread sleeps until an event:
+// raw mouse input, a window event about the foreground window, a display or
+// setting broadcast, a finished image load, or the slow maintenance pass.
+//
+// Maintenance that cannot be evented (in-place image file changes, the SDR
+// brightness slider, Explorer re-layering the wallpaper host, a desktop layout
+// appearing) still polls every kMaintenanceMs, as upstream did, except while
+// every monitor is paused: then nothing can be seen, so no timer runs and the
+// pass catches up as soon as a monitor unpauses.
+constexpr ULONGLONG kMaintenanceMs = 2000;
+// The frame timer keeps running at the idle pace this long after the pointer
+// last moved. Without it, pointer movement inside the dead zone would bounce
+// between stopping and raw-input wakes at the mouse's report rate.
+constexpr double kSettleMs = 500;
+HANDLE g_frameTimer = nullptr;
+bool g_framesRunning = false, g_listening = false;
+double g_nextFrame = 0, g_cursorMovedAt = 0;
+POINT g_lastCursor{LONG_MIN, LONG_MIN};
+// Set by message handlers and the WinEvent callback, consumed by the loop.
+// Everything runs on the render thread; the flags only defer the work out of
+// callbacks that COM can dispatch in the middle of a rebuild.
+bool g_inputWake = false, g_pauseCheck = false, g_maintenanceNow = false;
+UINT g_taskbarCreated = 0;
+HWINEVENTHOOK g_eventHooks[3]{};
+HWINEVENTHOOK g_locationHook = nullptr;
+DWORD g_locationProcess = 0;
+HWND g_foreground = nullptr;
+
 double ClockMs() {
     static const double frequency = [] {
         LARGE_INTEGER f;
@@ -401,7 +438,7 @@ struct Rule {
 };
 Options g_defaults;
 std::vector<Rule> g_rules;
-bool g_independent = true, g_pauseFullscreen = true;
+bool g_independent = true, g_pauseFullscreen = true, g_pauseMaximized = true;
 bool g_smoothRendering = true;
 bool g_hdrColorManagement = true;
 int g_fps = 60, g_requestedFps = 0;
@@ -796,6 +833,7 @@ void ReadSettings() {
     ReadPerspective(g_defaults, L"");
     g_independent = Wh_GetIntSetting(L"independent") != 0;
     g_pauseFullscreen = Wh_GetIntSetting(L"pauseFullscreen") != 0;
+    g_pauseMaximized = Wh_GetIntSetting(L"pauseMaximized") != 0;
     g_requestedFps = Wh_GetIntSetting(L"smoothFps");
     if (g_requestedFps)
         g_requestedFps = std::clamp(g_requestedFps, 30, 240);
@@ -1654,14 +1692,51 @@ bool Covers(const RECT& window, const RECT& monitor) {
     return window.left <= monitor.left && window.top <= monitor.top &&
            window.right >= monitor.right && window.bottom >= monitor.bottom;
 }
-void UpdatePause() {
+void CALLBACK WinEventProc(HWINEVENTHOOK,
+                           DWORD event,
+                           HWND window,
+                           LONG object,
+                           LONG child,
+                           DWORD,
+                           DWORD) {
+    // Location and cloak events matter only for the foreground window itself
+    // (not its caret, cursor or child windows).
+    if ((event == EVENT_OBJECT_LOCATIONCHANGE ||
+         event == EVENT_OBJECT_CLOAKED || event == EVENT_OBJECT_UNCLOAKED) &&
+        (window != g_foreground || object != OBJID_WINDOW ||
+         child != CHILDID_SELF))
+        return;
+    g_pauseCheck = true;
+}
+// Moves and resizes are hooked for the foreground window's process only, so
+// that windows dragged or animated elsewhere do not wake this thread.
+void FollowForeground(HWND foreground) {
+    g_foreground = foreground;
+    DWORD process = 0;
+    if (foreground && (g_pauseFullscreen || g_pauseMaximized))
+        GetWindowThreadProcessId(foreground, &process);
+    if (process == g_locationProcess && (g_locationHook || !process))
+        return;
+    if (g_locationHook)
+        UnhookWinEvent(g_locationHook);
+    g_locationHook = nullptr;
+    g_locationProcess = process;
+    if (process)
+        g_locationHook = SetWinEventHook(
+            EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, nullptr,
+            WinEventProc, process, 0, WINEVENT_OUTOFCONTEXT);
+}
+// Returns true when the pause state of any monitor changed.
+bool UpdatePause() {
     RECT rect{};
-    bool full = false;
+    bool full = false, zoomed = false;
     HWND foreground = GetForegroundWindow();
+    FollowForeground(foreground);
     wchar_t cls[128]{};
     if (foreground)
         GetClassNameW(foreground, cls, ARRAYSIZE(cls));
-    if (g_pauseFullscreen && foreground && IsWindowVisible(foreground) &&
+    if ((g_pauseFullscreen || g_pauseMaximized) && foreground &&
+        IsWindowVisible(foreground) &&
         !IsIconic(foreground) && wcscmp(cls, L"Progman") &&
         wcscmp(cls, L"WorkerW") && wcscmp(cls, kClass) &&
         wcscmp(cls, L"Shell_TrayWnd") &&
@@ -1674,16 +1749,63 @@ void UpdatePause() {
                 foreground, DWMWA_EXTENDED_FRAME_BOUNDS, &rect, sizeof(rect)));
             if (!full)
                 full = GetWindowRect(foreground, &rect) != FALSE;
+            zoomed = full && g_pauseMaximized && IsZoomed(foreground);
         }
     }
+    HMONITOR zoomedOn =
+        zoomed ? MonitorFromWindow(foreground, MONITOR_DEFAULTTONULL) : nullptr;
+    bool changed = false;
     for (auto& p : *g_panes) {
-        bool pause = full && Covers(rect, p->display.rect);
+        bool pause = full && g_pauseFullscreen && Covers(rect, p->display.rect);
+        if (full && !pause && g_pauseMaximized) {
+            // App bars shrink the work area, so a maximized window never
+            // covers the whole monitor; the wallpaper is hidden all the same.
+            // The work area is read live because it changes without a
+            // layout rebuild.
+            HMONITOR monitor =
+                MonitorFromRect(&p->display.rect, MONITOR_DEFAULTTONULL);
+            MONITORINFO info{};
+            info.cbSize = sizeof(info);
+            pause = monitor &&
+                    ((zoomed && monitor == zoomedOn) ||
+                     (GetMonitorInfoW(monitor, &info) &&
+                      Covers(rect, info.rcWork)));
+        }
         if (pause && !p->paused) {
             p->vx = p->vy = 0;
             p->tiltVx = p->tiltVy = 0;
         }
+        changed = changed || pause != p->paused;
         p->paused = pause;
     }
+    return changed;
+}
+bool AllPaused() {
+    if (!g_panes || g_panes->empty())
+        return false;
+    for (auto& p : *g_panes)
+        if (!p->paused)
+            return false;
+    return true;
+}
+// A pane that could react to the pointer.
+bool Animatable() {
+    for (auto& p : *g_panes)
+        if (p->pixels && p->window && !p->paused)
+            return true;
+    return false;
+}
+// Earliest time a pending render (new image, retry, device recovery) should
+// run, never sooner than `soonest`; kNever if nothing is pending.
+double PendingRender(double soonest) {
+    if (!g_d2d)
+        return kNever;  // The mod stays idle without Direct2D.
+    double deadline = kNever;
+    for (auto& p : *g_panes)
+        if (p->dirty && p->pixels && p->window && p->retryRender != kNever)
+            deadline = std::min(
+                deadline, std::max({soonest, p->retryRender, g_deviceRetryAt}));
+    return deadline;
 }
 
 void Normalized(const RECT& rect, POINT cursor, double& x, double& y) {
@@ -1775,6 +1897,11 @@ Activity Tick() {
     POINT cursor{};
     bool haveCursor = GetCursorPos(&cursor) != FALSE;  // Fails on the secure
                                                        // desktop.
+    if (haveCursor &&
+        (cursor.x != g_lastCursor.x || cursor.y != g_lastCursor.y)) {
+        g_lastCursor = cursor;
+        g_cursorMovedAt = now;
+    }
     // Use all displays, including ones where the animation is disabled.
     const Display* active = nullptr;
     if (haveCursor)
@@ -1837,12 +1964,19 @@ LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wp, LPARAM lp) {
             EndPaint(window, &paint);
             return 0;
         }
-        case WM_TIMER:
-            // Timers belong only to the hidden controller, which survives
-            // monitor rebuilds.
-            if (window == g_controller && !g_rebuilding && wp == 2)
-                UpdatePause();
-            return 0;
+        case WM_INPUT:
+            // Raw mouse input is registered on the hidden controller only
+            // while the frame timer is stopped. DefWindowProc releases the
+            // input data.
+            if (window == g_controller)
+                g_inputWake = true;
+            break;
+        case WM_SETTINGCHANGE:
+            // Wallpaper, work area and similar changes: run maintenance now
+            // instead of waiting for (or, while paused, without) the poll.
+            if (window == g_controller)
+                g_maintenanceNow = true;
+            break;
         case WM_DISPLAYCHANGE:
         case WM_DPICHANGED:
             g_rebuild = true;
@@ -1855,6 +1989,12 @@ LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wp, LPARAM lp) {
                     g_rebuild = true;
             }
             SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+            break;
+        default:
+            // Explorer restarted: reattach without waiting for the poll.
+            if (g_taskbarCreated && msg == g_taskbarCreated &&
+                window == g_controller)
+                g_maintenanceNow = true;
             break;
     }
     return DefWindowProcW(window, msg, wp, lp);
@@ -2000,6 +2140,80 @@ bool ArmFrameTimer(HANDLE timer, double deadline) {
     return SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE) != FALSE;
 }
 
+// Raw mouse input (usage page 1, usage 2) with RIDEV_INPUTSINK reaches the
+// hidden controller whatever window has focus. It is registered only while
+// the frame timer is stopped, so a moving mouse produces one wake, not a
+// message per mouse report. Returns true when the requested state holds.
+bool ListenForInput(bool listen) {
+    if (listen == g_listening)
+        return true;
+    if (listen && !g_controller)
+        return false;
+    RAWINPUTDEVICE device{};
+    device.usUsagePage = 1;
+    device.usUsage = 2;
+    device.dwFlags = listen ? RIDEV_INPUTSINK : RIDEV_REMOVE;
+    device.hwndTarget = listen ? g_controller : nullptr;
+    if (RegisterRawInputDevices(&device, 1, sizeof(device)))
+        g_listening = listen;
+    else if (listen)
+        Wh_Log(L"Raw input registration failed, error=%lu; polling instead",
+               GetLastError());
+    return listen == g_listening;
+}
+// Restarts the frame timer if it is stopped.
+bool WakeFrames() {
+    if (g_framesRunning)
+        return true;
+    ListenForInput(false);
+    double now = ClockMs();
+    // The first frame after a stop advances by one nominal frame, not by the
+    // whole time spent asleep.
+    g_lastTick = now - 1000.0 / g_fps;
+    g_nextFrame = now;
+    g_framesRunning = ArmFrameTimer(g_frameTimer, now);
+    return g_framesRunning;
+}
+// Re-evaluates the pause after a window event or maintenance.
+void CheckPause() {
+    bool wasAllPaused = AllPaused();
+    if (!UpdatePause())
+        return;
+    // While everything was paused, maintenance did not poll; catch up.
+    if (wasAllPaused && !AllPaused())
+        g_maintenanceNow = true;
+    WakeFrames();
+}
+// Arms the next frame after Tick(), or stops the timer once settled. Settled
+// means nothing moves, the pointer has been still for kSettleMs and no render
+// is pending. Returns false only if the timer cannot be armed.
+bool ScheduleFrame(Activity activity) {
+    double now = ClockMs();
+    // Upstream's pacing: full rate while moving, at most 30 Hz otherwise.
+    double moving = std::max(g_nextFrame + 1000.0 / g_fps, now + 0.1);
+    double idle =
+        std::max(g_nextFrame + 1000.0 / std::min(g_fps, 30), now + 0.1);
+    double deadline = kNever;
+    if (activity == Activity::Moving)
+        deadline = moving;
+    else if (activity == Activity::Idle && now - g_cursorMovedAt < kSettleMs)
+        deadline = idle;
+    deadline = std::min(deadline, PendingRender(idle));
+    // Without raw input, fall back to upstream's polling (30 Hz idle, 10 Hz
+    // dormant).
+    if (deadline == kNever && !ListenForInput(Animatable()))
+        deadline = activity == Activity::Idle
+                       ? idle
+                       : std::max(g_nextFrame + 100.0, now + 0.1);
+    if (deadline == kNever) {
+        CancelWaitableTimer(g_frameTimer);
+        g_framesRunning = false;
+        return true;
+    }
+    g_nextFrame = deadline;
+    return ArmFrameTimer(g_frameTimer, deadline);
+}
+
 DWORD WINAPI RenderThread(void*) {
     HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     using SetDpiProc = HANDLE(WINAPI*)(HANDLE);
@@ -2052,38 +2266,77 @@ DWORD WINAPI RenderThread(void*) {
                                             TIMER_ALL_ACCESS);
         if (!frameTimer)
             frameTimer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
-        double nextFrame = ClockMs();
-        if (g_controller && frameTimer &&
-            ArmFrameTimer(frameTimer, nextFrame) &&
-            SetTimer(g_controller, 2, 250, nullptr)) {
+        g_frameTimer = frameTimer;
+        g_framesRunning = g_listening = false;
+        g_inputWake = g_pauseCheck = g_maintenanceNow = false;
+        g_lastCursor = {LONG_MIN, LONG_MIN};
+        g_cursorMovedAt = 0;
+        g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+        // Out-of-context WinEvents arrive as messages on this thread, so the
+        // pause follows the foreground window without the 250 ms poll. The
+        // per-process location hook is managed by FollowForeground().
+        constexpr DWORD kHookFlags =
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+        g_eventHooks[0] = SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
+            WinEventProc, 0, 0, kHookFlags);
+        g_eventHooks[1] = SetWinEventHook(
+            EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND, nullptr,
+            WinEventProc, 0, 0, kHookFlags);
+        g_eventHooks[2] =
+            SetWinEventHook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED,
+                            nullptr, WinEventProc, 0, 0, kHookFlags);
+        // Without the foreground hook, maintenance keeps polling (and
+        // re-checking the pause) even while every monitor is paused.
+        bool evented = g_eventHooks[0] != nullptr;
+        if (!evented)
+            Wh_Log(L"Foreground event hook failed, error=%lu; polling instead",
+                   GetLastError());
+        if (g_controller && frameTimer && WakeFrames()) {
             HANDLE events[]{g_stop, g_settingsEvent, frameTimer, g_loadDone};
             constexpr DWORD kEventCount = ARRAYSIZE(events);
             bool running = true;
             while (running && WaitForSingleObject(g_stop, 0) == WAIT_TIMEOUT) {
-                if (g_rebuild || GetTickCount64() >= g_nextMaintenance) {
+                bool polling = !evented || !AllPaused();
+                if (g_rebuild || g_maintenanceNow ||
+                    (polling && GetTickCount64() >= g_nextMaintenance)) {
+                    g_maintenanceNow = false;
                     Maintenance();
-                    g_nextMaintenance = GetTickCount64() + 2000;
+                    g_nextMaintenance = GetTickCount64() + kMaintenanceMs;
+                    // Also a safety net for pause changes no event reports.
+                    CheckPause();
+                    if (PendingRender(0) != kNever && !WakeFrames())
+                        break;
+                    polling = !evented || !AllPaused();
+                }
+                DWORD timeout = INFINITE;
+                if (polling) {
+                    ULONGLONG now = GetTickCount64();
+                    timeout = g_nextMaintenance > now
+                                  ? static_cast<DWORD>(g_nextMaintenance - now)
+                                  : 0;
                 }
                 DWORD wait = MsgWaitForMultipleObjectsEx(
-                    kEventCount, events, 250, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                    kEventCount, events, timeout, QS_ALLINPUT,
+                    MWMO_INPUTAVAILABLE);
                 if (wait == WAIT_OBJECT_0 || wait == WAIT_FAILED)
                     break;
                 if (wait == WAIT_OBJECT_0 + 1) {
                     ReadSettings();
                     g_rebuild = true;
+                    if (!WakeFrames())
+                        break;
                 }
                 if (wait == WAIT_OBJECT_0 + 2) {
                     Activity activity = Tick();
-                    int fps = activity == Activity::Moving ? g_fps
-                              : activity == Activity::Idle ? std::min(g_fps, 30)
-                                                           : 10;
-                    nextFrame =
-                        std::max(nextFrame + 1000.0 / fps, ClockMs() + 0.1);
-                    if (!ArmFrameTimer(frameTimer, nextFrame))
+                    if (!ScheduleFrame(activity))
                         break;
                 }
-                if (wait == WAIT_OBJECT_0 + 3)
+                if (wait == WAIT_OBJECT_0 + 3) {
                     ProcessLoadResults();
+                    if (PendingRender(0) != kNever && !WakeFrames())
+                        break;
+                }
                 MSG msg{};
                 // A bounded batch leaves room for shutdown and maintenance
                 // under load.
@@ -2097,6 +2350,18 @@ DWORD WINAPI RenderThread(void*) {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
+                if (g_pauseCheck && running) {
+                    g_pauseCheck = false;
+                    CheckPause();
+                }
+                if (g_inputWake && running) {
+                    g_inputWake = false;
+                    // Counts as pointer activity even when the cursor is held
+                    // at a screen edge.
+                    g_cursorMovedAt = ClockMs();
+                    if (!WakeFrames())
+                        break;
+                }
             }
         } else {
             Wh_Log(L"Controller/timer creation failed, error=%lu",
@@ -2104,6 +2369,21 @@ DWORD WINAPI RenderThread(void*) {
         }
         g_rebuilding = true;
         StopLoader();
+        // WinEvent hooks and the raw input registration belong to this
+        // thread and its controller window; release them before both go.
+        for (auto& hook : g_eventHooks) {
+            if (hook)
+                UnhookWinEvent(hook);
+            hook = nullptr;
+        }
+        if (g_locationHook)
+            UnhookWinEvent(g_locationHook);
+        g_locationHook = nullptr;
+        g_locationProcess = 0;
+        g_foreground = nullptr;
+        ListenForInput(false);
+        g_framesRunning = false;
+        g_frameTimer = nullptr;
         if (frameTimer) {
             CancelWaitableTimer(frameTimer);
             CloseHandle(frameTimer);
