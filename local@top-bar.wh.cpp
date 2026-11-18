@@ -6156,6 +6156,51 @@ void SendPanelMode(WPARAM mode) {
     }
 }
 
+// ---- Close and reopen ----
+// Changing the panel's part, or a cold first open, closes the panel and opens it again. The reopen
+// waits for the panel to lose focus, then out the moment Windows ignores the toggle after that.
+// The foreground hook ends the first wait as soon as focus leaves, so the settle runs from the real
+// close instead of from the next poll (up to 100 ms later); the poll stays as the fallback.
+bool g_reopenClosing = false;       // Waiting for the notification panel to lose focus.
+bool g_quickReopenClosing = false;  // Waiting for Quick Settings to lose focus.
+
+void StartPanelReopen() {
+    g_reopenStage = 0;
+    g_reopenTries = 15;
+    g_reopenClosing = true;
+    SetTimer(g_hwnd, kReopenTimer, 100, nullptr);
+}
+
+// It has closed. The settle is the shortest one the poll could already give (300 after a close
+// seen just before a poll), so Windows ignoring the open is no likelier than before.
+void SettlePanelReopen() {
+    g_reopenClosing = false;
+    g_reopenStage = 1;
+    g_reopenOpens = 4;
+    SetTimer(g_hwnd, kReopenTimer, 300, nullptr);
+}
+
+void SettleQuickReopen() {
+    g_quickReopenClosing = false;
+    g_quickReopenSettled = true;
+    SetTimer(g_hwnd, kQuickReopenTimer, 250, nullptr);
+}
+
+// From the foreground hook, before anything else sees the change.
+void OnForegroundForReopen(HWND hwnd) {
+    if (g_reopenClosing && g_reopenStage == 0 && !IsShellExperienceWindow(hwnd)) {
+        SettlePanelReopen();
+    }
+    if (g_quickReopenClosing && !g_quickReopenSettled && !IsQuickSettingsWindow(hwnd)) {
+        SettleQuickReopen();
+    }
+    // Quick Settings opened by Win+A for a page: its link goes once it has focus, which is all
+    // the wait was for, instead of after a fixed 150 ms (still the fallback, if focus is late).
+    if (g_quickPendingUri && IsQuickSettingsWindow(hwnd)) {
+        SetTimer(g_hwnd, kQuickPageTimer, USER_TIMER_MINIMUM, nullptr);
+    }
+}
+
 void StepPanelFollow() {
     HWND fg = GetForegroundWindow();
     if (GetTickCount64() > g_panelDeadline) {
@@ -6173,9 +6218,7 @@ void StepPanelFollow() {
         g_panelCold = false;
         g_panelResend = 0;
         SendWinKey('N');  // The clip comes just after the focus, so hiding lasts until the reopen below.
-        g_reopenStage = 0;
-        g_reopenTries = 15;
-        SetTimer(g_hwnd, kReopenTimer, 100, nullptr);
+        StartPanelReopen();
         KillTimer(g_hwnd, kPanelTimer);
         return;
     }
@@ -6207,9 +6250,7 @@ void TogglePanel(WPARAM mode) {
     if (open) {
         // Windows sizes the panel's clip region as it opens, so changing parts means reopening.
         SendWinKey('N');
-        g_reopenStage = 0;
-        g_reopenTries = 15;
-        SetTimer(g_hwnd, kReopenTimer, 100, nullptr);
+        StartPanelReopen();
         return;
     }
     g_panelCold = !g_notificationPanel || !IsWindow(g_notificationPanel);
@@ -6272,6 +6313,7 @@ void OpenQuickPage(Action page) {
             g_quickHadFocus = false;  // This close is intended: nothing to clean up after it.
             g_quickReopenTries = 15;
             g_quickReopenSettled = false;
+            g_quickReopenClosing = true;
             SendWinKey('A');
             SetTimer(g_hwnd, kQuickReopenTimer, 80, nullptr);
             return;
@@ -6625,30 +6667,80 @@ bool IsStartWindow(HWND hwnd) {
     return ok;
 }
 
-// Shows Start's own profile flyout under the avatar. See start-menu-pop.
-void ToggleProfile() {
-    if (g_profileOpen) {
-        g_profileOpen = false;
-        SendWinKey(0);
-        return;
-    }
+// Ids above the bar's own timers in types.inc and below the module timers.
+constexpr UINT_PTR kProfileWatchTimer = 40;  // While open: clears g_profileOpen if start-menu-pop never answers.
+constexpr UINT_PTR kProfileArmTimer = 41;    // Retries arming a Start host that did not answer.
+constexpr UINT kProfileWatchMs = 3000;
+constexpr UINT kProfileArmRetryMs = 150;
+constexpr int kProfileArmRetries = 4;        // About 0.6 s, then the click is dropped.
+int g_profileArmLeft = 0;
+
+// Tells start-menu-pop that the next Start open is for the profile flyout. Only Start's own host
+// handles the message, so an answer from Search alone does not count.
+bool ArmProfile() {
     HWND hwnd = nullptr;
     bool armed = false;
     while ((hwnd = FindWindowExW(nullptr, hwnd, L"Windows.UI.Core.CoreWindow", nullptr))) {
-        if (IsStartWindow(hwnd)) {
+        if (IsStartMenuWindow(hwnd)) {
             DWORD_PTR result = 0;
             if (SendMessageTimeoutW(hwnd, g_profileMessage, 0, 0, SMTO_ABORTIFHUNG, 150, &result)) {
                 armed = true;
             }
         }
     }
-    if (armed) {
-        g_profileOpen = true;
+    return armed;
+}
+
+void OpenProfile() {
+    g_profileOpen = true;
+    SendWinKey(0);
+    SetTimer(g_hwnd, kProfileWatchTimer, kProfileWatchMs, nullptr);
+}
+
+// Shows Start's own profile flyout under the avatar. See start-menu-pop.
+void ToggleProfile() {
+    KillTimer(g_hwnd, kProfileArmTimer);
+    if (g_profileOpen) {
+        g_profileOpen = false;
+        KillTimer(g_hwnd, kProfileWatchTimer);
         SendWinKey(0);
+        return;
+    }
+    if (ArmProfile()) {
+        OpenProfile();
+        return;
+    }
+    // A host that is starting or briefly busy: try again for a moment instead of dropping the click.
+    g_profileArmLeft = kProfileArmRetries;
+    SetTimer(g_hwnd, kProfileArmTimer, kProfileArmRetryMs, nullptr);
+}
+
+void ProfileArmTick() {
+    HWND fg = GetForegroundWindow();
+    if (fg && IsStartWindow(fg)) {
+        KillTimer(g_hwnd, kProfileArmTimer);  // Start opened some other way: Win now would close it.
+        return;
+    }
+    if (ArmProfile()) {
+        KillTimer(g_hwnd, kProfileArmTimer);
+        OpenProfile();
+    } else if (--g_profileArmLeft <= 0) {
+        KillTimer(g_hwnd, kProfileArmTimer);
+        Wh_Log(L"Profile: Start's host did not answer");
     }
 }
 
-
+// WM_PROFILE_DONE ends the flyout. If it never comes (Start crashed, start-menu-pop off, a Start
+// open that was not taken as the profile), g_profileOpen would stay set and the next click would
+// send a bare Win. So look every few seconds, and let it go once Start is no longer in front.
+void ProfileWatchTick() {
+    HWND fg = GetForegroundWindow();
+    if (g_profileOpen && fg && IsStartWindow(fg)) {
+        return;  // Still up.
+    }
+    KillTimer(g_hwnd, kProfileWatchTimer);
+    g_profileOpen = false;
+}
 
 #line 1 "bar/island.inc"
 // ---- Island: the centre bubble, a layered window owned by the bar, on the bar's thread ----
@@ -9296,6 +9388,7 @@ void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG object, LON
         return;
     }
     if (event == EVENT_SYSTEM_FOREGROUND) {
+        OnForegroundForReopen(hwnd);  // A close-and-reopen in progress, or a page link waiting for focus.
         OnForegroundForPanels(hwnd);  // Closes Quick Settings or Search left behind by an app switch.
         if (IsShellExperienceWindow(hwnd) || IsQuickSettingsWindow(hwnd)) {
             if (GetTickCount64() - g_anchorTick >= kPanelAnchorMs) {
@@ -9565,6 +9658,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
             }
             g_profileOpen = false;
+            KillTimer(hwnd, kProfileWatchTimer);
             return 0;
         case WM_APPBAR_CB:
             if (wp == ABN_POSCHANGED) {
@@ -9620,9 +9714,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         return 0;
                     }
                     // Windows ignores a toggle for a moment after the panel loses focus.
-                    g_reopenStage = 1;
-                    g_reopenOpens = 4;
-                    SetTimer(hwnd, kReopenTimer, 300, nullptr);
+                    SettlePanelReopen();  // Usually already done by the foreground hook.
                     return 0;
                 }
                 if (panelFocused && g_reopenStage == 2) {
@@ -9651,8 +9743,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 if (!g_quickReopenSettled) {
                     // Windows ignores the shortcut for a moment after the panel loses focus.
-                    g_quickReopenSettled = true;
-                    SetTimer(hwnd, kQuickReopenTimer, 250, nullptr);
+                    SettleQuickReopen();  // Usually already done by the foreground hook.
                     return 0;
                 }
                 KillTimer(hwnd, kQuickReopenTimer);
@@ -9662,6 +9753,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_quickHadFocus = true;
                 SendWinKey('A');
                 FollowPanel();
+            } else if (wp == kProfileWatchTimer) {
+                ProfileWatchTick();
+            } else if (wp == kProfileArmTimer) {
+                ProfileArmTick();
             } else if (wp == kQuickPageTimer) {
                 KillTimer(hwnd, kQuickPageTimer);
                 if (g_quickPendingUri) {
