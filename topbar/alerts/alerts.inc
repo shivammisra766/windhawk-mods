@@ -225,7 +225,7 @@ public:
     void PublishGeometry();
     void FullscreenChanged();
     int Dots() const { return (mic_ ? 1 : 0) + (cam_ ? 1 : 0); }
-    // A slider, or the short "Sent to phone" that follows closing the shelf under the pointer.
+    // A slider, or the short "Sending to phone" that follows closing the shelf under the pointer.
     bool HoldsHover() const { return IsLevel() || (hasCur_ && cur_.kind == AK::Phone); }
     void DrawOverlay(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* brush, float L, float R, float B, float s);
     LRESULT Wnd(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
@@ -1382,17 +1382,18 @@ void AlertsDrawOverlay(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* brush, float
 void AlertsPublishGeometry() {
     if (g_alMod) g_alMod->PublishGeometry();
 }
-// The shelf handed something to the phone (or could not): a short confirmation.
+// The shelf handed something to PCTracker for the phone (or could not): a short acknowledgement.
+// Handing over is not delivery: PCTracker still has to reach the phone, and the transfer pill
+// (bar/transfers.inc) shows the progress and the real "Sent". So no green dot here.
 void AlertsPhoneSent(int sent, int failed) {
     if (!g_alMod) return;
     AItem it;
     it.kind = AK::Phone;
     it.ms = 2200;
     if (sent) {
-        it.title = AlT(L"alert.phone.sent", L"Sent to phone");
-        if (failed) it.sub = AlFmt(AlT(L"alert.phone.some", L"%d sent, %d failed"), sent, failed);
+        it.title = AlT(L"alert.phone.sending", L"Sending to phone");
+        if (failed) it.sub = AlFmt(AlT(L"alert.phone.some", L"%d sending, %d failed"), sent, failed);
         else if (sent > 1) it.sub = AlFmt(AlT(L"alert.phone.n", L"%d items"), sent);
-        it.good = !failed;
         it.danger = failed > 0;
     } else {
         it.title = AlT(L"alert.phone.fail", L"Could not send to phone");

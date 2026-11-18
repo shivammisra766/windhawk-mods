@@ -886,7 +886,7 @@ protected:
             return;
         } else if (id >= kPhoneIdBase) {
             bool removed = false;
-            Flash(SendItem((unsigned)(id - kPhoneIdBase), false, &removed) ? L"Sent to phone" : L"Could not send to phone");
+            Flash(SendItem((unsigned)(id - kPhoneIdBase), false, &removed) ? L"Sending to phone" : L"Could not send to phone");
         } else if (id >= 100000) {
             Remove((unsigned)(id - 100000));
         } else if (id >= 1000) {
@@ -999,7 +999,7 @@ private:
             bool removed = false;  // Sent from the drop: not kept, unless the drop only promoted a row already there.
             if (SendItem(f.id, f.fresh, &removed)) sent++; else failed++;
         }
-        Flash(sent ? L"Sent to phone" : L"Could not send to phone");
+        Flash(sent ? L"Sending to phone" : L"Could not send to phone");
         AlertsPhoneSent(sent, failed);
         // The confirmation is an alert, and alerts wait while the island is open: let it close.
         if (sv_) sv_->Post([] { if (!g_pinned) SetExpanded(false); });
