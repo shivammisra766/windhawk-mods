@@ -172,6 +172,51 @@ void SendPanelMode(WPARAM mode) {
     }
 }
 
+// ---- Close and reopen ----
+// Changing the panel's part, or a cold first open, closes the panel and opens it again. The reopen
+// waits for the panel to lose focus, then out the moment Windows ignores the toggle after that.
+// The foreground hook ends the first wait as soon as focus leaves, so the settle runs from the real
+// close instead of from the next poll (up to 100 ms later); the poll stays as the fallback.
+bool g_reopenClosing = false;       // Waiting for the notification panel to lose focus.
+bool g_quickReopenClosing = false;  // Waiting for Quick Settings to lose focus.
+
+void StartPanelReopen() {
+    g_reopenStage = 0;
+    g_reopenTries = 15;
+    g_reopenClosing = true;
+    SetTimer(g_hwnd, kReopenTimer, 100, nullptr);
+}
+
+// It has closed. The settle is the shortest one the poll could already give (300 after a close
+// seen just before a poll), so Windows ignoring the open is no likelier than before.
+void SettlePanelReopen() {
+    g_reopenClosing = false;
+    g_reopenStage = 1;
+    g_reopenOpens = 4;
+    SetTimer(g_hwnd, kReopenTimer, 300, nullptr);
+}
+
+void SettleQuickReopen() {
+    g_quickReopenClosing = false;
+    g_quickReopenSettled = true;
+    SetTimer(g_hwnd, kQuickReopenTimer, 250, nullptr);
+}
+
+// From the foreground hook, before anything else sees the change.
+void OnForegroundForReopen(HWND hwnd) {
+    if (g_reopenClosing && g_reopenStage == 0 && !IsShellExperienceWindow(hwnd)) {
+        SettlePanelReopen();
+    }
+    if (g_quickReopenClosing && !g_quickReopenSettled && !IsQuickSettingsWindow(hwnd)) {
+        SettleQuickReopen();
+    }
+    // Quick Settings opened by Win+A for a page: its link goes once it has focus, which is all
+    // the wait was for, instead of after a fixed 150 ms (still the fallback, if focus is late).
+    if (g_quickPendingUri && IsQuickSettingsWindow(hwnd)) {
+        SetTimer(g_hwnd, kQuickPageTimer, USER_TIMER_MINIMUM, nullptr);
+    }
+}
+
 void StepPanelFollow() {
     HWND fg = GetForegroundWindow();
     if (GetTickCount64() > g_panelDeadline) {
@@ -189,9 +234,7 @@ void StepPanelFollow() {
         g_panelCold = false;
         g_panelResend = 0;
         SendWinKey('N');  // The clip comes just after the focus, so hiding lasts until the reopen below.
-        g_reopenStage = 0;
-        g_reopenTries = 15;
-        SetTimer(g_hwnd, kReopenTimer, 100, nullptr);
+        StartPanelReopen();
         KillTimer(g_hwnd, kPanelTimer);
         return;
     }
@@ -223,9 +266,7 @@ void TogglePanel(WPARAM mode) {
     if (open) {
         // Windows sizes the panel's clip region as it opens, so changing parts means reopening.
         SendWinKey('N');
-        g_reopenStage = 0;
-        g_reopenTries = 15;
-        SetTimer(g_hwnd, kReopenTimer, 100, nullptr);
+        StartPanelReopen();
         return;
     }
     g_panelCold = !g_notificationPanel || !IsWindow(g_notificationPanel);
@@ -288,6 +329,7 @@ void OpenQuickPage(Action page) {
             g_quickHadFocus = false;  // This close is intended: nothing to clean up after it.
             g_quickReopenTries = 15;
             g_quickReopenSettled = false;
+            g_quickReopenClosing = true;
             SendWinKey('A');
             SetTimer(g_hwnd, kQuickReopenTimer, 80, nullptr);
             return;

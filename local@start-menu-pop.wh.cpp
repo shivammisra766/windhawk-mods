@@ -168,6 +168,9 @@ int g_profilePlaceTicks = 0;
 int g_profileStableTicks = 0;
 float g_profileLastX = 0.0f;
 float g_profileLastY = 0.0f;
+bool g_profileSettled = false;  // Where the user button came to rest the last time, to skip the wait.
+float g_profileSettledX = 0.0f;
+float g_profileSettledY = 0.0f;
 
 
 // The pop animation owns FrameRoot's composition visual, which stops XAML changes to that
@@ -345,8 +348,18 @@ void BeginProfile() {
                 g_profileStableTicks = (dx > -0.5f && dx < 0.5f && dy > -0.5f && dy < 0.5f) ? g_profileStableTicks + 1 : 0;
                 g_profileLastX = at.X;
                 g_profileLastY = at.Y;
+                // A warm Start lays the button out where it was last time, already settled: press
+                // at once instead of watching it for three more frames. Anywhere else (the first
+                // open, another scale or layout), the wait below still applies.
+                const float sx = at.X - g_profileSettledX, sy = at.Y - g_profileSettledY;
+                if (g_profileSettled && sx > -0.5f && sx < 0.5f && sy > -0.5f && sy < 0.5f) {
+                    g_profileStableTicks = 3;
+                }
             }
             if (g_profileStableTicks >= 3) {
+                g_profileSettled = true;
+                g_profileSettledX = g_profileLastX;
+                g_profileSettledY = g_profileLastY;
                 StopProfileTimer();
                 PressUserButton();
             } else if (GetTickCount64() - g_profileStart > 2500) {

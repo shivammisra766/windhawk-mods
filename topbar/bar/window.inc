@@ -3,6 +3,7 @@ void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG object, LON
         return;
     }
     if (event == EVENT_SYSTEM_FOREGROUND) {
+        OnForegroundForReopen(hwnd);  // A close-and-reopen in progress, or a page link waiting for focus.
         OnForegroundForPanels(hwnd);  // Closes Quick Settings or Search left behind by an app switch.
         if (IsShellExperienceWindow(hwnd) || IsQuickSettingsWindow(hwnd)) {
             if (GetTickCount64() - g_anchorTick >= kPanelAnchorMs) {
@@ -271,6 +272,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
             }
             g_profileOpen = false;
+            KillTimer(hwnd, kProfileWatchTimer);
             return 0;
         case WM_APPBAR_CB:
             if (wp == ABN_POSCHANGED) {
@@ -326,9 +328,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         return 0;
                     }
                     // Windows ignores a toggle for a moment after the panel loses focus.
-                    g_reopenStage = 1;
-                    g_reopenOpens = 4;
-                    SetTimer(hwnd, kReopenTimer, 300, nullptr);
+                    SettlePanelReopen();  // Usually already done by the foreground hook.
                     return 0;
                 }
                 if (panelFocused && g_reopenStage == 2) {
@@ -357,8 +357,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 if (!g_quickReopenSettled) {
                     // Windows ignores the shortcut for a moment after the panel loses focus.
-                    g_quickReopenSettled = true;
-                    SetTimer(hwnd, kQuickReopenTimer, 250, nullptr);
+                    SettleQuickReopen();  // Usually already done by the foreground hook.
                     return 0;
                 }
                 KillTimer(hwnd, kQuickReopenTimer);
@@ -368,6 +367,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_quickHadFocus = true;
                 SendWinKey('A');
                 FollowPanel();
+            } else if (wp == kProfileWatchTimer) {
+                ProfileWatchTick();
+            } else if (wp == kProfileArmTimer) {
+                ProfileArmTick();
             } else if (wp == kQuickPageTimer) {
                 KillTimer(hwnd, kQuickPageTimer);
                 if (g_quickPendingUri) {
