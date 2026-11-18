@@ -39,7 +39,7 @@ try {
   $key.SetValue('Exclude', '', 'String')
   $key.SetValue('Architecture', '', 'String')
   $key.SetValue('Version', $ver, 'String')
-  $key.SetValue('LoggingEnabled', 1, 'DWord')
+  $key.SetValue('LoggingEnabled', 0, 'DWord')
   $key.SetValue('Disabled', 0, 'DWord')
   $key.SetValue('SettingsChangeTime', $now, 'DWord')
   $key.Close()
