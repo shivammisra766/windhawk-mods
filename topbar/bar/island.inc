@@ -387,6 +387,9 @@ LRESULT CALLBACK IslandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_MOUSEACTIVATE:
             return MA_NOACTIVATE;
+        case WM_WINDOWPOSCHANGING:
+            GuardBarPos(hwnd, reinterpret_cast<WINDOWPOS*>(lp));
+            break;
         case WM_MOUSEMOVE:
             if (!g_isTracking) {
                 g_isTracking = true;

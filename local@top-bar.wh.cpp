@@ -2,7 +2,7 @@
 // @id              top-bar
 // @name            Top bar
 // @description     Top bar with three bubbles in the Seelen toolbar style, drawn with Direct2D
-// @version         4.9
+// @version         4.10
 // @author          local
 // @include         windhawk.exe
 // @compilerOptions -lgdi32 -luser32 -lshell32 -ladvapi32 -lole32 -lversion -lwininet -liphlpapi -luuid -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -lruntimeobject -loleaut32 -lsetupapi -lpdh -lwbemuuid
@@ -271,6 +271,7 @@ constexpr UINT WM_REFRESH_TITLE = WM_APP + 6;
 constexpr UINT WM_APP_FRAME = WM_APP + 10;     // From the frame clock thread: one per display frame while animating.
 constexpr UINT WM_APP_SETTINGS = WM_APP + 11;  // From the settings callback, which runs on another thread.
 constexpr UINT WM_APP_PAINT = WM_APP + 12;     // Coalesced repaint request.
+constexpr UINT WM_APP_KEEPUP = WM_APP + 14;    // Something minimized or demoted the bar: put it back.
 constexpr UINT WM_APP_POST = WM_APP + 13;      // Services::Post: lParam is a heap std::function<void()>.
 constexpr UINT_PTR kClockTimer = 1;
 constexpr UINT_PTR kTitleTimer = 2;  // Coalesces title changes.
@@ -5870,8 +5871,36 @@ bool ForegroundCoversMonitor() {
            r.bottom >= mi.rcMonitor.bottom;
 }
 
+bool IsDesktopWindow(HWND hwnd) {
+    wchar_t cls[32] = {};
+    GetClassNameW(hwnd, cls, 32);
+    return !wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW");
+}
+
+// Show Desktop (Win+D, the three-finger swipe down) minimizes, hides or un-topmosts windows, the bar's
+// too. The bar refuses those in WM_WINDOWPOSCHANGING; this repairs whatever got through anyway.
+void KeepBarUp() {
+    if (!g_hwnd || g_fullscreen || g_hidden) return;
+    if (IsIconic(g_hwnd)) ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
+    for (HWND h : {g_hwnd, g_isHwnd}) {
+        if (h && !(GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOPMOST)) {
+            SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+    }
+    if (!IsWindowVisible(g_hwnd)) PlaceBar();
+}
+
+// Our own windows only: forced on top, and the bar not hidden unless it is hiding itself.
+void GuardBarPos(HWND hwnd, WINDOWPOS* p) {
+    if (g_fullscreen || g_hidden) return;
+    if (!(p->flags & SWP_NOZORDER) && p->hwndInsertAfter != HWND_TOPMOST) p->hwndInsertAfter = HWND_TOPMOST;
+    if (hwnd == g_hwnd) p->flags &= ~SWP_HIDEWINDOW;
+}
+
 void UpdateFullscreen() {
-    g_fsRaw = g_abnFullscreen || ForegroundCoversMonitor();
+    // The desktop in front (Show Desktop) is never a fullscreen app, whatever the last ABN_FULLSCREENAPP said.
+    HWND fgNow = GetForegroundWindow();
+    g_fsRaw = (g_abnFullscreen && !(fgNow && IsDesktopWindow(fgNow))) || ForegroundCoversMonitor();
     if (!g_fsRaw) g_fsOverride = false;
     const bool fullscreen = g_fsRaw && !g_fsOverride;  // The hotkey can bring the bar back over the app.
     if (fullscreen == g_fullscreen) {
@@ -7132,6 +7161,9 @@ LRESULT CALLBACK IslandProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_MOUSEACTIVATE:
             return MA_NOACTIVATE;
+        case WM_WINDOWPOSCHANGING:
+            GuardBarPos(hwnd, reinterpret_cast<WINDOWPOS*>(lp));
+            break;
         case WM_MOUSEMOVE:
             if (!g_isTracking) {
                 g_isTracking = true;
@@ -9421,6 +9453,7 @@ void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG object, LON
             g_abnFullscreen = false;  // Windows can miss telling us a fullscreen app has gone.
         }
         UpdateFullscreen();
+        PostMessageW(g_hwnd, WM_APP_KEEPUP, 0, 0);  // Cheap: style reads only, unless something demoted the bar.
         PostMessageW(g_hwnd, WM_REFRESH_FOREGROUND, 0, 0);
     } else if (event == EVENT_OBJECT_NAMECHANGE && hwnd == GetForegroundWindow()) {
         PostMessageW(g_hwnd, WM_REFRESH_TITLE, 0, 0);
@@ -9606,6 +9639,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_MOUSEACTIVATE:
             return MA_NOACTIVATE;
+        case WM_WINDOWPOSCHANGING:
+            GuardBarPos(hwnd, reinterpret_cast<WINDOWPOS*>(lp));
+            break;
+        case WM_SYSCOMMAND:
+            if ((wp & 0xFFF0) == SC_MINIMIZE) return 0;
+            break;
+        case WM_SIZE:
+            if (wp == SIZE_MINIMIZED) PostMessageW(hwnd, WM_APP_KEEPUP, 0, 0);
+            break;
+        case WM_APP_KEEPUP:
+            KeepBarUp();
+            return 0;
         case WM_LBUTTONDOWN:
             g_profileAtDown = g_profileOpen;
             return 0;
