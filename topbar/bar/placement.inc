@@ -89,10 +89,14 @@ bool IsDesktopWindow(HWND hwnd) {
 void KeepBarUp() {
     if (!g_hwnd || g_fullscreen || g_hidden) return;
     if (IsIconic(g_hwnd)) ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
-    for (HWND h : {g_hwnd, g_isHwnd}) {
+    // Island first: the bar is then put directly under it (GuardBarPos), so the pill keeps the pointer.
+    for (HWND h : {g_isHwnd, g_hwnd}) {
         if (h && !(GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOPMOST)) {
             SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
+    }
+    if (g_isHwnd && GetWindow(g_isHwnd, GW_HWNDPREV) == g_hwnd) {  // Bar above the island: swap back.
+        SetWindowPos(g_hwnd, g_isHwnd, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
     if (!IsWindowVisible(g_hwnd)) PlaceBar();
 }
@@ -100,7 +104,12 @@ void KeepBarUp() {
 // Our own windows only: forced on top, and the bar not hidden unless it is hiding itself.
 void GuardBarPos(HWND hwnd, WINDOWPOS* p) {
     if (g_fullscreen || g_hidden) return;
-    if (!(p->flags & SWP_NOZORDER) && p->hwndInsertAfter != HWND_TOPMOST) p->hwndInsertAfter = HWND_TOPMOST;
+    if (!(p->flags & SWP_NOZORDER)) {
+        // The island overlaps the bar and must stay above it, or the bar takes the island's hover and clicks.
+        const bool underIsland = hwnd == g_hwnd && g_isHwnd && (GetWindowLongW(g_isHwnd, GWL_EXSTYLE) & WS_EX_TOPMOST);
+        if (underIsland) p->hwndInsertAfter = g_isHwnd;
+        else if (p->hwndInsertAfter != HWND_TOPMOST) p->hwndInsertAfter = HWND_TOPMOST;
+    }
     if (hwnd == g_hwnd) p->flags &= ~SWP_HIDEWINDOW;
 }
 
