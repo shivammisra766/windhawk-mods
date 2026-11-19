@@ -36,6 +36,7 @@ void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG object, LON
             g_abnFullscreen = false;  // Windows can miss telling us a fullscreen app has gone.
         }
         UpdateFullscreen();
+        PostMessageW(g_hwnd, WM_APP_KEEPUP, 0, 0);  // Cheap: style reads only, unless something demoted the bar.
         PostMessageW(g_hwnd, WM_REFRESH_FOREGROUND, 0, 0);
     } else if (event == EVENT_OBJECT_NAMECHANGE && hwnd == GetForegroundWindow()) {
         PostMessageW(g_hwnd, WM_REFRESH_TITLE, 0, 0);
@@ -221,6 +222,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_MOUSEACTIVATE:
             return MA_NOACTIVATE;
+        case WM_WINDOWPOSCHANGING:
+            GuardBarPos(hwnd, reinterpret_cast<WINDOWPOS*>(lp));
+            break;
+        case WM_SYSCOMMAND:
+            if ((wp & 0xFFF0) == SC_MINIMIZE) return 0;
+            break;
+        case WM_SIZE:
+            if (wp == SIZE_MINIMIZED) PostMessageW(hwnd, WM_APP_KEEPUP, 0, 0);
+            break;
+        case WM_APP_KEEPUP:
+            KeepBarUp();
+            return 0;
         case WM_LBUTTONDOWN:
             g_profileAtDown = g_profileOpen;
             return 0;

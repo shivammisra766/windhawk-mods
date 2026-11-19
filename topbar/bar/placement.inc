@@ -78,8 +78,45 @@ bool ForegroundCoversMonitor() {
            r.bottom >= mi.rcMonitor.bottom;
 }
 
+bool IsDesktopWindow(HWND hwnd) {
+    wchar_t cls[32] = {};
+    GetClassNameW(hwnd, cls, 32);
+    return !wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW");
+}
+
+// Show Desktop (Win+D, the three-finger swipe down) minimizes, hides or un-topmosts windows, the bar's
+// too. The bar refuses those in WM_WINDOWPOSCHANGING; this repairs whatever got through anyway.
+void KeepBarUp() {
+    if (!g_hwnd || g_fullscreen || g_hidden) return;
+    if (IsIconic(g_hwnd)) ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
+    // Island first: the bar is then put directly under it (GuardBarPos), so the pill keeps the pointer.
+    for (HWND h : {g_isHwnd, g_hwnd}) {
+        if (h && !(GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOPMOST)) {
+            SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+    }
+    if (g_isHwnd && GetWindow(g_isHwnd, GW_HWNDPREV) == g_hwnd) {  // Bar above the island: swap back.
+        SetWindowPos(g_hwnd, g_isHwnd, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    if (!IsWindowVisible(g_hwnd)) PlaceBar();
+}
+
+// Our own windows only: forced on top, and the bar not hidden unless it is hiding itself.
+void GuardBarPos(HWND hwnd, WINDOWPOS* p) {
+    if (g_fullscreen || g_hidden) return;
+    if (!(p->flags & SWP_NOZORDER)) {
+        // The island overlaps the bar and must stay above it, or the bar takes the island's hover and clicks.
+        const bool underIsland = hwnd == g_hwnd && g_isHwnd && (GetWindowLongW(g_isHwnd, GWL_EXSTYLE) & WS_EX_TOPMOST);
+        if (underIsland) p->hwndInsertAfter = g_isHwnd;
+        else if (p->hwndInsertAfter != HWND_TOPMOST) p->hwndInsertAfter = HWND_TOPMOST;
+    }
+    if (hwnd == g_hwnd) p->flags &= ~SWP_HIDEWINDOW;
+}
+
 void UpdateFullscreen() {
-    g_fsRaw = g_abnFullscreen || ForegroundCoversMonitor();
+    // The desktop in front (Show Desktop) is never a fullscreen app, whatever the last ABN_FULLSCREENAPP said.
+    HWND fgNow = GetForegroundWindow();
+    g_fsRaw = (g_abnFullscreen && !(fgNow && IsDesktopWindow(fgNow))) || ForegroundCoversMonitor();
     if (!g_fsRaw) g_fsOverride = false;
     const bool fullscreen = g_fsRaw && !g_fsOverride;  // The hotkey can bring the bar back over the app.
     if (fullscreen == g_fullscreen) {

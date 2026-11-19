@@ -1,7 +1,7 @@
 ﻿param([ValidateSet('both','32','64')][string]$Arch = 'both', [switch]$CheckOnly)
 $s = $PSScriptRoot
 # Version and serial live on this line only; the header, the DLL name and the defines take them from here.
-$id = 'local@top-bar'; $ver = '4.9'; $serial = '300049'
+$id = 'local@top-bar'; $ver = '4.11'; $serial = '300051'
 $utf8 = New-Object Text.UTF8Encoding($false)
 # One library list, used for the generated @compilerOptions and for the clang call.
 $libs = @('-lgdi32','-luser32','-lshell32','-ladvapi32','-lole32','-lversion','-lwininet','-liphlpapi','-luuid','-ld2d1','-ldwrite','-lwindowscodecs','-ldwmapi','-lruntimeobject','-loleaut32','-lsetupapi','-lpdh','-lwbemuuid')

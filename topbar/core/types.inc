@@ -9,6 +9,7 @@ constexpr UINT WM_REFRESH_TITLE = WM_APP + 6;
 constexpr UINT WM_APP_FRAME = WM_APP + 10;     // From the frame clock thread: one per display frame while animating.
 constexpr UINT WM_APP_SETTINGS = WM_APP + 11;  // From the settings callback, which runs on another thread.
 constexpr UINT WM_APP_PAINT = WM_APP + 12;     // Coalesced repaint request.
+constexpr UINT WM_APP_KEEPUP = WM_APP + 14;    // Something minimized or demoted the bar: put it back.
 constexpr UINT WM_APP_POST = WM_APP + 13;      // Services::Post: lParam is a heap std::function<void()>.
 constexpr UINT_PTR kClockTimer = 1;
 constexpr UINT_PTR kTitleTimer = 2;  // Coalesces title changes.
