@@ -1,7 +1,7 @@
 # Local build of the repo mod radial-window-switcher plus a three-finger touchpad swipe (raw HID input).
 # Keeps the mod id, so settings stay; a repo update would overwrite it. Original: radial\radial-window-switcher.orig.wh.cpp
 $s = $PSScriptRoot
-$id = 'radial-window-switcher'; $ver = '1.0.0'; $serial = '685941'
+$id = 'radial-window-switcher'; $ver = '1.0.0'; $serial = '685942'
 $comp = 'C:\Program Files\Windhawk\Compiler'
 $utf8 = New-Object Text.UTF8Encoding($false)
 $t = [IO.File]::ReadAllText("$s\$id.wh.cpp", $utf8)

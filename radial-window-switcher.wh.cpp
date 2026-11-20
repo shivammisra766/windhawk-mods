@@ -112,6 +112,9 @@ appears next to its sector.
 - lookupTap: true
   $name: Three-finger tap looks up a word
   $description: Like macOS Lookup - tap with three fingers on a word (or a selection) for the dictionary, Wikipedia and the local model. Set the Windows three-finger tap to "Nothing"
+- altSpaceSearch: true
+  $name: Alt+Space opens Search
+  $description: Like Spotlight's Cmd+Space. Replaces the window menu that Alt+Space opens in apps
 */
 // ==/WindhawkModSettings==
 
@@ -171,9 +174,11 @@ struct Settings {
     bool animate = true;
     bool touchpadGesture = true;
     bool lookupTap = true;
+    bool altSpaceSearch = true;
 };
 
 static Settings g_settings;
+static std::atomic<bool> g_altSpaceSearch{true};  // read by the hook thread
 // The trigger key: matched by virtual-key code (Tab, Q), or by scan code for
 // the key above Tab, whose virtual-key code depends on the layout.
 static std::atomic<DWORD> g_triggerVk{VK_TAB};
@@ -199,6 +204,8 @@ static void LoadSettings() {
     s.animate = Wh_GetIntSetting(L"animate") != 0;
     s.touchpadGesture = Wh_GetIntSetting(L"touchpadGesture") != 0;
     s.lookupTap = Wh_GetIntSetting(L"lookupTap") != 0;
+    s.altSpaceSearch = Wh_GetIntSetting(L"altSpaceSearch") != 0;
+    g_altSpaceSearch = s.altSpaceSearch;
     g_settings = s;
     g_activateOnRelease = s.activateOnRelease;
 
@@ -243,6 +250,7 @@ constexpr UINT WM_RS_LOOKUP_TAP = WM_APP + 30;     // wp = 1: lp = test point
 constexpr UINT WM_RS_LOOKUP_RESULT = WM_APP + 31;  // lp = LkMsg*
 constexpr UINT WM_RS_LOOKUP_CLOSE = WM_APP + 32;
 constexpr UINT WM_RS_LOOKUP_MHOOK = WM_APP + 33;   // hook thread, wp = on
+constexpr UINT WM_RS_SEARCH = WM_APP + 34;         // Alt+Space
 constexpr UINT_PTR kTimerId = 1;
 constexpr float kPi = 3.14159265358979f;
 constexpr wchar_t kClassName[] = L"RadialWindowSwitcher_Windhawk";
@@ -1472,6 +1480,14 @@ static LRESULT CALLBACK KeyboardProc(int code, WPARAM wp, LPARAM lp) {
                 g_pending = true;
                 g_sticky = ctrl;  // Ctrl+Alt+Tab
                 PostMessageW(hwnd, WM_RS_SHOW, KeyDown(VK_SHIFT) ? 1 : 0, 0);
+                return 1;
+            }
+        }
+        if (down && vk == VK_SPACE && g_altSpaceSearch) {
+            bool alt = g_altHeld || (k->flags & LLKHF_ALTDOWN) || KeyDown(VK_MENU);
+            if (alt && !KeyDown(VK_CONTROL) && !KeyDown(VK_SHIFT) && !KeyDown(VK_LWIN) &&
+                !KeyDown(VK_RWIN)) {
+                PostMessageW(hwnd, WM_RS_SEARCH, 0, 0);
                 return 1;
             }
         }
@@ -3864,6 +3880,29 @@ static void LookupShutdownUi() {
     LkWnClose();
 }
 
+// Alt+Space: cancel the app's Alt menu, let go of Alt for the system (the user is still
+// holding it, which would turn Win+S into Alt+Win+S), then send Win+S. A second Alt+Space
+// sends Win+S again, which closes Search, like Spotlight.
+static void OpenSearchFromAltSpace() {
+    SendDummyKey();
+    std::vector<INPUT> in;
+    for (WORD k : {VK_LMENU, VK_RMENU}) {
+        if (GetAsyncKeyState(k) & 0x8000) {
+            INPUT i{};
+            i.type = INPUT_KEYBOARD;
+            i.ki.wVk = k;
+            i.ki.dwFlags = KEYEVENTF_KEYUP | (k == VK_RMENU ? KEYEVENTF_EXTENDEDKEY : 0);
+            i.ki.dwExtraInfo = kInjectedMagic;
+            in.push_back(i);
+        }
+    }
+    if (!in.empty()) {
+        SendInput((UINT)in.size(), in.data(), sizeof(INPUT));
+    }
+    g_altHeld = false;
+    SendKeys({VK_LWIN, 'S'});
+}
+
 static void PublishState() {
     if (g_hwnd) {
         SetWindowTextW(g_hwnd, g_settings.trigger == Trigger::AltTab
@@ -3934,6 +3973,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_RS_LOOKUP_TAP:
             OnLookupTap(wp, lp);
+            return 0;
+        case WM_RS_SEARCH:
+            OpenSearchFromAltSpace();
             return 0;
         case WM_RS_LOOKUP_RESULT:
             OnLookupResult(reinterpret_cast<LkMsg*>(lp));
