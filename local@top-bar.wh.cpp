@@ -2,7 +2,7 @@
 // @id              top-bar
 // @name            Top bar
 // @description     Top bar with three bubbles in the Seelen toolbar style, drawn with Direct2D
-// @version         4.11
+// @version         4.12
 // @author          local
 // @include         windhawk.exe
 // @compilerOptions -lgdi32 -luser32 -lshell32 -ladvapi32 -lole32 -lversion -lwininet -liphlpapi -luuid -ld2d1 -ldwrite -lwindowscodecs -ldwmapi -lruntimeobject -loleaut32 -lsetupapi -lpdh -lwbemuuid
@@ -8946,25 +8946,114 @@ bool AlDndOff() {
     return ok;
 }
 
+// Volume changes as Core Audio reports them, one per key step, so the slider follows a held key
+// instead of jumping to wherever the level was when the popup appeared. It also shows the slider
+// when the popup hook isn't working. Brightness has no cheap equivalent: the hook trigger starts a
+// short burst of reads instead (see AlLevelThread).
+std::atomic<int> g_alLastBright{-1};
+
+struct AlVolumeCallback : IAudioEndpointVolumeCallback {
+    std::atomic<ULONG> refs{1};
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
+        if (iid == __uuidof(IUnknown) || iid == __uuidof(IAudioEndpointVolumeCallback)) {
+            *out = static_cast<IAudioEndpointVolumeCallback*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG r = --refs;
+        if (!r) delete this;
+        return r;
+    }
+    HRESULT STDMETHODCALLTYPE OnNotify(PAUDIO_VOLUME_NOTIFICATION_DATA d) override {
+        if (!d) return S_OK;
+        const int vol = (int)std::lround(d->fMasterVolume * 100.0f);
+        if (HWND h = g_alHwnd.load())
+            PostMessageW(h, WM_AL_LEVEL, (WPARAM)(vol & 0xFFFF) | (d->bMuted ? 0x10000 : 0), (LPARAM)g_alLastBright.load());
+        return S_OK;
+    }
+};
+
+// Keeps the callback on the current default output device (it changes with headphones).
+struct AlVolumeWatch {
+    Com<IAudioEndpointVolume> ep;
+    AlVolumeCallback* cb = nullptr;
+    std::wstring id;
+
+    void Ensure() {
+        Com<IMMDeviceEnumerator> en;
+        Com<IMMDevice> dev;
+        if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(en.Put()))) ||
+            FAILED(en->GetDefaultAudioEndpoint(eRender, eConsole, dev.Put())))
+            return;
+        LPWSTR now = nullptr;
+        if (FAILED(dev->GetId(&now)) || !now) return;
+        const bool same = id == now;
+        std::wstring nowId = now;
+        CoTaskMemFree(now);
+        if (same && ep) return;
+        Stop();
+        if (FAILED(dev->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(ep.Put()))) || !ep)
+            return;
+        cb = new AlVolumeCallback();
+        if (FAILED(ep->RegisterControlChangeNotify(cb))) {
+            cb->Release();
+            cb = nullptr;
+            ep.Reset();
+            return;
+        }
+        id = nowId;
+    }
+    void Stop() {
+        if (ep && cb) ep->UnregisterControlChangeNotify(cb);
+        if (cb) cb->Release();
+        cb = nullptr;
+        ep.Reset();
+        id.clear();
+    }
+};
+
 DWORD WINAPI AlLevelThread(void*) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     {
         AlLevels lv;
+        AlVolumeWatch watch;
         HANDLE waits[] = {g_alStop, g_alLevelRead, g_alLevelSet, g_alDndOff};
         auto post = [&] {
             bool mute = false;
             const int vol = lv.Volume(&mute);
             const int bright = lv.Brightness();
+            g_alLastBright = bright;
             if (HWND h = g_alHwnd.load()) PostMessageW(h, WM_AL_LEVEL, (WPARAM)(vol & 0xFFFF) | (mute ? 0x10000 : 0), (LPARAM)bright);
         };
         post();  // Baseline, so the first key press can be told apart.
+        watch.Ensure();
+        bool stop = false;
         for (;;) {
             const DWORD w = WaitForMultipleObjects(4, waits, FALSE, INFINITE);
             if (w == WAIT_OBJECT_0 + 1) {
                 post();
-                // The popup can show before the new brightness is readable: look once more.
-                if (WaitForSingleObject(g_alStop, 300) == WAIT_OBJECT_0) break;
-                post();
+                watch.Ensure();  // Follow a new default device from the next step on.
+                // A held brightness key steps several times while the popup is up, and the new level can
+                // trail the popup: read every 100 ms for 1.5 s and pass on each change.
+                int last = g_alLastBright.load();
+                HANDLE burstWaits[] = {g_alStop, g_alLevelSet};
+                for (int i = 0; i < 15 && !stop; i++) {
+                    const DWORD b = WaitForMultipleObjects(2, burstWaits, FALSE, 100);
+                    if (b == WAIT_OBJECT_0) stop = true;
+                    else if (b == WAIT_OBJECT_0 + 1) {  // A drag wants the level set: stop reading, let it through.
+                        SetEvent(g_alLevelSet);
+                        break;
+                    } else if (lv.Brightness() != last) {
+                        post();
+                        last = g_alLastBright.load();
+                    }
+                }
+                if (stop) break;
             } else if (w == WAIT_OBJECT_0 + 2) {
                 const int v = g_alSetVolume.exchange(-1), b = g_alSetBright.exchange(-1);
                 if (v >= 0) {
@@ -8982,6 +9071,7 @@ DWORD WINAPI AlLevelThread(void*) {
                 break;
             }
         }
+        watch.Stop();
     }
     CoUninitialize();
     return 0;

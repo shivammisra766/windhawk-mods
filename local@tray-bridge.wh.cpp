@@ -2,7 +2,7 @@
 // @id              tray-bridge
 // @name            Tray bridge
 // @description     Passes tray icon updates to the top bar, and places the volume and brightness popup over its centre bubble
-// @version         1.11
+// @version         1.12
 // @author          local
 // @include         explorer.exe
 // @architecture    x86-64
@@ -427,8 +427,12 @@ FRect* GetPositionRect_Hook(void* self, FRect* result, const FRect* input) {
 }
 
 DWORD WINAPI OsdThread(void*) {
-    // The DLL may not be loaded yet: wait for it, then hook once. Nothing runs after that.
-    for (int i = 0; i < 600; i++) {
+    // Explorer loads the popup's DLL only on the first volume or brightness key. Load it now, so the
+    // hook is in place before that first press (1.11 waited 10 minutes for it and then gave up, so a
+    // first press after that showed the native popup and never told the island). It stays loaded.
+    if (!LoadLibraryExW(L"Windows.Internal.HardwareConfirmator.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32))
+        Wh_Log(L"Loading HardwareConfirmator failed: %u; waiting for Explorer to load it", GetLastError());
+    for (;;) {
         HMODULE mod = GetModuleHandleW(L"Windows.Internal.HardwareConfirmator.dll");
         if (mod) {
             WindhawkUtils::SYMBOL_HOOK hooks[] = {
@@ -441,10 +445,8 @@ DWORD WINAPI OsdThread(void*) {
             if (g_originalGetPositionRect) Wh_ApplyHookOperations();
             return 0;
         }
-        if (WaitForSingleObject(g_stopEvent, 1000) == WAIT_OBJECT_0) return 0;
+        if (WaitForSingleObject(g_stopEvent, 2000) == WAIT_OBJECT_0) return 0;
     }
-    Wh_Log(L"HardwareConfirmator never loaded; popup keeps its registry position");
-    return 0;
 }
 HANDLE g_osdThread = nullptr;
 
