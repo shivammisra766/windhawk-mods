@@ -2,7 +2,7 @@
 // @id              panel-split
 // @name            Panel split
 // @description     Lets the top bar open the native notifications or calendar on their own, hides toasts for the bar's island, and hides a cold first panel open
-// @version         1.14
+// @version         1.15
 // @author          local
 // @include         ShellExperienceHost.exe
 // @include         ShellHost.exe
@@ -43,6 +43,8 @@ constexpr WPARAM kModeCalendar = 2;
 constexpr WPARAM kModeNative = 3;  // Internal: what kModeBoth becomes while the bar runs.
 constexpr WPARAM kAttach = 10;
 constexpr WPARAM kDetach = 11;
+constexpr WPARAM kOpened = 12;  // From the setup thread: the panel was uncloaked (opened).
+constexpr WPARAM kClosed = 13;  // Cloaked (closed). Window.VisibilityChanged stopped firing for it.
 
 UINT g_message = 0;
 HANDLE g_setupThread = nullptr;
@@ -264,6 +266,24 @@ bool BarAlive() {
     return bar && !IsHungAppWindow(bar);
 }
 
+// The notification panel opens wherever its window was left (the window never hides, it is only
+// cloaked), and the bar moves it under the island for the calendar. Moving it back once the panel
+// opened made it show in the wrong place first and then jump, or stay there when the bar's
+// move-back didn't run. So the moment it closes, while nothing is shown, it goes back to its
+// native place at the bottom right. The bar's calendar open moves it again before opening.
+std::atomic<DWORD> g_modeTick{0};           // When the bar last sent a part (it may close and reopen).
+thread_local HWND t_hwnd = nullptr;          // This thread's panel window.
+thread_local bool t_isNotifications = false;  // It holds the notification part.
+
+// State readable from outside (the host is sandboxed, so its log doesn't reach a debugger):
+// GetProp(panel, L"PanelSplitState"): 1 attached, 2 holds the notifications, 4 bar found, 8 parked,
+// 16 layout ran, 32 native mode, 64 notifications found, 512 calendar found, 128 shown, 256 closed.
+void SetState(int bits) {
+    if (!t_hwnd) return;
+    UINT_PTR v = (UINT_PTR)GetPropW(t_hwnd, L"PanelSplitState") | (UINT_PTR)bits;
+    SetPropW(t_hwnd, L"PanelSplitState", (HANDLE)v);
+}
+
 // Runs on the XAML thread that owns the current window.
 void ApplyMode(WPARAM mode, bool forBar = true) {
     auto window = Window::Current();
@@ -276,6 +296,8 @@ void ApplyMode(WPARAM mode, bool forBar = true) {
     auto root = window.Content().try_as<FrameworkElement>();
     auto notifications = FindNamed(root, L"NotificationCenterGrid");
     auto calendar = FindNamed(root, L"CalendarCenterGrid");
+    if (notifications) t_isNotifications = true;
+    SetState(16 | (mode == kModeNative ? 32 : 0) | (notifications ? 64 : 0) | (calendar ? 512 : 0));
     if (notifications) {
         notifications.Visibility(mode == kModeCalendar ? Visibility::Collapsed : Visibility::Visible);
         if (mode == kModeNative) {
@@ -306,7 +328,31 @@ void ApplyMode(WPARAM mode, bool forBar = true) {
     }
 }
 
-void Attach() {
+void ParkNative() {
+    if (!t_isNotifications) {  // Attached before its content existed: look again.
+        if (auto w = Window::Current())
+            t_isNotifications = (bool)FindNamed(w.Content().try_as<FrameworkElement>(), L"NotificationCenterGrid");
+    }
+    if (!t_isNotifications || !t_hwnd || !IsWindow(t_hwnd)) return;
+    HWND bar = FindWindowW(L"WindhawkTopBar", nullptr);
+    if (!bar || IsHungAppWindow(bar)) return;
+    SetState(4);  // Without the bar nothing moves it, so nothing to undo.
+    RECT r;
+    if (!GetWindowRect(t_hwnd, &r)) return;
+    MONITORINFO mi{sizeof(mi)};
+    if (!GetMonitorInfoW(MonitorFromWindow(bar, MONITOR_DEFAULTTOPRIMARY), &mi)) return;
+    // Exactly where Windows puts it (flush right, ending at the work area's bottom), which is also
+    // where the bar puts it back: two places would make it jump between them.
+    const int x = mi.rcWork.right - (r.right - r.left);
+    const int y = mi.rcWork.bottom - (r.bottom - r.top);
+    if (x != r.left || y != r.top) {
+        g_originalSetWindowPos(t_hwnd, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        SetState(8);
+        Wh_Log(L"Notification panel parked at %d,%d (was %d,%d)", x, y, r.left, r.top);
+    }
+}
+
+void Attach(HWND hwnd) {
     if (t_attached) {
         return;
     }
@@ -314,14 +360,20 @@ void Attach() {
     if (!window) {
         return;
     }
+    t_hwnd = hwnd;
+    t_isNotifications = (bool)FindNamed(window.Content().try_as<FrameworkElement>(), L"NotificationCenterGrid");
+    SetState(1 | (t_isNotifications ? 2 : 0));
     t_visibilityToken = window.VisibilityChanged(
         [](winrt::Windows::Foundation::IInspectable const&,
            winrt::Windows::UI::Core::VisibilityChangedEventArgs const& args) {
             try {
+                SetState(args.Visible() ? 128 : 256);
                 if (!args.Visible()) {
                     // Closed: the next open is both parts unless the bar says otherwise.
                     // Activation can't be used for this, since it also changes while open.
                     g_mode = kModeBoth;
+                    // Not during the bar's own close-and-reopen of a part it just asked for.
+                    if (GetTickCount() - g_modeTick > 1500) ParkNative();
                 }
                 ApplyMode(g_mode);
             } catch (...) {
@@ -331,6 +383,8 @@ void Attach() {
     // Hooked while already open (a first open from the dock): lay it out now, not at the next open.
     if (window.Visible()) {
         ApplyMode(g_mode);
+    } else {
+        ParkNative();  // Left under the island by an earlier calendar open.
     }
 }
 
@@ -345,18 +399,40 @@ void Detach() {
     t_attached = false;
 }
 
+// The panel never hides: Windows cloaks it when closed. Recent builds no longer raise
+// Window.VisibilityChanged for it, so the setup thread watches cloaking and sends this here.
+// Closed: back to the native layout (calendar collapsed) and the native place, while nothing is
+// shown, so the next Win+N opens right at once. Not during the bar's own close-and-reopen of a
+// part it asked for a moment ago. Opened: lay out again, in case a mode came in meanwhile.
+void OnCloak(bool closed) {
+    SetState(closed ? 256 : 128);
+    if (closed) {
+        if (GetTickCount() - g_modeTick > 1500) {
+            g_mode = kModeBoth;
+            ApplyMode(g_mode);
+            ParkNative();
+        }
+        return;
+    }
+    ApplyMode(g_mode);
+}
+
 LRESULT CALLBACK CallWndProc(int code, WPARAM wParam, LPARAM lParam) {
     if (code == HC_ACTION) {
         auto msg = reinterpret_cast<const CWPSTRUCT*>(lParam);
         if (msg->message == g_message) {
             try {
                 if (msg->wParam == kAttach) {
-                    Attach();
+                    Attach(msg->hwnd);
                 } else if (msg->wParam == kDetach) {
                     Detach();
+                } else if (msg->wParam == kOpened || msg->wParam == kClosed) {
+                    Attach(msg->hwnd);
+                    OnCloak(msg->wParam == kClosed);
                 } else {
                     g_mode = msg->wParam;
-                    Attach();
+                    g_modeTick = GetTickCount();
+                    Attach(msg->hwnd);
                     ApplyMode(msg->wParam);
                 }
             } catch (...) {
@@ -400,9 +476,17 @@ BOOL CALLBACK HookOwnWindow(HWND hwnd, LPARAM) {
     return TRUE;
 }
 
-void CALLBACK OnOwnWindowEvent(HWINEVENTHOOK, DWORD, HWND hwnd, LONG object, LONG, DWORD, DWORD) {
-    if (object == OBJID_WINDOW && hwnd) {
-        HookOwnWindow(hwnd, 0);
+void CALLBACK OnOwnWindowEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG object, LONG, DWORD, DWORD) {
+    if (object != OBJID_WINDOW || !hwnd) {
+        return;
+    }
+    HookOwnWindow(hwnd, 0);
+    if (event == EVENT_OBJECT_CLOAKED || event == EVENT_OBJECT_UNCLOAKED) {
+        wchar_t cls[64] = {};
+        GetClassNameW(hwnd, cls, 64);
+        if (!wcscmp(cls, L"Windows.UI.Core.CoreWindow") && !IsToastWindow(hwnd)) {
+            SendNotifyMessageW(hwnd, g_message, event == EVENT_OBJECT_CLOAKED ? kClosed : kOpened, 0);
+        }
     }
 }
 
@@ -415,6 +499,8 @@ DWORD WINAPI SetupThread(void*) {
                                             WINEVENT_OUTOFCONTEXT);
     HWINEVENTHOOK foreground = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
                                                OnOwnWindowEvent, pid, 0, WINEVENT_OUTOFCONTEXT);
+    HWINEVENTHOOK cloak = SetWinEventHook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED, nullptr, OnOwnWindowEvent, pid,
+                                          0, WINEVENT_OUTOFCONTEXT);
     for (;;) {
         const DWORD wait = MsgWaitForMultipleObjects(1, &g_stopEvent, FALSE, INFINITE, QS_ALLINPUT);
         if (wait != WAIT_OBJECT_0 + 1) {
@@ -427,6 +513,7 @@ DWORD WINAPI SetupThread(void*) {
     }
     if (created) UnhookWinEvent(created);
     if (foreground) UnhookWinEvent(foreground);
+    if (cloak) UnhookWinEvent(cloak);
     return 0;
 }
 
