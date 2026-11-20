@@ -2058,6 +2058,54 @@ static bool LkHasDevanagari(const std::wstring& s) {
     return false;
 }
 
+// A letter outside the Latin script (punctuation, symbols and emoji don't count).
+static bool LkIsNonLatinLetter(wchar_t c) {
+    if (c < 0x0370) return false;
+    if (c >= 0x2000 && c <= 0x2BFF) return false;  // punctuation, symbols, arrows
+    if (c >= 0x3000 && c <= 0x303F) return false;  // CJK punctuation
+    if (c >= 0xD800 && c <= 0xDFFF) return false;  // surrogates (emoji)
+    if (c >= 0xFE00 && c <= 0xFE6F) return false;  // variation selectors, small forms
+    if (c >= 0xFF00 && c <= 0xFF0F) return false;
+    if (c == 0x0964 || c == 0x0965) return false;  // Devanagari danda
+    return true;
+}
+
+static bool LkHasNonLatin(const std::wstring& s) {
+    for (wchar_t c : s) {
+        if (LkIsNonLatinLetter(c)) return true;
+    }
+    return false;
+}
+
+static int LkWordCount(const std::wstring& s) {
+    int n = 0;
+    bool in = false;
+    for (wchar_t c : s) {
+        bool sp = iswspace(c) || c == 0xA0;
+        if (!sp && !in) n++;
+        in = !sp;
+    }
+    return n;
+}
+
+// What the local model is asked, chosen from the text that was found:
+// Word: an English (Latin-script) word or short phrase, "in this sentence".
+// Native: a Hindi (Devanagari) word or short phrase, its English meaning plus
+//         "in this sentence".
+// Phrase: more than 4 words, or another script: an English translation and
+//         what it means. No dictionary or Wikipedia for these.
+enum class LkMode { Word, Native, Phrase };
+
+static LkMode LkModeFor(const std::wstring& t) {
+    if (LkWordCount(t) > 4) return LkMode::Phrase;
+    if (!LkHasNonLatin(t)) return LkMode::Word;
+    bool other = false;
+    for (wchar_t c : t) {
+        if (LkIsNonLatinLetter(c) && !LkIsDevanagari(c)) other = true;
+    }
+    return other ? LkMode::Phrase : LkMode::Native;
+}
+
 static bool LkWordChar(wchar_t c) {
     return iswalnum(c) || LkIsDevanagari(c) || c == L'\'' || c == L'-' ||
            c == 0x2019 || (c >= 0x00C0 && c <= 0x024F);
@@ -2082,11 +2130,11 @@ static std::wstring LkCollapseSpace(const std::wstring& s) {
 static std::wstring LkCleanWord(std::wstring w) {
     w = LkCollapseSpace(w);
     size_t a = 0, b = w.size();
-    while (a < b && !(iswalnum(w[a]) || LkIsDevanagari(w[a]) ||
-                      (w[a] >= 0x00C0 && w[a] <= 0x024F))) a++;
-    while (b > a && !(iswalnum(w[b - 1]) || LkIsDevanagari(w[b - 1]) ||
-                      (w[b - 1] >= 0x00C0 && w[b - 1] <= 0x024F) ||
-                      (w[b - 1] >= 0x093E && w[b - 1] <= 0x094D))) b--;
+    auto keep = [](wchar_t c) {
+        return iswalnum(c) || LkIsNonLatinLetter(c) || (c >= 0x00C0 && c <= 0x024F);
+    };
+    while (a < b && !keep(w[a])) a++;
+    while (b > a && !keep(w[b - 1])) b--;
     w = w.substr(a, b - a);
     if (w.size() > 2) {
         size_t n = w.size();
@@ -2232,7 +2280,13 @@ static bool LkUiaWordAt(POINT pt, LkHit& hit) {
         if (FAILED(walker->GetParentElement(el.get(), parent.put()))) break;
         el = parent;
     }
-    if (!tp) return false;
+    if (!tp) {
+        BSTR cb = nullptr;
+        std::wstring cls;
+        if (el && SUCCEEDED(el->get_CurrentClassName(&cb))) cls = LkBstr(cb);
+        LkLog(L"UIA: no text pattern (pid %d, class '%s')", pid, cls.c_str());
+        return false;
+    }
 
     // The selection, if the pointer is on it.
     winrt::com_ptr<IUIAutomationTextRangeArray> sel;
@@ -2243,9 +2297,9 @@ static bool LkUiaWordAt(POINT pt, LkHit& hit) {
             winrt::com_ptr<IUIAutomationTextRange> r;
             if (FAILED(sel->GetElement(i, r.put())) || !r) continue;
             BSTR b = nullptr;
-            r->GetText(200, &b);
+            r->GetText(1200, &b);
             std::wstring t = LkCleanWord(LkBstr(b));
-            if (t.empty() || t.size() > 120) continue;
+            if (t.empty() || t.size() > 1000) continue;  // phrases get a translation
             SAFEARRAY* sa = nullptr;
             RECT rc{};
             if (SUCCEEDED(r->GetBoundingRectangles(&sa)) &&
@@ -2271,6 +2325,7 @@ static bool LkUiaWordAt(POINT pt, LkHit& hit) {
     // RangeFromPoint returns the nearest text even far from the pointer.
     if (FAILED(r->GetBoundingRectangles(&sa)) ||
         !LkRectsContain(sa, pt, 3, &rc)) {
+        LkLog(L"UIA: nearest text '%s' is not under the pointer", t.substr(0, 40).c_str());
         return false;
     }
     hit.word = t;
@@ -2291,11 +2346,12 @@ using winrt::Windows::Storage::Streams::DataWriter;
 }  // namespace lkw
 
 static bool LkOcrPick(const lkw::OcrResult& res, float ix, float iy, float k,
-                      LONG ox, LONG oy, LkHit& out) {
+                      LONG ox, LONG oy, LkHit& out, int* count = nullptr) {
     float best = 1e9f;
     bool found = false;
     for (const auto& line : res.Lines()) {
         for (const auto& w : line.Words()) {
+            if (count) (*count)++;
             auto r = w.BoundingRect();
             float dx = std::max({r.X - ix, 0.f, ix - (r.X + r.Width)});
             float dy = std::max({r.Y - iy, 0.f, iy - (r.Y + r.Height)});
@@ -2362,9 +2418,11 @@ static bool LkOcrWordAt(POINT pt, LkHit& hit) {
 
         LkHit en, hi;
         bool haveEn = false, haveHi = false;
+        int nEn = -1;
         if (auto eng = lkw::OcrEngine::TryCreateFromLanguage(lkw::Language(L"en-US"))) {
+            nEn = 0;
             haveEn = LkOcrPick(eng.RecognizeAsync(bmp).get(), ix, iy, (float)k,
-                               cap.left, cap.top, en);
+                               cap.left, cap.top, en, &nEn);
         }
         if (auto eng = lkw::OcrEngine::TryCreateFromLanguage(lkw::Language(L"hi-IN"))) {
             haveHi = LkOcrPick(eng.RecognizeAsync(bmp).get(), ix, iy, (float)k,
@@ -2377,8 +2435,12 @@ static bool LkOcrWordAt(POINT pt, LkHit& hit) {
         } else if (haveEn) {
             hit = en;
             ok = true;
+        } else {
+            LkLog(L"OCR: %d words read around the pointer, none under it%s", nEn,
+                  nEn < 0 ? L" (no English OCR engine)" : L"");
         }
     } catch (...) {
+        LkLog(L"OCR failed");
         ok = false;
     }
     SelectObject(mem, old);
@@ -2630,6 +2692,46 @@ static void LkAppendUtf8(std::string& s, uint32_t cp) {
     }
 }
 
+// The JSON string literal whose opening quote is at j[q].
+static bool LkJsonStrAt(const std::string& j, size_t q, std::wstring& out,
+                        size_t* endPos = nullptr) {
+    if (q >= j.size() || j[q] != '"') return false;
+    q++;
+    std::string s;
+    while (q < j.size() && j[q] != '"') {
+        char c = j[q++];
+        if (c != '\\') {
+            s += c;
+            continue;
+        }
+        if (q >= j.size()) break;
+        char e = j[q++];
+        switch (e) {
+            case 'n': s += '\n'; break;
+            case 't': s += '\t'; break;
+            case 'r': break;
+            case 'b': case 'f': break;
+            case 'u': {
+                if (q + 4 > j.size()) break;
+                uint32_t cp = strtoul(j.substr(q, 4).c_str(), nullptr, 16);
+                q += 4;
+                if (cp >= 0xD800 && cp < 0xDC00 && q + 6 <= j.size() &&
+                    j[q] == '\\' && j[q + 1] == 'u') {
+                    uint32_t lo = strtoul(j.substr(q + 2, 4).c_str(), nullptr, 16);
+                    q += 6;
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                }
+                LkAppendUtf8(s, cp);
+                break;
+            }
+            default: s += e; break;
+        }
+    }
+    out = LkUtf8ToWide(s);
+    if (endPos) *endPos = q;
+    return true;
+}
+
 // The string value of the first "key" at or after `from`. Not a full parser:
 // enough for the flat fields read from Wikipedia and ollama.
 static bool LkJsonStr(const std::string& j, const char* key, std::wstring& out,
@@ -2642,41 +2744,7 @@ static bool LkJsonStr(const std::string& j, const char* key, std::wstring& out,
         if (q < j.size() && j[q] == ':') {
             q++;
             while (q < j.size() && isspace((unsigned char)j[q])) q++;
-            if (q >= j.size() || j[q] != '"') return false;
-            q++;
-            std::string s;
-            while (q < j.size() && j[q] != '"') {
-                char c = j[q++];
-                if (c != '\\') {
-                    s += c;
-                    continue;
-                }
-                if (q >= j.size()) break;
-                char e = j[q++];
-                switch (e) {
-                    case 'n': s += '\n'; break;
-                    case 't': s += '\t'; break;
-                    case 'r': break;
-                    case 'b': case 'f': break;
-                    case 'u': {
-                        if (q + 4 > j.size()) break;
-                        uint32_t cp = strtoul(j.substr(q, 4).c_str(), nullptr, 16);
-                        q += 4;
-                        if (cp >= 0xD800 && cp < 0xDC00 && q + 6 <= j.size() &&
-                            j[q] == '\\' && j[q + 1] == 'u') {
-                            uint32_t lo = strtoul(j.substr(q + 2, 4).c_str(), nullptr, 16);
-                            q += 6;
-                            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                        }
-                        LkAppendUtf8(s, cp);
-                        break;
-                    }
-                    default: s += e; break;
-                }
-            }
-            out = LkUtf8ToWide(s);
-            if (endPos) *endPos = q;
-            return true;
+            return LkJsonStrAt(j, q, out, endPos);
         }
         p = j.find(k, p + 1);
     }
@@ -2760,14 +2828,17 @@ static bool LkWikipedia(const std::wstring& word, LkWiki& w) {
         st != 200) {
         return false;
     }
-    // ["query",["Title"],...]
-    size_t a = body.find("[\"", body.find(',') );
+    // ["query",["Title"],...]: skip the query string (which may hold commas,
+    // brackets or escaped quotes), then read the first title.
+    std::wstring query, title;
+    size_t end = 0;
+    size_t q0 = body.find('"');
+    if (q0 == std::string::npos || !LkJsonStrAt(body, q0, query, &end)) return false;
+    size_t a = body.find('[', end);
     if (a == std::string::npos) return false;
-    size_t b = body.find('"', a + 2);
-    if (b == std::string::npos || b == a + 2) return false;
-    std::wstring title;
-    std::string fake = "{\"t\":\"" + body.substr(a + 2, b - a - 2) + "\"}";
-    LkJsonStr(fake, "t", title);
+    a++;
+    while (a < body.size() && isspace((unsigned char)body[a])) a++;
+    if (!LkJsonStrAt(body, a, title)) return false;  // [] = no match
     return !title.empty() && LkWikiSummary(host, title, w);
 }
 
@@ -2825,21 +2896,66 @@ static bool LkOllamaStart() {
     return false;
 }
 
-static bool LkOllamaAsk(const std::wstring& word, const std::wstring& context,
-                        std::wstring& answer) {
+// What the model said. Word: note ("in this sentence"). Native: meaning and
+// note. Phrase: translation (empty when the text is already English) and meaning.
+struct LkAnswer {
+    std::wstring note, meaning, translation;
+};
+
+static bool LkHasContext(const std::wstring& word, const std::wstring& context) {
+    return !context.empty() && context != word;
+}
+
+// Letters and digits only, lower case: to tell a translation from an echo.
+static std::wstring LkFold(const std::wstring& s) {
+    std::wstring o;
+    for (wchar_t c : s) {
+        if (iswalnum(c) || LkIsNonLatinLetter(c)) o += towlower(c);
+    }
+    return o;
+}
+
+// One model call per lookup. Native and Phrase ask for a small JSON object
+// (ollama's "format":"json" keeps a 1.7B model to it).
+static bool LkOllamaAsk(LkMode mode, const std::wstring& word, const std::wstring& context,
+                        LkAnswer& ans) {
     std::wstring prompt;
-    if (!context.empty() && context != word) {
-        prompt = L"Sentence: \"" + context + L"\"\nIn one or two short sentences, explain what \"" +
-                 word + L"\" means in this sentence. Answer in English, plain text, no preamble.";
+    bool json = mode != LkMode::Word;
+    int predict = 110;
+    if (mode == LkMode::Word) {
+        if (LkHasContext(word, context)) {
+            prompt = L"Sentence: \"" + context + L"\"\nIn one or two short sentences, explain what \"" +
+                     word + L"\" means in this sentence. Answer in English, plain text, no preamble.";
+        } else {
+            prompt = L"In one or two short sentences, explain what \"" + word +
+                     L"\" means. Answer in English, plain text, no preamble.";
+        }
+    } else if (mode == LkMode::Native) {
+        if (LkHasContext(word, context)) {
+            prompt = L"Hindi word: \"" + word + L"\"\nSentence: \"" + context +
+                     L"\"\nReply with JSON only, in English: {\"meaning\": \"<the word's English "
+                     L"meaning, a few words>\", \"context\": \"<one short sentence: what the word "
+                     L"means in this sentence>\"}";
+            predict = 120;
+        } else {
+            prompt = L"Hindi word: \"" + word +
+                     L"\"\nReply with JSON only, in English: {\"meaning\": \"<the word's English "
+                     L"meaning, a few words>\"}";
+            predict = 60;
+        }
     } else {
-        prompt = L"In one or two short sentences, explain what \"" + word +
-                 L"\" means. Answer in English, plain text, no preamble.";
+        prompt = L"Text: \"" + word +
+                 L"\"\nReply with JSON only: {\"translation\": \"<the English translation of the "
+                 L"text>\", \"meaning\": \"<one short sentence on what it means>\"}";
+        predict = std::clamp(80 + (int)word.size(), 80, 420);
     }
     std::string body = std::string("{\"model\":\"") + kLookupModel + "\",\"prompt\":\"" +
-                       LkJsonEscape(prompt) +
-                       "\",\"stream\":false,\"think\":false,\"keep_alive\":0,"
-                       "\"options\":{\"num_thread\":8,\"num_predict\":110,\"temperature\":0.3}}";
+                       LkJsonEscape(prompt) + "\",\"stream\":false,\"think\":false,\"keep_alive\":0," +
+                       (json ? "\"format\":\"json\"," : "") +
+                       "\"options\":{\"num_thread\":8,\"num_predict\":" + std::to_string(predict) +
+                       ",\"temperature\":0.3}}";
     std::string out;
+    std::wstring answer;
     DWORD st = 0;
     if (!LkHttp(L"127.0.0.1", 11434, false, L"POST", L"/api/generate", body, 60000, out,
                 st) ||
@@ -2848,8 +2964,28 @@ static bool LkOllamaAsk(const std::wstring& word, const std::wstring& context,
     }
     size_t t = answer.find(L"</think>");
     if (t != std::wstring::npos) answer = answer.substr(t + 8);
-    answer = LkCollapseSpace(answer);
-    return !answer.empty();
+    if (!json) {
+        ans.note = LkCollapseSpace(answer);
+        return !ans.note.empty();
+    }
+    std::string a8 = LkWideToUtf8(answer);
+    if (mode == LkMode::Native) {
+        LkJsonStr(a8, "meaning", ans.meaning);
+        LkJsonStr(a8, "context", ans.note);
+    } else {
+        LkJsonStr(a8, "translation", ans.translation);
+        LkJsonStr(a8, "meaning", ans.meaning);
+        // An English text comes back as itself: not a translation.
+        if (LkFold(ans.translation) == LkFold(word)) ans.translation.clear();
+    }
+    ans.note = LkCollapseSpace(ans.note);
+    ans.meaning = LkCollapseSpace(ans.meaning);
+    ans.translation = LkCollapseSpace(ans.translation);
+    if (ans.note.empty() && ans.meaning.empty() && ans.translation.empty() &&
+        answer.find(L'{') == std::wstring::npos) {
+        ans.meaning = LkCollapseSpace(answer);  // not JSON after all: show it as it is
+    }
+    return !(ans.note.empty() && ans.meaning.empty() && ans.translation.empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -2866,6 +3002,7 @@ struct LkMsg {
     std::vector<LkSense> senses;
     std::string bytes;
     bool ok = false;
+    LkMode mode = LkMode::Word;
 };
 
 static void LkPost(LkMsg* m) {
@@ -2882,6 +3019,7 @@ struct LkJob {
     POINT pt{};
     std::wstring word, context;
     HMODULE self = nullptr;
+    LkMode mode = LkMode::Word;
 };
 
 static bool LkStartThread(LPTHREAD_START_ROUTINE fn, LkJob* job) {
@@ -2915,11 +3053,20 @@ static void LkRunAi(const LkJob& job) {
         }
     }
     if (!LkCurrent(job.gen)) return;
-    std::wstring ans;
+    LkAnswer ans;
     auto* m = new LkMsg{job.gen, LkKind::Ai};
-    m->ok = LkOllamaAsk(job.word, job.context, ans);
-    m->a = m->ok ? ans : L"The local model didn't answer.";
-    LkLog(L"model: %s", m->ok ? L"answered" : L"no answer");
+    m->ok = LkOllamaAsk(job.mode, job.word, job.context, ans);
+    if (m->ok) {
+        m->a = ans.note;
+        m->b = ans.meaning;
+        m->c = ans.translation;
+    } else {
+        m->a = L"The local model didn't answer.";
+    }
+    LkLog(L"model (%s): %s; note %u, meaning %u, translation %u chars",
+          job.mode == LkMode::Word ? L"word" : job.mode == LkMode::Native ? L"hindi" : L"phrase",
+          m->ok ? L"answered" : L"no answer", (unsigned)ans.note.size(),
+          (unsigned)ans.meaning.size(), (unsigned)ans.translation.size());
     LkPost(m);
 }
 
@@ -2962,21 +3109,26 @@ static void LkRunLookup(const LkJob& job) {
     }
     if (hit.context.size() > 400) hit.context.resize(400);
 
+    const LkMode mode = LkModeFor(hit.word);
     auto* wm = new LkMsg{job.gen, LkKind::Word};
     wm->a = hit.word;
     wm->b = hit.context;
     wm->rect = hit.rect;
+    wm->mode = mode;
     LkPost(wm);
 
     auto* ai = new LkJob{job.gen, job.pt, hit.word, hit.context};
+    ai->mode = mode;
     LkStartThread(LkAiThread, ai);
 
-    auto* dm = new LkMsg{job.gen, LkKind::Dict};
-    if (!LkHasDevanagari(hit.word)) dm->senses = LkDictionary(hit.word);
-    LkLog(L"dictionary: %u senses", (unsigned)dm->senses.size());
-    LkPost(dm);
-
-    if (!LkCurrent(job.gen)) return;
+    // The dictionary is English only; a phrase gets neither it nor Wikipedia.
+    if (mode == LkMode::Word) {
+        auto* dm = new LkMsg{job.gen, LkKind::Dict};
+        dm->senses = LkDictionary(hit.word);
+        LkLog(L"dictionary: %u senses", (unsigned)dm->senses.size());
+        LkPost(dm);
+    }
+    if (mode == LkMode::Phrase || !LkCurrent(job.gen)) return;
     LkWiki w;
     auto* km = new LkMsg{job.gen, LkKind::Wiki};
     km->ok = LkWikipedia(hit.word, w);
@@ -3019,7 +3171,9 @@ static struct {
     std::wstring wikiTitle, wikiText, wikiUrl;
     std::unique_ptr<gp::Bitmap> thumb;
     LkState ai = LkState::Pending;
-    std::wstring aiText = L"Thinking\x2026";
+    std::wstring aiText = L"Thinking\x2026";   // status, then the note ("in this sentence")
+    std::wstring aiMeaning, aiTranslation;     // Native and Phrase answers
+    LkMode mode = LkMode::Word;
     RECT wikiHit{};  // window-local
 } g_pop;
 
@@ -3131,7 +3285,8 @@ static const LkLevel kLkLevels[] = {
     {1, 2, 3, 4, false, false},
 };
 
-static float g_lkCardTop[3], g_lkCardBottom[3];  // from the measuring pass
+// Cards: 0 dictionary, 1 Wikipedia, 2 and 3 the local model.
+static float g_lkCardTop[4], g_lkCardBottom[4];  // from the measuring pass
 
 // Lays the popover out, and draws it when `draw`. Returns the content height.
 static float LkLayout(gp::Graphics& g, bool draw, float W, float H, int level) {
@@ -3198,13 +3353,14 @@ static float LkLayout(gp::Graphics& g, bool draw, float W, float H, int level) {
              6 * s;
     };
 
-    // Header: the word, on the surface itself.
-    y += text(g_pop.word, LkFont(g_pop.word, 20 * s, gp::FontStyleRegular, true), kLkFg,
-              outer + 4 * s, W - 2 * outer - 8 * s, 2) +
+    // Header: the word, on the surface itself (a phrase smaller, on more lines).
+    const bool phrase = g_pop.mode == LkMode::Phrase;
+    y += text(g_pop.word, LkFont(g_pop.word, (phrase ? 15 : 20) * s, gp::FontStyleRegular, true),
+              kLkFg, outer + 4 * s, W - 2 * outer - 8 * s, phrase ? 3 : 2) +
          2 * s;
 
-    // Dictionary.
-    if (!LkHasDevanagari(g_pop.word)) {
+    // Dictionary (English words only).
+    if (g_pop.mode == LkMode::Word) {
         cardBegin(0);
         label(L"Dictionary");
         if (g_pop.dict == LkState::Pending) {
@@ -3295,12 +3451,42 @@ static float LkLayout(gp::Graphics& g, bool draw, float W, float H, int level) {
         cardEnd(1);
     }
 
-    // In this sentence (local model).
-    cardBegin(2);
-    label(L"In this sentence \x00B7 local model");
-    y += text(g_pop.aiText, LkFont(g_pop.aiText, 13.5f * s, gp::FontStyleRegular),
-              g_pop.ai == LkState::Done ? kLkFg : kLkMuted, x0, cw, L.aiLines);
-    cardEnd(2);
+    // The local model: one card while it works, then one or two with its answer.
+    const bool hasContext = LkHasContext(g_pop.word, g_pop.context);
+    const wchar_t* kNoteLabel = hasContext ? L"In this sentence \x00B7 local model"
+                                           : L"Meaning \x00B7 local model";
+    auto aiCard = [&](int i, const wchar_t* lbl, const std::wstring& t, bool done, int lines) {
+        cardBegin(i);
+        label(lbl);
+        y += text(t, LkFont(t, 13.5f * s, gp::FontStyleRegular), done ? kLkFg : kLkMuted, x0, cw,
+                  lines);
+        cardEnd(i);
+    };
+    if (g_pop.ai != LkState::Done) {
+        const wchar_t* lbl = g_pop.mode == LkMode::Word     ? kNoteLabel
+                             : g_pop.mode == LkMode::Native ? L"Meaning \x00B7 local model"
+                                                            : L"Translation \x00B7 local model";
+        aiCard(2, lbl, g_pop.aiText, false, L.aiLines);
+    } else if (g_pop.mode == LkMode::Word) {
+        aiCard(2, kNoteLabel, g_pop.aiText, true, L.aiLines);
+    } else if (g_pop.mode == LkMode::Native) {
+        int i = 2;
+        if (!g_pop.aiMeaning.empty()) {
+            aiCard(i++, L"Meaning \x00B7 local model", g_pop.aiMeaning, true, 3);
+        }
+        if (!g_pop.aiText.empty() && hasContext) {
+            aiCard(i++, L"In this sentence \x00B7 local model", g_pop.aiText, true, L.aiLines);
+        }
+    } else {
+        int i = 2;
+        if (!g_pop.aiTranslation.empty()) {
+            aiCard(i++, L"Translation \x00B7 local model", g_pop.aiTranslation, true,
+                   L.aiLines * 2);
+        }
+        if (!g_pop.aiMeaning.empty()) {
+            aiCard(i++, L"Meaning \x00B7 local model", g_pop.aiMeaning, true, L.aiLines);
+        }
+    }
 
     return y + outer;
 }
@@ -3315,6 +3501,79 @@ static void LkFreeSurface() {
         DeleteObject(g_popDib);
         g_popDib = nullptr;
     }
+}
+
+// msedge.exe from App Paths (64-bit view first: this process may be 32-bit),
+// else the usual install folders. Empty if Edge isn't there.
+static std::wstring LkEdgePath() {
+    const REGSAM views[] = {KEY_WOW64_64KEY, KEY_WOW64_32KEY};
+    const HKEY hives[] = {HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER};
+    for (HKEY hive : hives) {
+        for (REGSAM v : views) {
+            HKEY k;
+            if (RegOpenKeyExW(hive,
+                              L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\msedge.exe",
+                              0, KEY_READ | v, &k) != ERROR_SUCCESS) {
+                continue;
+            }
+            wchar_t buf[MAX_PATH * 2] = {};
+            DWORD sz = sizeof(buf) - sizeof(wchar_t), type = 0;
+            LONG r = RegQueryValueExW(k, nullptr, nullptr, &type, (BYTE*)buf, &sz);
+            RegCloseKey(k);
+            if (r != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) continue;
+            std::wstring p = buf;
+            if (p.size() > 1 && p.front() == L'"') p = p.substr(1, p.find(L'"', 1) - 1);
+            wchar_t ex[MAX_PATH * 2];
+            if (ExpandEnvironmentStringsW(p.c_str(), ex, ARRAYSIZE(ex))) p = ex;
+            if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) return p;
+        }
+    }
+    const wchar_t* guesses[] = {
+        L"%ProgramFiles(x86)%\\Microsoft\\Edge\\Application\\msedge.exe",
+        L"%ProgramW6432%\\Microsoft\\Edge\\Application\\msedge.exe",
+    };
+    for (const wchar_t* gs : guesses) {
+        wchar_t ex[MAX_PATH * 2];
+        if (ExpandEnvironmentStringsW(gs, ex, ARRAYSIZE(ex)) &&
+            GetFileAttributesW(ex) != INVALID_FILE_ATTRIBUTES) {
+            return ex;
+        }
+    }
+    return {};
+}
+
+// Opens a Wikipedia article in a compact Edge app window where the popover
+// was (no tabs or toolbar), or in the default browser without Edge.
+static void LkOpenArticle(const std::wstring& url, RECT pop, float scale) {
+    // Only a plain https link: it goes on a command line inside quotes.
+    if (url.rfind(L"https://", 0) != 0 || url.find_first_of(L"\" \t\r\n") != std::wstring::npos) {
+        LkLog(L"not opening odd link");
+        return;
+    }
+    std::wstring edge = LkEdgePath();
+    if (!edge.empty()) {
+        if (scale <= 0) scale = 1;
+        MONITORINFO mi{sizeof(mi)};
+        GetMonitorInfoW(MonitorFromRect(&pop, MONITOR_DEFAULTTONEAREST), &mi);
+        const RECT& wa = mi.rcWork;
+        int w = (int)std::lround(480 * scale), h = (int)std::lround(680 * scale);
+        w = std::min(w, (int)(wa.right - wa.left));
+        h = std::min(h, (int)(wa.bottom - wa.top));
+        int x = std::clamp((int)pop.left, (int)wa.left, std::max((int)wa.left, (int)wa.right - w));
+        int y = std::clamp((int)pop.top, (int)wa.top, std::max((int)wa.top, (int)wa.bottom - h));
+        // Chromium reads these switches in DIPs.
+        wchar_t args[2400];
+        _snwprintf(args, ARRAYSIZE(args) - 1, L"--app=\"%s\" --window-size=%d,%d --window-position=%d,%d",
+                   url.c_str(), (int)std::lround(w / scale), (int)std::lround(h / scale),
+                   (int)std::lround(x / scale), (int)std::lround(y / scale));
+        args[ARRAYSIZE(args) - 1] = 0;
+        if ((INT_PTR)ShellExecuteW(nullptr, L"open", edge.c_str(), args, nullptr, SW_SHOWNORMAL) > 32) {
+            LkLog(L"opened in an Edge app window: %s", url.c_str());
+            return;
+        }
+        LkLog(L"Edge app window failed (%u), using the default browser", GetLastError());
+    }
+    ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
 static LRESULT CALLBACK LkPopProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
@@ -3336,8 +3595,10 @@ static LRESULT CALLBACK LkPopProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             POINT p{(short)LOWORD(lp), (short)HIWORD(lp)};
             if (PtInRect(&g_pop.wikiHit, p) && !g_pop.wikiUrl.empty()) {
                 std::wstring url = g_pop.wikiUrl;
+                RECT pop{g_popL, g_popT, g_popR, g_popB};
+                float scale = g_pop.scale;
                 LookupClose(L"opened Wikipedia");
-                ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                LkOpenArticle(url, pop, scale);
             }
             return 0;
         }
@@ -3392,7 +3653,10 @@ static void LkRender(bool firstShow) {
         }
         if (level == 3) level = 2;
     }
-    const int H = std::min((int)std::ceil(h), maxH);
+    // Still too tall at the smallest level: rather than cut the last card
+    // off, let it grow over the word, up to the work area.
+    const int H = std::min((int)std::ceil(h),
+                           std::max(maxH, (int)(wa.bottom - wa.top) - 2 * gap));
 
     LkFreeSurface();
     BITMAPINFO bi{};
@@ -3483,6 +3747,10 @@ static void OnLookupResult(LkMsg* m) {
             g_pop.thumb.reset();
             g_pop.ai = LkState::Pending;
             g_pop.aiText = L"Thinking\x2026";
+            g_pop.aiMeaning.clear();
+            g_pop.aiTranslation.clear();
+            g_pop.mode = m->mode;
+            if (g_pop.mode == LkMode::Phrase) g_pop.wiki = LkState::None;  // not looked up
             LkRender(true);
             LkLog(L"popover shown for '%s' (context %u chars)", g_pop.word.c_str(),
                   (unsigned)g_pop.context.size());
@@ -3519,6 +3787,8 @@ static void OnLookupResult(LkMsg* m) {
         case LkKind::Ai:
             g_pop.ai = m->ok ? LkState::Done : LkState::None;
             g_pop.aiText = m->a;
+            g_pop.aiMeaning = m->b;
+            g_pop.aiTranslation = m->c;
             break;
     }
     if (g_lookupVisible) LkRender(false);
