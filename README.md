@@ -35,6 +35,19 @@ A macOS-style Windows 11 desktop built on [Windhawk](https://windhawk.net): a to
 explorer-details-better-file-sizes 1.6, file-hover-info 1.1.2, icon-resource-redirect 1.3, invisible-borders 1.0.0, lock-screen-clock-styler 0.5.0, modern-run-dialog-ui 3.0.6, radial-window-switcher 1.0.0, taskbar-icon-size 1.3.11, taskbar-start-button-colorizer 1.1, taskbar-volume-control 1.3.1, win32-ui-modernizer 1.0.4, windows-11-file-explorer-styler 1.7.2, windows-11-notification-center-styler 1.8, windows-11-start-menu-styler 1.8, windows-11-taskbar-styler 1.10, windows-animations 1.3.7.
 Installed but disabled: dynamic-island-for-windows, parallax-wallpaper (replaced by the idle fork), taskbar-dock-animation (replaced by the dock fork), windows-11-settings-styler.
 
+## radial-window-switcher local build (touchpad swipe and Lookup)
+
+`radial-window-switcher.wh.cpp` is a local build of the catalog mod (same id, so a catalog update overwrites it). It adds:
+
+- Three-finger horizontal swipe opens the Alt+Tab wheel (raw HID touchpad reports), plus parity features (Ctrl+Alt+Tab sticky, Delete closes a window, mouse, 3-finger up/down for Task View and Show Desktop).
+- **Lookup**: a three-finger tap shows a macOS-style word popover. The word comes from the selection under the pointer, else UI Automation, else OCR (English only). Cards: WordNet (offline), Wikipedia summary, and a local model note (qwen3:1.7b through ollama at `D:\ai\bin\ollama`, started on demand, unloaded right after).
+
+Files in `radial/`: `touchpad.inc` + `patch.py` (swipe), `patch-parity.py`, `lookup.inc` + `patch-lookup.py`, `build-wordnet.py`, and the upstream / intermediate copies (`*.orig.wh.cpp`, `*.pre-parity.wh.cpp`, `*.pre-lookup.wh.cpp`).
+
+Rebuild onto a fresh upstream: copy it to `radial-window-switcher.wh.cpp`, run `python -I radial\patch.py`, add the swipe clamp in `MoveSelection` by hand (not in patch.py), save as `radial\*.pre-parity.wh.cpp`, run `patch-parity.py`, save as `radial\*.pre-lookup.wh.cpp`, run `patch-lookup.py`. Then bump `$serial` in both `build-radial.ps1` and `install-lookup.ps1`, run `build-radial.ps1` (32 and 64-bit) and `install-lookup.ps1` elevated.
+
+Data: `D:\lookup\wordnet.tsv`, made by `python -I radial\build-wordnet.py <WordNet 3.0 dict dir> D:\lookup\wordnet.tsv`. Run the patch scripts from this folder; they patch `radial-window-switcher.wh.cpp` in place. Log: `D:\lookup\lookup.log`.
+
 ## Setting up another device
 
 1. Install Windhawk.
